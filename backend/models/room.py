@@ -1,0 +1,34 @@
+from __future__ import annotations
+
+import uuid
+
+from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, Integer, Text
+from sqlalchemy.dialects.postgresql import ENUM, UUID
+from sqlalchemy.sql import func
+
+from models.base import Base
+
+
+ROOM_TYPE = ENUM(
+    "CLASSROOM",
+    "LT",
+    "LAB",
+    name="room_type",
+    create_type=False,
+)
+
+
+class Room(Base):
+    __tablename__ = "rooms"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    code = Column(Text, nullable=False, unique=True)
+    name = Column(Text, nullable=False)
+    room_type = Column(ROOM_TYPE, nullable=False)
+    capacity = Column(Integer, nullable=False, default=0)
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint("capacity >= 0", name="ck_rooms_capacity"),
+    )

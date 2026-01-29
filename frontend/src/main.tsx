@@ -1,0 +1,76 @@
+import React from 'react'
+import ReactDOM from 'react-dom/client'
+import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
+import './styles.css'
+import { Layout } from './components/Layout'
+import { Dashboard } from './pages/Dashboard'
+import { LoginPage } from './pages/LoginPage'
+import { Teachers } from './pages/Teachers'
+import { TimeSlots } from './pages/TimeSlots'
+import { GenerateTimetable } from './pages/GenerateTimetable'
+import { Programs } from './pages/Programs'
+import { Subjects } from './pages/Subjects'
+import { Sections } from './pages/Sections'
+import { Rooms } from './pages/Rooms'
+import { Curriculum } from './pages/Curriculum'
+import { Electives } from './pages/Electives'
+import { ElectiveBlocks } from './pages/ElectiveBlocks'
+import { CombinedClasses } from './pages/CombinedClasses'
+import { Conflicts } from './pages/Conflicts'
+import { Timetable } from './pages/Timetable'
+import { TimetablePrint } from './pages/TimetablePrint'
+import { TimetablePrintAllSections } from './pages/TimetablePrintAllSections'
+import { TimetablePrintAllRooms } from './pages/TimetablePrintAllRooms'
+import { TimetablePrintAllFaculty } from './pages/TimetablePrintAllFaculty'
+import { RequireAuth } from './routes/RequireAuth'
+import { RedirectIfAuth } from './routes/RedirectIfAuth'
+
+ReactDOM.createRoot(document.getElementById('root')!).render(
+  <React.StrictMode>
+    <BrowserRouter>
+      <Routes>
+        <Route
+          path="/login"
+          element={
+            <RedirectIfAuth>
+              <LoginPage />
+            </RedirectIfAuth>
+          }
+        />
+
+        <Route
+          element={
+            <RequireAuth>
+              <Layout />
+            </RequireAuth>
+          }
+        >
+          <Route index element={<Navigate to="/dashboard" replace />} />
+          <Route path="/dashboard" element={<Dashboard />} />
+
+          <Route path="/programs" element={<Programs />} />
+          <Route path="/teachers" element={<Teachers />} />
+          <Route path="/subjects" element={<Subjects />} />
+          <Route path="/sections" element={<Sections />} />
+          <Route path="/rooms" element={<Rooms />} />
+          <Route path="/time-slots" element={<TimeSlots />} />
+          <Route path="/curriculum" element={<Curriculum />} />
+          <Route path="/electives" element={<Electives />} />
+          <Route path="/elective-blocks" element={<ElectiveBlocks />} />
+          <Route path="/combined-classes" element={<CombinedClasses />} />
+          <Route path="/generate" element={<GenerateTimetable />} />
+          <Route path="/conflicts" element={<Conflicts />} />
+          <Route path="/timetable" element={<Timetable />} />
+          <Route path="/timetable/print" element={<TimetablePrint />} />
+          <Route path="/timetable/print-all/sections" element={<TimetablePrintAllSections />} />
+          <Route path="/timetable/print-all/rooms" element={<TimetablePrintAllRooms />} />
+          <Route path="/timetable/print-all/faculty" element={<TimetablePrintAllFaculty />} />
+
+          <Route path="*" element={<Navigate to="/dashboard" replace />} />
+        </Route>
+
+        <Route path="*" element={<Navigate to="/dashboard" replace />} />
+      </Routes>
+    </BrowserRouter>
+  </React.StrictMode>,
+)

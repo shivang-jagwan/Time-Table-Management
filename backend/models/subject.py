@@ -1,0 +1,39 @@
+from __future__ import annotations
+
+import uuid
+
+from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, Integer, Text
+from sqlalchemy.dialects.postgresql import ENUM, UUID
+from sqlalchemy.sql import func
+
+from models.base import Base
+
+
+SUBJECT_TYPE = ENUM(
+    "THEORY",
+    "LAB",
+    name="subject_type",
+    create_type=False,
+)
+
+
+class Subject(Base):
+    __tablename__ = "subjects"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    program_id = Column(UUID(as_uuid=True), nullable=False)
+    academic_year_id = Column(UUID(as_uuid=True), nullable=False)
+    code = Column(Text, nullable=False)
+    name = Column(Text, nullable=False)
+    subject_type = Column(SUBJECT_TYPE, nullable=False)
+    sessions_per_week = Column(Integer, nullable=False)
+    max_per_day = Column(Integer, nullable=False, default=1)
+    lab_block_size_slots = Column(Integer, nullable=False)
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint("sessions_per_week >= 0", name="ck_subjects_sessions_per_week"),
+        CheckConstraint("max_per_day >= 0", name="ck_subjects_max_per_day"),
+        CheckConstraint("lab_block_size_slots >= 1", name="ck_subjects_lab_block_size"),
+    )

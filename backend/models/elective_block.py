@@ -1,0 +1,23 @@
+from __future__ import annotations
+
+import uuid
+
+from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, Integer, Text
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.sql import func
+
+from models.base import Base
+
+
+class ElectiveBlock(Base):
+    __tablename__ = "elective_blocks"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    program_id = Column(UUID(as_uuid=True), nullable=False)
+    academic_year_id = Column(UUID(as_uuid=True), nullable=False)
+    name = Column(Text, nullable=False)
+    code = Column(Text, nullable=True)
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = ()

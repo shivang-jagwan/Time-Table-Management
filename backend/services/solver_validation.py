@@ -1,0 +1,1313 @@
+from __future__ import annotations
+
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Any, Iterable
+
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from models.combined_subject_group import CombinedSubjectGroup
+from models.combined_subject_section import CombinedSubjectSection
+from models.elective_block import ElectiveBlock
+from models.elective_block_subject import ElectiveBlockSubject
+from models.room import Room
+from models.section_elective import SectionElective
+from models.section_elective_block import SectionElectiveBlock
+from models.section_subject import SectionSubject
+from models.section_break import SectionBreak
+from models.section_time_window import SectionTimeWindow
+from models.subject import Subject
+from models.teacher import Teacher
+from models.teacher_subject_section import TeacherSubjectSection
+from models.time_slot import TimeSlot
+from models.fixed_timetable_entry import FixedTimetableEntry
+from models.timetable_conflict import TimetableConflict
+from models.timetable_run import TimetableRun
+from models.track_subject import TrackSubject
+
+
+@dataclass(frozen=True)
+class ValidationConflict:
+    conflict_type: str
+    message: str
+    severity: str = "ERROR"
+    section_id: Any | None = None
+    teacher_id: Any | None = None
+    subject_id: Any | None = None
+    room_id: Any | None = None
+    slot_id: Any | None = None
+    metadata: dict[str, Any] | None = None
+
+
+def persist_conflicts(db: Session, *, run: TimetableRun, conflicts: Iterable[ValidationConflict]) -> None:
+    for c in conflicts:
+        db.add(
+            TimetableConflict(
+                run_id=run.id,
+                severity=c.severity,
+                conflict_type=c.conflict_type,
+                message=c.message,
+                section_id=c.section_id,
+                teacher_id=c.teacher_id,
+                subject_id=c.subject_id,
+                room_id=c.room_id,
+                slot_id=c.slot_id,
+                metadata_json=c.metadata or {},
+            )
+        )
+
+
+def validate_prereqs(
+    db: Session,
+    *,
+    run: TimetableRun,
+    program_id,
+    academic_year_id,
+    sections: list,
+) -> list[ValidationConflict]:
+    conflicts: list[ValidationConflict] = []
+
+    # Global validation:
+    # - If academic_year_id is provided: solve is scoped to one academic year.
+    # - If academic_year_id is None: program-wide solve spans multiple academic years.
+    solve_year_ids = sorted({s.academic_year_id for s in sections if getattr(s, "academic_year_id", None) is not None})
+    if academic_year_id is not None:
+        solve_year_ids = [academic_year_id]
+
+    section_ids = [s.id for s in sections]
+    mapped_subject_ids_by_section = defaultdict(list)
+    if section_ids:
+        for sec_id, subj_id in db.execute(
+            select(SectionSubject.section_id, SectionSubject.subject_id).where(SectionSubject.section_id.in_(section_ids))
+        ).all():
+            mapped_subject_ids_by_section[sec_id].append(subj_id)
+
+    # Time slots are required.
+    if db.execute(select(TimeSlot.id).limit(1)).first() is None:
+        conflicts.append(
+            ValidationConflict(
+                conflict_type="MISSING_TIME_SLOTS",
+                message="No time slots configured. Populate time_slots before generating timetables.",
+            )
+        )
+
+    # Section time windows must exist for all active days and use valid slot indices.
+    # Active days = days that have at least one time slot.
+    slot_rows = db.execute(select(TimeSlot.day_of_week, TimeSlot.slot_index, TimeSlot.id)).all()
+    active_days: list[int] = sorted({int(d) for d, _i, _id in slot_rows})
+    slot_indices_by_day: dict[int, set[int]] = defaultdict(set)
+    slot_id_to_day_index: dict[Any, tuple[int, int]] = {}
+    for d, i, sid in slot_rows:
+        slot_indices_by_day[int(d)].add(int(i))
+        slot_id_to_day_index[sid] = (int(d), int(i))
+
+    windows = []
+    if section_ids:
+        windows = (
+            db.execute(select(SectionTimeWindow).where(SectionTimeWindow.section_id.in_(section_ids)))
+            .scalars()
+            .all()
+        )
+    windows_by_section_day: dict[tuple[Any, int], SectionTimeWindow] = {}
+    duplicate_window_days: set[tuple[Any, int]] = set()
+    for w in windows:
+        key = (w.section_id, int(w.day_of_week))
+        if key in windows_by_section_day:
+            duplicate_window_days.add(key)
+        else:
+            windows_by_section_day[key] = w
+
+    for section in sections:
+        if not active_days:
+            # Missing time slots is already reported above.
+            continue
+
+        for d in active_days:
+            key = (section.id, d)
+            if key in duplicate_window_days:
+                conflicts.append(
+                    ValidationConflict(
+                        conflict_type="DUPLICATE_SECTION_TIME_WINDOW",
+                        message="Section has multiple time windows for the same day; expected exactly one.",
+                        section_id=section.id,
+                        metadata={"day_of_week": d},
+                    )
+                )
+                continue
+
+            w = windows_by_section_day.get(key)
+            if w is None:
+                conflicts.append(
+                    ValidationConflict(
+                        conflict_type="MISSING_SECTION_TIME_WINDOW",
+                        message="Section is missing a time window for an active day.",
+                        section_id=section.id,
+                        metadata={"day_of_week": d},
+                    )
+                )
+                continue
+
+            valid_indices = slot_indices_by_day.get(d, set())
+            if int(w.start_slot_index) not in valid_indices:
+                conflicts.append(
+                    ValidationConflict(
+                        conflict_type="INVALID_SECTION_TIME_WINDOW",
+                        message="Section time window start_slot_index does not exist in time_slots for this day.",
+                        section_id=section.id,
+                        metadata={"day_of_week": d, "start_slot_index": int(w.start_slot_index)},
+                    )
+                )
+            if int(w.end_slot_index) not in valid_indices:
+                conflicts.append(
+                    ValidationConflict(
+                        conflict_type="INVALID_SECTION_TIME_WINDOW",
+                        message="Section time window end_slot_index does not exist in time_slots for this day.",
+                        section_id=section.id,
+                        metadata={"day_of_week": d, "end_slot_index": int(w.end_slot_index)},
+                    )
+                )
+            if int(w.end_slot_index) < int(w.start_slot_index):
+                conflicts.append(
+                    ValidationConflict(
+                        conflict_type="INVALID_SECTION_TIME_WINDOW",
+                        message="Section time window end_slot_index must be >= start_slot_index.",
+                        section_id=section.id,
+                        metadata={
+                            "day_of_week": d,
+                            "start_slot_index": int(w.start_slot_index),
+                            "end_slot_index": int(w.end_slot_index),
+                        },
+                    )
+                )
+
+    # Break compatibility: any breaks defined for this run must fall inside the section window.
+    if section_ids and active_days:
+        breaks = (
+            db.execute(
+                select(SectionBreak)
+                .where(SectionBreak.run_id == run.id)
+                .where(SectionBreak.section_id.in_(section_ids))
+            )
+            .scalars()
+            .all()
+        )
+        for b in breaks:
+            day_idx = slot_id_to_day_index.get(b.slot_id)
+            if day_idx is None:
+                conflicts.append(
+                    ValidationConflict(
+                        conflict_type="INVALID_SECTION_BREAK",
+                        message="Break references a time slot that does not exist.",
+                        section_id=b.section_id,
+                        slot_id=b.slot_id,
+                    )
+                )
+                continue
+            d, si = day_idx
+            w = windows_by_section_day.get((b.section_id, d))
+            if w is None:
+                conflicts.append(
+                    ValidationConflict(
+                        conflict_type="BREAK_OUTSIDE_SECTION_WINDOW",
+                        message="Break is set on a day where the section has no working window.",
+                        section_id=b.section_id,
+                        slot_id=b.slot_id,
+                        metadata={"day_of_week": d, "slot_index": si},
+                    )
+                )
+                continue
+            if si < int(w.start_slot_index) or si > int(w.end_slot_index):
+                conflicts.append(
+                    ValidationConflict(
+                        conflict_type="BREAK_OUTSIDE_SECTION_WINDOW",
+                        message="Break slot is outside the section's working window.",
+                        section_id=b.section_id,
+                        slot_id=b.slot_id,
+                        metadata={
+                            "day_of_week": d,
+                            "slot_index": si,
+                            "window_start": int(w.start_slot_index),
+                            "window_end": int(w.end_slot_index),
+                        },
+                    )
+                )
+
+    # Rooms are required.
+    if db.execute(select(Room.id).limit(1)).first() is None:
+        conflicts.append(
+            ValidationConflict(
+                conflict_type="MISSING_ROOMS",
+                message="No rooms configured. Populate rooms before generating timetables.",
+            )
+        )
+
+    # (Legacy) minimum window check is now covered by the per-day validation above.
+
+    # Track curriculum must exist per section unless explicit mapping is present.
+    for section in sections:
+        if mapped_subject_ids_by_section.get(section.id):
+            continue
+
+        effective_year_id = academic_year_id if academic_year_id is not None else section.academic_year_id
+        has_any_track = (
+            db.execute(
+                select(TrackSubject.id)
+                .where(TrackSubject.program_id == program_id)
+                .where(TrackSubject.academic_year_id == effective_year_id)
+                .where(TrackSubject.track == section.track)
+                .limit(1)
+            ).first()
+            is not None
+        )
+        if not has_any_track:
+            conflicts.append(
+                ValidationConflict(
+                    conflict_type="MISSING_TRACK_CURRICULUM",
+                    message=f"No track_subjects configured for track '{section.track}'.",
+                    section_id=section.id,
+                    metadata={"track": section.track, "academic_year_id": str(effective_year_id)},
+                )
+            )
+
+    # Elective selection rules (explicit; no inference from names).
+    # If explicit section_subjects mapping exists, electives are ignored.
+    for section in sections:
+        if mapped_subject_ids_by_section.get(section.id):
+            continue
+
+        effective_year_id = academic_year_id if academic_year_id is not None else section.academic_year_id
+        elective_subject_ids = (
+            db.execute(
+                select(TrackSubject.subject_id)
+                .where(TrackSubject.program_id == program_id)
+                .where(TrackSubject.academic_year_id == effective_year_id)
+                .where(TrackSubject.track == section.track)
+                .where(TrackSubject.is_elective.is_(True))
+            )
+            .scalars()
+            .all()
+        )
+        selection = (
+            db.execute(select(SectionElective).where(SectionElective.section_id == section.id))
+            .scalars()
+            .first()
+        )
+
+        if section.track != "CORE":
+            if selection is not None:
+                conflicts.append(
+                    ValidationConflict(
+                        conflict_type="NON_CORE_HAS_ELECTIVE_SELECTION",
+                        message="Non-CORE sections must not use section_electives.",
+                        section_id=section.id,
+                        subject_id=selection.subject_id,
+                        metadata={"track": section.track},
+                    )
+                )
+            continue
+
+        # CORE track
+        if elective_subject_ids:
+            if selection is None:
+                conflicts.append(
+                    ValidationConflict(
+                        conflict_type="MISSING_ELECTIVE_SELECTION",
+                        message="CORE section must select exactly one elective (section_electives).",
+                        section_id=section.id,
+                    )
+                )
+            else:
+                if selection.subject_id not in set(elective_subject_ids):
+                    conflicts.append(
+                        ValidationConflict(
+                            conflict_type="INVALID_ELECTIVE_SELECTION",
+                            message="Selected elective is not an allowed elective option for CORE track.",
+                            section_id=section.id,
+                            subject_id=selection.subject_id,
+                        )
+                    )
+        else:
+            if selection is not None:
+                conflicts.append(
+                    ValidationConflict(
+                        conflict_type="UNEXPECTED_ELECTIVE_SELECTION",
+                        message="CORE section has a selection but CORE track has no elective options configured.",
+                        section_id=section.id,
+                        subject_id=selection.subject_id,
+                    )
+                )
+
+    # Teacher assignment validation (strict): each (section, required subject) must have exactly one active teacher.
+    # We validate against the curriculum per section (mapping override else track + electives).
+    if section_ids:
+        # Elective blocks mapped to sections in this solve.
+        section_blocks_rows = (
+            db.execute(
+                select(SectionElectiveBlock.section_id, SectionElectiveBlock.block_id)
+                .where(SectionElectiveBlock.section_id.in_(section_ids))
+            )
+            .all()
+        )
+        block_ids = sorted({bid for _sid, bid in section_blocks_rows})
+        blocks_by_section: dict[Any, list[Any]] = defaultdict(list)
+        for sid, bid in section_blocks_rows:
+            blocks_by_section[sid].append(bid)
+
+        blocks_by_id: dict[Any, ElectiveBlock] = {}
+        if block_ids:
+            block_rows = (
+                db.execute(select(ElectiveBlock).where(ElectiveBlock.id.in_(block_ids))).scalars().all()
+            )
+            blocks_by_id = {b.id: b for b in block_rows}
+
+        block_subject_rows = []
+        if block_ids:
+            block_subject_rows = (
+                db.execute(
+                    select(
+                        ElectiveBlockSubject.block_id,
+                        ElectiveBlockSubject.subject_id,
+                        ElectiveBlockSubject.teacher_id,
+                    ).where(ElectiveBlockSubject.block_id.in_(block_ids))
+                )
+                .all()
+            )
+        block_subjects_by_block: dict[Any, list[tuple[Any, Any]]] = defaultdict(list)  # block_id -> [(subject_id, teacher_id)]
+        for bid, subj_id, teacher_id in block_subject_rows:
+            block_subjects_by_block[bid].append((subj_id, teacher_id))
+
+        # Allowed subject ids per section (mapping override else track curriculum).
+        allowed_subject_ids_by_section: dict[Any, set[Any]] = {}
+
+        # Track rows by (academic_year_id, track)
+        track_rows_all = (
+            db.execute(select(TrackSubject).where(TrackSubject.program_id == program_id))
+            .scalars()
+            .all()
+        )
+        track_by_year_track: dict[tuple[Any, str], list[TrackSubject]] = defaultdict(list)
+        for r in track_rows_all:
+            track_by_year_track[(r.academic_year_id, str(r.track))].append(r)
+
+        elective_by_section = {}
+        elective_rows = (
+            db.execute(select(SectionElective).where(SectionElective.section_id.in_(section_ids)))
+            .scalars()
+            .all()
+        )
+        for e in elective_rows:
+            elective_by_section[e.section_id] = e.subject_id
+
+        for section in sections:
+            mapped = mapped_subject_ids_by_section.get(section.id, [])
+            if mapped:
+                allowed_subject_ids_by_section[section.id] = set(mapped)
+                continue
+
+            effective_year_id = academic_year_id if academic_year_id is not None else section.academic_year_id
+            rows = track_by_year_track.get((effective_year_id, str(section.track)), [])
+            mandatory = [r for r in rows if not r.is_elective]
+            elective_options = [r for r in rows if r.is_elective]
+            allowed = {r.subject_id for r in mandatory}
+            # Legacy section elective is ignored if the section uses elective blocks.
+            if elective_options and not blocks_by_section.get(section.id):
+                sel = elective_by_section.get(section.id)
+                if sel is not None:
+                    allowed.add(sel)
+            allowed_subject_ids_by_section[section.id] = allowed
+
+        required_pairs: list[tuple[Any, Any]] = []
+        for sec_id, subj_ids in allowed_subject_ids_by_section.items():
+            for sid in subj_ids:
+                required_pairs.append((sec_id, sid))
+
+        # Load active assignments for the sections in this solve.
+        assignment_rows = (
+            db.execute(
+                select(TeacherSubjectSection.section_id, TeacherSubjectSection.subject_id, TeacherSubjectSection.teacher_id)
+                .where(TeacherSubjectSection.section_id.in_(section_ids))
+                .where(TeacherSubjectSection.is_active.is_(True))
+            )
+            .all()
+        )
+        teachers_by_section_subject: dict[tuple[Any, Any], set[Any]] = defaultdict(set)
+        for sec_id, subj_id, teacher_id in assignment_rows:
+            teachers_by_section_subject[(sec_id, subj_id)].add(teacher_id)
+
+        # Elective block validation:
+        # - Each section's mapped blocks must be in-scope and active
+        # - Each block must have >= 1 subject assignment
+        # - No duplicate teacher within a block
+        # - Each (subject, teacher) must be eligible for that section (teacher_subject_sections)
+        # - All subjects in the block must have equal sessions_per_week (>0)
+        if block_ids:
+            all_block_subject_ids = sorted({sid for pairs in block_subjects_by_block.values() for sid, _tid in pairs})
+            subj_rows = []
+            if all_block_subject_ids:
+                subj_rows = (
+                    db.execute(select(Subject).where(Subject.id.in_(all_block_subject_ids))).scalars().all()
+                )
+            subj_by_id = {s.id: s for s in subj_rows}
+
+            for section in sections:
+                sec_block_ids = blocks_by_section.get(section.id, [])
+                if not sec_block_ids:
+                    continue
+
+                # If explicit section-subject override is present, reject mixing with blocks.
+                if mapped_subject_ids_by_section.get(section.id):
+                    conflicts.append(
+                        ValidationConflict(
+                            conflict_type="SECTION_MAPPING_CONFLICT",
+                            message="Section has explicit subject mapping (section_subjects) and elective blocks. Use only one approach.",
+                            section_id=section.id,
+                            metadata={"block_ids": [str(bid) for bid in sec_block_ids]},
+                        )
+                    )
+                    continue
+
+                for bid in sec_block_ids:
+                    block = blocks_by_id.get(bid)
+                    if block is None:
+                        conflicts.append(
+                            ValidationConflict(
+                                conflict_type="ELECTIVE_BLOCK_NOT_FOUND",
+                                message="Elective block mapping references a block that does not exist.",
+                                section_id=section.id,
+                                metadata={"block_id": str(bid)},
+                            )
+                        )
+                        continue
+                    if not bool(getattr(block, "is_active", True)):
+                        conflicts.append(
+                            ValidationConflict(
+                                conflict_type="ELECTIVE_BLOCK_INACTIVE",
+                                message="Elective block is inactive.",
+                                section_id=section.id,
+                                metadata={"block_id": str(bid)},
+                            )
+                        )
+                        continue
+                    if block.academic_year_id != section.academic_year_id:
+                        conflicts.append(
+                            ValidationConflict(
+                                conflict_type="ELECTIVE_BLOCK_OUT_OF_SCOPE",
+                                message="Elective block scope does not match the section (academic year).",
+                                section_id=section.id,
+                                metadata={"block_id": str(bid)},
+                            )
+                        )
+                        continue
+
+                    pairs = block_subjects_by_block.get(bid, [])
+                    if not pairs:
+                        conflicts.append(
+                            ValidationConflict(
+                                conflict_type="ELECTIVE_BLOCK_EMPTY",
+                                message="Elective block has no subject-teacher assignments.",
+                                section_id=section.id,
+                                metadata={"block_id": str(bid)},
+                            )
+                        )
+                        continue
+
+                    # Duplicate teacher within the same block.
+                    teacher_ids = [tid for _sid, tid in pairs]
+                    if len(set(teacher_ids)) != len(teacher_ids):
+                        conflicts.append(
+                            ValidationConflict(
+                                conflict_type="DUPLICATE_TEACHER_IN_BLOCK",
+                                message="A teacher is assigned multiple times within the same elective block.",
+                                section_id=section.id,
+                                metadata={"block_id": str(bid)},
+                            )
+                        )
+
+                    sessions_vals: list[int] = []
+                    for subj_id, teacher_id in pairs:
+                        subj = subj_by_id.get(subj_id)
+                        if subj is None:
+                            conflicts.append(
+                                ValidationConflict(
+                                    conflict_type="SUBJECT_NOT_FOUND",
+                                    message="Elective block references a subject that does not exist.",
+                                    section_id=section.id,
+                                    subject_id=subj_id,
+                                    metadata={"block_id": str(bid)},
+                                )
+                            )
+                            continue
+                        if str(subj.subject_type) != "THEORY":
+                            conflicts.append(
+                                ValidationConflict(
+                                    conflict_type="ELECTIVE_BLOCK_SUBJECT_MUST_BE_THEORY",
+                                    message="Elective blocks currently support THEORY subjects only.",
+                                    section_id=section.id,
+                                    subject_id=subj_id,
+                                    metadata={"block_id": str(bid)},
+                                )
+                            )
+                        sessions_vals.append(int(getattr(subj, "sessions_per_week", 0) or 0))
+
+                        eligible = teachers_by_section_subject.get((section.id, subj_id), set())
+                        if teacher_id not in eligible:
+                            conflicts.append(
+                                ValidationConflict(
+                                    conflict_type="ELECTIVE_BLOCK_TEACHER_NOT_ELIGIBLE",
+                                    message="Elective block teacher is not assigned to teach this subject in this section (teacher_subject_sections).",
+                                    section_id=section.id,
+                                    subject_id=subj_id,
+                                    teacher_id=teacher_id,
+                                    metadata={"block_id": str(bid)},
+                                )
+                            )
+
+                    sessions_vals = [v for v in sessions_vals if v is not None]
+                    if sessions_vals:
+                        if any(v <= 0 for v in sessions_vals):
+                            conflicts.append(
+                                ValidationConflict(
+                                    conflict_type="ELECTIVE_BLOCK_INVALID_SESSIONS",
+                                    message="Elective block subjects must have sessions_per_week > 0.",
+                                    section_id=section.id,
+                                    metadata={"block_id": str(bid), "sessions_per_week": sessions_vals},
+                                )
+                            )
+                        if len(set(sessions_vals)) != 1:
+                            conflicts.append(
+                                ValidationConflict(
+                                    conflict_type="ELECTIVE_BLOCK_MISMATCHED_SESSIONS",
+                                    message="All subjects in an elective block must have the same sessions_per_week.",
+                                    section_id=section.id,
+                                    metadata={"block_id": str(bid), "sessions_per_week": sessions_vals},
+                                )
+                            )
+
+        # Exactly one teacher per section+subject.
+        for sec_id, subj_id in required_pairs:
+            teachers = teachers_by_section_subject.get((sec_id, subj_id), set())
+            if not teachers:
+                conflicts.append(
+                    ValidationConflict(
+                        conflict_type="MISSING_TEACHER_ASSIGNMENT",
+                        message="No teacher assigned for this section+subject (teacher_subject_sections).",
+                        section_id=sec_id,
+                        subject_id=subj_id,
+                    )
+                )
+            elif len(teachers) > 1:
+                conflicts.append(
+                    ValidationConflict(
+                        conflict_type="DUPLICATE_TEACHER_ASSIGNMENT",
+                        message="Multiple teachers assigned for the same section+subject; expected exactly one.",
+                        section_id=sec_id,
+                        subject_id=subj_id,
+                        metadata={"teacher_ids": [str(t) for t in sorted(list(teachers), key=lambda x: str(x))]},
+                    )
+                )
+
+        # Teacher weekly load sanity: total required occupied slots must not exceed max_per_week.
+        subj_ids_all = sorted({sid for _sec, sid in required_pairs})
+        teacher_ids_all = sorted({tid for teachers in teachers_by_section_subject.values() for tid in teachers})
+        if subj_ids_all and teacher_ids_all:
+            subject_rows = (
+                db.execute(select(Subject).where(Subject.id.in_(subj_ids_all))).scalars().all()
+            )
+            teacher_rows = (
+                db.execute(select(Teacher).where(Teacher.id.in_(teacher_ids_all))).scalars().all()
+            )
+            subj_by_id = {s.id: s for s in subject_rows}
+            teacher_by_id = {t.id: t for t in teacher_rows}
+
+            teacher_required_slots = defaultdict(int)  # teacher_id -> total occupied slots/week
+            for sec_id, subj_id in required_pairs:
+                teachers = teachers_by_section_subject.get((sec_id, subj_id), set())
+                if len(teachers) != 1:
+                    continue
+                teacher_id = next(iter(teachers))
+                subj = subj_by_id.get(subj_id)
+                if subj is None:
+                    continue
+                spw = int(getattr(subj, "sessions_per_week", 0) or 0)
+                block = int(getattr(subj, "lab_block_size_slots", 1) or 1)
+                if str(getattr(subj, "subject_type", "")).upper() == "LAB":
+                    teacher_required_slots[teacher_id] += spw * max(block, 1)
+                else:
+                    teacher_required_slots[teacher_id] += spw
+
+            for teacher_id, required in teacher_required_slots.items():
+                teacher = teacher_by_id.get(teacher_id)
+                if teacher is None:
+                    continue
+                if required > int(getattr(teacher, "max_per_week", 0) or 0):
+                    conflicts.append(
+                        ValidationConflict(
+                            conflict_type="TEACHER_LOAD_EXCEEDS_MAX_PER_WEEK",
+                            message="Assigned teaching load exceeds teacher.max_per_week; solve will be infeasible.",
+                            teacher_id=teacher_id,
+                            metadata={"required_slots_per_week": int(required), "max_per_week": int(teacher.max_per_week)},
+                        )
+                    )
+
+    # Fixed timetable entries (hard locks) validation.
+    if section_ids:
+        fixed_rows: list[FixedTimetableEntry] = (
+            db.execute(
+                select(FixedTimetableEntry)
+                .where(FixedTimetableEntry.section_id.in_(section_ids))
+                .where(FixedTimetableEntry.is_active.is_(True))
+            )
+            .scalars()
+            .all()
+        )
+
+        if fixed_rows:
+            fixed_subject_ids = {r.subject_id for r in fixed_rows}
+            fixed_teacher_ids = {r.teacher_id for r in fixed_rows}
+
+            fixed_subjects = (
+                db.execute(select(Subject).where(Subject.id.in_(list(fixed_subject_ids))))
+                .scalars()
+                .all()
+            )
+            fixed_teachers = (
+                db.execute(select(Teacher).where(Teacher.id.in_(list(fixed_teacher_ids))))
+                .scalars()
+                .all()
+            )
+
+            fixed_subject_by_id = {s.id: s for s in fixed_subjects}
+            fixed_teacher_by_id = {t.id: t for t in fixed_teachers}
+
+            # Precompute allowed subject ids per section (mapping override else track curriculum).
+            allowed_subject_ids_by_section: dict[Any, set[Any]] = {}
+            # Track rows by (academic_year_id, track)
+            track_rows_all = (
+                db.execute(select(TrackSubject).where(TrackSubject.program_id == program_id))
+                .scalars()
+                .all()
+            )
+            track_by_year_track: dict[tuple[Any, str], list[TrackSubject]] = defaultdict(list)
+            for r in track_rows_all:
+                track_by_year_track[(r.academic_year_id, str(r.track))].append(r)
+
+            elective_by_section = {}
+            elective_rows = (
+                db.execute(select(SectionElective).where(SectionElective.section_id.in_(section_ids)))
+                .scalars()
+                .all()
+            )
+            for e in elective_rows:
+                elective_by_section[e.section_id] = e.subject_id
+
+            for section in sections:
+                mapped = mapped_subject_ids_by_section.get(section.id, [])
+                if mapped:
+                    allowed_subject_ids_by_section[section.id] = set(mapped)
+                    continue
+
+                effective_year_id = academic_year_id if academic_year_id is not None else section.academic_year_id
+                rows = track_by_year_track.get((effective_year_id, str(section.track)), [])
+                mandatory = [r for r in rows if not r.is_elective]
+                elective_options = [r for r in rows if r.is_elective]
+                allowed = {r.subject_id for r in mandatory}
+                if elective_options:
+                    sel = elective_by_section.get(section.id)
+                    if sel is not None:
+                        allowed.add(sel)
+                allowed_subject_ids_by_section[section.id] = allowed
+
+            # Assignment lookup for fixed entries: (section, subject) -> teacher_id
+            assign_rows = (
+                db.execute(
+                    select(
+                        TeacherSubjectSection.section_id,
+                        TeacherSubjectSection.subject_id,
+                        TeacherSubjectSection.teacher_id,
+                    )
+                    .where(TeacherSubjectSection.section_id.in_(section_ids))
+                    .where(TeacherSubjectSection.is_active.is_(True))
+                )
+                .all()
+            )
+            assigned_teacher_by_section_subject: dict[tuple[Any, Any], Any] = {}
+            dup_assigned: set[tuple[Any, Any]] = set()
+            for sec_id, subj_id, teacher_id in assign_rows:
+                key = (sec_id, subj_id)
+                if key in assigned_teacher_by_section_subject and assigned_teacher_by_section_subject[key] != teacher_id:
+                    dup_assigned.add(key)
+                else:
+                    assigned_teacher_by_section_subject[key] = teacher_id
+
+            eligible_triplets: set[tuple[Any, Any, Any]] = set()
+            for _sec_id, subj_id, teacher_id in assign_rows:
+                subj = fixed_subject_by_id.get(subj_id)
+                if subj is None:
+                    continue
+                eligible_triplets.add((teacher_id, subj_id, subj.academic_year_id))
+
+            # Additional infeasibility checks for fixed locks
+            fixed_teacher_slot_seen: dict[tuple[Any, Any], Any] = {}  # (teacher_id, slot_id) -> section_id
+
+            for fe in fixed_rows:
+                subj = fixed_subject_by_id.get(fe.subject_id)
+                teacher = fixed_teacher_by_id.get(fe.teacher_id)
+
+                if subj is None:
+                    conflicts.append(
+                        ValidationConflict(
+                            conflict_type="FIXED_SUBJECT_NOT_FOUND",
+                            message="Fixed entry references a subject that does not exist.",
+                            section_id=fe.section_id,
+                            subject_id=fe.subject_id,
+                            slot_id=fe.slot_id,
+                        )
+                    )
+                    continue
+
+                if teacher is None:
+                    conflicts.append(
+                        ValidationConflict(
+                            conflict_type="FIXED_TEACHER_NOT_FOUND",
+                            message="Fixed entry references a teacher that does not exist.",
+                            section_id=fe.section_id,
+                            teacher_id=fe.teacher_id,
+                            subject_id=fe.subject_id,
+                            slot_id=fe.slot_id,
+                        )
+                    )
+                    continue
+
+                day_idx = slot_id_to_day_index.get(fe.slot_id)
+                if day_idx is None:
+                    conflicts.append(
+                        ValidationConflict(
+                            conflict_type="FIXED_SLOT_NOT_FOUND",
+                            message="Fixed entry references a time slot that does not exist.",
+                            section_id=fe.section_id,
+                            teacher_id=fe.teacher_id,
+                            subject_id=fe.subject_id,
+                            slot_id=fe.slot_id,
+                        )
+                    )
+                    continue
+
+                d, si = day_idx
+                w = windows_by_section_day.get((fe.section_id, int(d)))
+                if w is None or si < int(w.start_slot_index) or si > int(w.end_slot_index):
+                    conflicts.append(
+                        ValidationConflict(
+                            conflict_type="FIXED_SLOT_OUTSIDE_SECTION_WINDOW",
+                            message="Fixed entry is outside the section's working window.",
+                            section_id=fe.section_id,
+                            teacher_id=fe.teacher_id,
+                            subject_id=fe.subject_id,
+                            slot_id=fe.slot_id,
+                            metadata={"day_of_week": int(d), "slot_index": int(si)},
+                        )
+                    )
+
+                allowed_subj = allowed_subject_ids_by_section.get(fe.section_id, set())
+                if allowed_subj and fe.subject_id not in allowed_subj:
+                    conflicts.append(
+                        ValidationConflict(
+                            conflict_type="FIXED_SUBJECT_NOT_ALLOWED_FOR_SECTION",
+                            message="Fixed entry uses a subject that is not part of this section's curriculum/mapping.",
+                            section_id=fe.section_id,
+                            subject_id=fe.subject_id,
+                            slot_id=fe.slot_id,
+                        )
+                    )
+
+                # Fixed teacher must match the strict assignment.
+                if (fe.section_id, fe.subject_id) in dup_assigned:
+                    conflicts.append(
+                        ValidationConflict(
+                            conflict_type="DUPLICATE_TEACHER_ASSIGNMENT",
+                            message="Multiple teachers are assigned for this section+subject; fixed entry cannot be validated.",
+                            section_id=fe.section_id,
+                            subject_id=fe.subject_id,
+                            slot_id=fe.slot_id,
+                        )
+                    )
+                else:
+                    assigned_tid = assigned_teacher_by_section_subject.get((fe.section_id, fe.subject_id))
+                    if assigned_tid is None:
+                        conflicts.append(
+                            ValidationConflict(
+                                conflict_type="MISSING_TEACHER_ASSIGNMENT",
+                                message="No teacher assigned for this section+subject; fixed entry cannot be satisfied.",
+                                section_id=fe.section_id,
+                                subject_id=fe.subject_id,
+                                slot_id=fe.slot_id,
+                            )
+                        )
+                    elif fe.teacher_id != assigned_tid:
+                        conflicts.append(
+                            ValidationConflict(
+                                conflict_type="FIXED_TEACHER_MISMATCH_ASSIGNMENT",
+                                message="Fixed entry teacher does not match the assigned teacher for this section+subject.",
+                                section_id=fe.section_id,
+                                subject_id=fe.subject_id,
+                                teacher_id=fe.teacher_id,
+                                slot_id=fe.slot_id,
+                                metadata={"assigned_teacher_id": str(assigned_tid)},
+                            )
+                        )
+
+                if teacher.weekly_off_day is not None and int(teacher.weekly_off_day) == int(d):
+                    conflicts.append(
+                        ValidationConflict(
+                            conflict_type="FIXED_TEACHER_WEEKLY_OFF_DAY",
+                            message="Fixed entry schedules the teacher on their weekly off day.",
+                            section_id=fe.section_id,
+                            teacher_id=fe.teacher_id,
+                            subject_id=fe.subject_id,
+                            slot_id=fe.slot_id,
+                            metadata={"day_of_week": int(d)},
+                        )
+                    )
+
+                if (fe.teacher_id, fe.subject_id, subj.academic_year_id) not in eligible_triplets:
+                    conflicts.append(
+                        ValidationConflict(
+                            conflict_type="FIXED_TEACHER_NOT_ELIGIBLE",
+                            message="Fixed entry assigns a teacher who is not eligible for this subject/year.",
+                            section_id=fe.section_id,
+                            teacher_id=fe.teacher_id,
+                            subject_id=fe.subject_id,
+                            slot_id=fe.slot_id,
+                        )
+                    )
+
+                # LAB: the fixed slot represents the LAB start; must fit contiguously.
+                if str(subj.subject_type) == "LAB":
+                    block = int(getattr(subj, "lab_block_size_slots", 1) or 1)
+                    if block < 1:
+                        block = 1
+                    end_idx = int(si) + block - 1
+                    if w is None or end_idx > int(w.end_slot_index):
+                        conflicts.append(
+                            ValidationConflict(
+                                conflict_type="FIXED_LAB_BLOCK_DOES_NOT_FIT",
+                                message="Fixed lab does not fit fully inside the section window as a contiguous block.",
+                                section_id=fe.section_id,
+                                teacher_id=fe.teacher_id,
+                                subject_id=fe.subject_id,
+                                slot_id=fe.slot_id,
+                                metadata={"block_size": int(block), "start_slot_index": int(si)},
+                            )
+                        )
+                    else:
+                        valid_indices = slot_indices_by_day.get(int(d), set())
+                        for j in range(block):
+                            if int(si) + j not in valid_indices:
+                                conflicts.append(
+                                    ValidationConflict(
+                                        conflict_type="FIXED_LAB_BLOCK_SLOT_MISSING",
+                                        message="Fixed lab block references a missing time slot index.",
+                                        section_id=fe.section_id,
+                                        teacher_id=fe.teacher_id,
+                                        subject_id=fe.subject_id,
+                                        slot_id=fe.slot_id,
+                                        metadata={"missing_slot_index": int(si) + j, "day_of_week": int(d)},
+                                    )
+                                )
+                                break
+
+                # Fixed teacher overlap -> guaranteed infeasible.
+                key = (fe.teacher_id, fe.slot_id)
+                other_section = fixed_teacher_slot_seen.get(key)
+                if other_section is not None and other_section != fe.section_id:
+                    conflicts.append(
+                        ValidationConflict(
+                            conflict_type="FIXED_TEACHER_OVERLAP",
+                            message="Two fixed entries assign the same teacher in the same time slot across sections; model will be infeasible.",
+                            teacher_id=fe.teacher_id,
+                            slot_id=fe.slot_id,
+                            metadata={"section_ids": [str(other_section), str(fe.section_id)]},
+                        )
+                    )
+                else:
+                    fixed_teacher_slot_seen[key] = fe.section_id
+
+    # Teacher capacity validation (strict mode helper): ensure total required weekly load can be covered.
+    # We estimate load in *slots* per week: LAB counts as lab_block_size_slots per session.
+    # This prevents wasting solver time when eligibility is too sparse.
+    q_subjects = select(Subject).where(Subject.program_id == program_id).where(Subject.is_active.is_(True))
+    if solve_year_ids:
+        q_subjects = q_subjects.where(Subject.academic_year_id.in_(solve_year_ids))
+
+    subject_by_id = {s.id: s for s in db.execute(q_subjects).scalars().all()}
+
+    # Required subjects per section (track curriculum + electives)
+    required_slots_by_subject = defaultdict(int)
+    for section in sections:
+        mapped = mapped_subject_ids_by_section.get(section.id, [])
+        if mapped:
+            section_weekly_load = 0
+            valid_mapped_subjects = 0
+            for subject_id in mapped:
+                subj = subject_by_id.get(subject_id)
+                if subj is None:
+                    continue
+                valid_mapped_subjects += 1
+                sessions = int(subj.sessions_per_week)
+                block = int(subj.lab_block_size_slots) if str(subj.subject_type) == "LAB" else 1
+                required_slots_by_subject[subj.id] += sessions * block
+                section_weekly_load += sessions * block
+
+            if valid_mapped_subjects <= 0:
+                conflicts.append(
+                    ValidationConflict(
+                        conflict_type="MISSING_SECTION_SUBJECTS",
+                        message="Section has subject mappings but none are valid active subjects for this solve scope.",
+                        section_id=section.id,
+                    )
+                )
+                continue
+
+            if section_weekly_load > 30:
+                conflicts.append(
+                    ValidationConflict(
+                        conflict_type="SECTION_WEEKLY_LOAD_GT_30",
+                        message="Mapped subjects exceed 30 total weekly load slots.",
+                        severity="WARN",
+                        section_id=section.id,
+                        metadata={"weekly_load_slots": int(section_weekly_load)},
+                    )
+                )
+
+            continue
+
+        effective_year_id = academic_year_id if academic_year_id is not None else section.academic_year_id
+        track_rows = (
+            db.execute(
+                select(TrackSubject)
+                .where(TrackSubject.program_id == program_id)
+                .where(TrackSubject.academic_year_id == effective_year_id)
+                .where(TrackSubject.track == section.track)
+            )
+            .scalars()
+            .all()
+        )
+        elective_subject_ids = [r.subject_id for r in track_rows if r.is_elective]
+        mandatory_rows = [r for r in track_rows if not r.is_elective]
+        chosen_elective_id = None
+        if elective_subject_ids:
+            sel = (
+                db.execute(select(SectionElective).where(SectionElective.section_id == section.id))
+                .scalars()
+                .first()
+            )
+            if sel is not None:
+                chosen_elective_id = sel.subject_id
+
+        any_subject = False
+
+        # Mandatory
+        for r in mandatory_rows:
+            subj = subject_by_id.get(r.subject_id)
+            if subj is None:
+                continue
+            any_subject = True
+            sessions = r.sessions_override if r.sessions_override is not None else subj.sessions_per_week
+            if str(subj.subject_type) == "LAB":
+                required_slots_by_subject[subj.id] += int(sessions) * int(subj.lab_block_size_slots)
+            else:
+                required_slots_by_subject[subj.id] += int(sessions)
+
+        # Elective chosen
+        if chosen_elective_id is not None:
+            any_subject = True
+            chosen_row = next((r for r in track_rows if r.subject_id == chosen_elective_id), None)
+            subj = subject_by_id.get(chosen_elective_id)
+            if subj is not None:
+                sessions = (
+                    chosen_row.sessions_override
+                    if (chosen_row is not None and chosen_row.sessions_override is not None)
+                    else subj.sessions_per_week
+                )
+                if str(subj.subject_type) == "LAB":
+                    required_slots_by_subject[subj.id] += int(sessions) * int(subj.lab_block_size_slots)
+                else:
+                    required_slots_by_subject[subj.id] += int(sessions)
+
+        if not any_subject:
+            conflicts.append(
+                ValidationConflict(
+                    conflict_type="MISSING_SECTION_SUBJECTS",
+                    message="Section has no subjects (no section_subjects mapping and no track_subjects curriculum).",
+                    section_id=section.id,
+                )
+            )
+
+    # With strict (teacher, subject, section) assignments, capacity feasibility is validated
+    # via per-teacher required load checks earlier.
+
+    # Section weekly load must fit in the section's allowed window capacity.
+    # This is a necessary (not sufficient) feasibility check.
+    slot_by_day_index: dict[tuple[int, int], Any] = {(int(d), int(i)): sid for d, i, sid in slot_rows}
+    allowed_slots_by_section = defaultdict(set)
+    for w in windows:
+        for si in range(int(w.start_slot_index), int(w.end_slot_index) + 1):
+            sid = slot_by_day_index.get((int(w.day_of_week), int(si)))
+            if sid is not None:
+                allowed_slots_by_section[w.section_id].add(sid)
+
+    for section in sections:
+        allowed = allowed_slots_by_section.get(section.id, set())
+        if not allowed:
+            # Missing window is already handled above.
+            continue
+
+        # Estimate required slot load for this section.
+        mapped = mapped_subject_ids_by_section.get(section.id, [])
+        required_slots = 0
+        if mapped:
+            for subject_id in mapped:
+                subj = subject_by_id.get(subject_id)
+                if subj is None:
+                    continue
+                sessions = int(subj.sessions_per_week)
+                block = int(subj.lab_block_size_slots) if str(subj.subject_type) == "LAB" else 1
+                required_slots += sessions * block
+        else:
+            effective_year_id = academic_year_id if academic_year_id is not None else section.academic_year_id
+            track_rows = (
+                db.execute(
+                    select(TrackSubject)
+                    .where(TrackSubject.program_id == program_id)
+                    .where(TrackSubject.academic_year_id == effective_year_id)
+                    .where(TrackSubject.track == section.track)
+                )
+                .scalars()
+                .all()
+            )
+            mandatory_rows = [r for r in track_rows if not r.is_elective]
+            elective_rows = [r for r in track_rows if r.is_elective]
+
+            chosen_elective_id = None
+            if elective_rows and str(section.track) == "CORE":
+                sel = (
+                    db.execute(select(SectionElective).where(SectionElective.section_id == section.id))
+                    .scalars()
+                    .first()
+                )
+                if sel is not None:
+                    chosen_elective_id = sel.subject_id
+
+            for r in mandatory_rows:
+                subj = subject_by_id.get(r.subject_id)
+                if subj is None:
+                    continue
+                sessions = r.sessions_override if r.sessions_override is not None else subj.sessions_per_week
+                block = int(subj.lab_block_size_slots) if str(subj.subject_type) == "LAB" else 1
+                required_slots += int(sessions) * block
+
+            if chosen_elective_id is not None:
+                subj = subject_by_id.get(chosen_elective_id)
+                if subj is not None:
+                    sessions = int(subj.sessions_per_week)
+                    block = int(subj.lab_block_size_slots) if str(subj.subject_type) == "LAB" else 1
+                    required_slots += sessions * block
+
+        if required_slots > len(allowed):
+            conflicts.append(
+                ValidationConflict(
+                    conflict_type="SECTION_LOAD_EXCEEDS_WINDOW_CAPACITY",
+                    message="Section weekly required load exceeds the number of allowed time slots in its working windows.",
+                    section_id=section.id,
+                    metadata={"required_slots": int(required_slots), "allowed_slots": int(len(allowed))},
+                )
+            )
+
+    # =========================
+    # Combined Subject Groups (strict)
+    # =========================
+    q_combined = (
+        select(CombinedSubjectGroup, Subject, CombinedSubjectSection.section_id)
+        .join(Subject, Subject.id == CombinedSubjectGroup.subject_id)
+        .join(CombinedSubjectSection, CombinedSubjectSection.combined_group_id == CombinedSubjectGroup.id)
+        .where(Subject.program_id == program_id)
+        .where(Subject.is_active.is_(True))
+    )
+    if solve_year_ids:
+        q_combined = q_combined.where(CombinedSubjectGroup.academic_year_id.in_(solve_year_ids)).where(
+            Subject.academic_year_id.in_(solve_year_ids)
+        )
+    combined_rows = db.execute(q_combined).all()
+
+    if combined_rows:
+        has_lt = (
+            db.execute(select(Room.id).where(Room.is_active.is_(True)).where(Room.room_type == "LT").limit(1)).first()
+            is not None
+        )
+        if not has_lt:
+            conflicts.append(
+                ValidationConflict(
+                    conflict_type="MISSING_LT_ROOMS_FOR_COMBINED",
+                    message="Combined classes require at least one active LT room.",
+                )
+            )
+
+    group_sections = defaultdict(set)
+    group_subject = {}
+    group_subject_code = {}
+    for g, subj, sec_id in combined_rows:
+        group_sections[g.id].add(sec_id)
+        group_subject[g.id] = subj.id
+        group_subject_code[g.id] = str(subj.code)
+
+    section_by_id = {s.id: s for s in sections}
+    solve_section_ids = set(section_by_id.keys())
+
+    # Preload track rows and elective selections to check subject existence and sessions/week.
+    track_rows_all = (
+        db.execute(
+            select(TrackSubject)
+            .where(TrackSubject.program_id == program_id)
+        )
+        .scalars()
+        .all()
+    )
+    track_rows_by_track_year = defaultdict(list)
+    for r in track_rows_all:
+        track_rows_by_track_year[(str(r.track), r.academic_year_id)].append(r)
+
+    electives_by_section_id = {}
+    if section_ids:
+        for e in db.execute(select(SectionElective).where(SectionElective.section_id.in_(section_ids))).scalars().all():
+            electives_by_section_id[e.section_id] = e
+
+    def required_sessions_for_section_subject(section, subj_id):
+        mapped = mapped_subject_ids_by_section.get(section.id, [])
+        subj = subject_by_id.get(subj_id)
+        if subj is None:
+            return None
+
+        if mapped:
+            return int(subj.sessions_per_week) if subj_id in set(mapped) else None
+
+        effective_year_id = academic_year_id if academic_year_id is not None else section.academic_year_id
+        rows = track_rows_by_track_year.get((str(section.track), effective_year_id), [])
+        mandatory = [r for r in rows if not r.is_elective]
+        elective = [r for r in rows if r.is_elective]
+
+        for r in mandatory:
+            if r.subject_id == subj_id:
+                sessions = r.sessions_override if r.sessions_override is not None else subj.sessions_per_week
+                return int(sessions or 0)
+
+        if elective and str(section.track) == "CORE":
+            sel = electives_by_section_id.get(section.id)
+            if sel is not None and sel.subject_id == subj_id:
+                return int(subj.sessions_per_week)
+
+        return None
+
+    for gid, sec_ids in group_sections.items():
+        subj_id = group_subject.get(gid)
+        subj_code = group_subject_code.get(gid, "")
+        if subj_id is None:
+            continue
+        subj = subject_by_id.get(subj_id)
+        if subj is None:
+            conflicts.append(
+                ValidationConflict(
+                    conflict_type="COMBINED_GROUP_SUBJECT_NOT_IN_SOLVE_SCOPE",
+                    message="Combined group subject is not an active subject in this solve scope.",
+                    metadata={"combined_group_id": str(gid), "subject_code": subj_code},
+                )
+            )
+            continue
+        if str(subj.subject_type) != "THEORY":
+            conflicts.append(
+                ValidationConflict(
+                    conflict_type="COMBINED_GROUP_SUBJECT_NOT_THEORY",
+                    message="Combined groups are allowed only for THEORY subjects.",
+                    subject_id=subj_id,
+                    metadata={"combined_group_id": str(gid), "subject_code": subj_code},
+                )
+            )
+
+        if len(sec_ids) < 2:
+            conflicts.append(
+                ValidationConflict(
+                    conflict_type="COMBINED_GROUP_TOO_SMALL",
+                    message="Combined group must contain at least 2 sections.",
+                    subject_id=subj_id,
+                    metadata={"combined_group_id": str(gid), "subject_code": subj_code},
+                )
+            )
+            continue
+
+        # Intersection of allowed slots must be non-empty for combined groups.
+        allowed_intersection = None
+        for sid in sec_ids:
+            s_allowed = set(allowed_slots_by_section.get(sid, set()))
+            allowed_intersection = s_allowed if allowed_intersection is None else (allowed_intersection & s_allowed)
+        if not allowed_intersection:
+            conflicts.append(
+                ValidationConflict(
+                    conflict_type="COMBINED_GROUP_NO_COMMON_SLOTS",
+                    message="Combined group has no common allowed time slots across its sections' working windows.",
+                    subject_id=subj_id,
+                    metadata={"combined_group_id": str(gid), "subject_code": subj_code},
+                )
+            )
+            continue
+
+        missing_sections = [str(sid) for sid in sec_ids if sid not in solve_section_ids]
+        if missing_sections:
+            conflicts.append(
+                ValidationConflict(
+                    conflict_type="COMBINED_GROUP_SECTION_NOT_IN_SOLVE",
+                    message="Combined group contains sections not present in this solve (inactive or different academic year).",
+                    subject_id=subj_id,
+                    metadata={
+                        "combined_group_id": str(gid),
+                        "subject_code": subj_code,
+                        "missing_section_ids": missing_sections,
+                    },
+                )
+            )
+            continue
+
+        sessions_list = []
+        missing_in_sections = []
+        for sid in sec_ids:
+            section = section_by_id.get(sid)
+            if section is None:
+                continue
+            val = required_sessions_for_section_subject(section, subj_id)
+            if val is None:
+                missing_in_sections.append(getattr(section, "code", str(sid)))
+            else:
+                sessions_list.append(int(val))
+
+        if missing_in_sections:
+            conflicts.append(
+                ValidationConflict(
+                    conflict_type="COMBINED_GROUP_SUBJECT_NOT_IN_ALL_SECTIONS",
+                    message="Combined group subject must exist in all selected sections.",
+                    subject_id=subj_id,
+                    metadata={"combined_group_id": str(gid), "subject_code": subj_code, "sections": missing_in_sections},
+                )
+            )
+            continue
+
+        if len(set(sessions_list)) > 1:
+            conflicts.append(
+                ValidationConflict(
+                    conflict_type="COMBINED_GROUP_SESSIONS_MISMATCH",
+                    message="Combined group requires the same sessions/week across all selected sections.",
+                    subject_id=subj_id,
+                    metadata={"combined_group_id": str(gid), "subject_code": subj_code, "values": sessions_list},
+                )
+            )
+
+    persist_conflicts(db, run=run, conflicts=conflicts)
+    return conflicts
+

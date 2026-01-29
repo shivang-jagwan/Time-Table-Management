@@ -1,0 +1,39 @@
+from __future__ import annotations
+
+import uuid
+
+from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, Integer
+from sqlalchemy.dialects.postgresql import ENUM, UUID
+from sqlalchemy.sql import func
+
+from models.base import Base
+
+
+SECTION_TRACK = ENUM(
+    "CORE",
+    "CYBER",
+    "AI_DS",
+    "AI_ML",
+    name="section_track",
+    create_type=False,
+)
+
+
+class TrackSubject(Base):
+    __tablename__ = "track_subjects"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    program_id = Column(UUID(as_uuid=True), nullable=False)
+    academic_year_id = Column(UUID(as_uuid=True), nullable=False)
+    track = Column(SECTION_TRACK, nullable=False)
+    subject_id = Column(UUID(as_uuid=True), nullable=False)
+    is_elective = Column(Boolean, nullable=False, default=False)
+    sessions_override = Column(Integer, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "sessions_override is null or sessions_override >= 0",
+            name="ck_track_subjects_sessions_override",
+        ),
+    )

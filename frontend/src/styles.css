@@ -1,0 +1,244 @@
+@import "tailwindcss";
+
+/* Minimal baseline */
+:root {
+  color-scheme: light;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  overflow: hidden;
+}
+
+/* Lock internal scroll regions while modal open */
+body[data-modal-open='true'] .app-scroll-region {
+  overflow: hidden !important;
+}
+
+/* Premium select styling (use with className="select-premium") */
+.select-premium {
+  border-radius: 0.75rem; /* rounded-xl */
+  border: 1px solid rgb(134 239 172); /* green-300 */
+  -webkit-backdrop-filter: blur(4px);
+  backdrop-filter: blur(4px);
+  background-color: rgba(255, 255, 255, 0.7);
+  padding: 0.5rem 2.5rem 0.5rem 1rem; /* px-4 py-2 + room for arrow */
+  color: rgb(55 65 81); /* gray-700 */
+  transition: all 200ms;
+  -webkit-appearance: none;
+  appearance: none;
+  cursor: pointer;
+  box-shadow:
+    0 1px 2px rgba(15, 23, 42, 0.06),
+    0 10px 28px rgba(15, 23, 42, 0.08);
+  background-image:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.90), rgba(255, 255, 255, 0.62)),
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none'%3E%3Cpath d='M6 8l4 4 4-4' stroke='%2316a34a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat, no-repeat;
+  background-position: 0 0, right 0.85rem center;
+  background-size: 100% 100%, 1rem 1rem;
+  min-height: 2.5rem;
+}
+
+.select-premium:hover {
+  border-color: rgb(74 222 128); /* green-400 */
+  box-shadow:
+    0 1px 2px rgba(15, 23, 42, 0.08),
+    0 14px 36px rgba(15, 23, 42, 0.12);
+}
+
+.select-premium:focus,
+.select-premium:focus-visible {
+  outline: none;
+  border-color: rgb(34 197 94); /* green-500 */
+  box-shadow:
+    0 0 0 3px rgba(34, 197, 94, 0.35),
+    0 14px 36px rgba(15, 23, 42, 0.12);
+}
+
+.select-premium:disabled {
+  background-image:
+    linear-gradient(180deg, rgba(241, 245, 249, 0.92), rgba(241, 245, 249, 0.75)),
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none'%3E%3Cpath d='M6 8l4 4 4-4' stroke='%2394a3b8' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  border-color: rgb(226 232 240); /* slate-200 */
+  color: rgb(71 85 105); /* slate-600 */
+  cursor: not-allowed;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+}
+
+.select-premium option {
+  background: #ffffff;
+  color: rgb(15 23 42); /* slate-900 */
+}
+
+/* Premium text inputs */
+.input-premium,
+.textarea-premium {
+  border-radius: 0.75rem; /* rounded-xl */
+  border: 1px solid rgb(134 239 172); /* green-300 */
+  background-color: rgba(255, 255, 255, 0.7);
+  -webkit-backdrop-filter: blur(4px);
+  backdrop-filter: blur(4px);
+  padding: 0.5rem 1rem;
+  color: rgb(55 65 81); /* gray-700 */
+  transition: all 200ms;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+}
+
+.textarea-premium {
+  resize: vertical;
+}
+
+.input-premium:hover,
+.textarea-premium:hover {
+  border-color: rgb(74 222 128); /* green-400 */
+}
+
+.input-premium:focus,
+.textarea-premium:focus {
+  outline: none;
+  border-color: rgb(34 197 94); /* green-500 */
+  box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.35);
+}
+
+.input-premium:disabled,
+.textarea-premium:disabled {
+  background-color: rgba(241, 245, 249, 0.75); /* slate-100/75 */
+  color: rgb(71 85 105); /* slate-600 */
+  cursor: not-allowed;
+}
+
+/* Buttons */
+.btn-primary {
+  background: rgb(22 163 74);
+  color: white;
+  padding: 0.5rem 1.25rem;
+  border-radius: 0.75rem;
+  transition: all 200ms;
+  box-shadow: 0 4px 12px rgba(22, 163, 74, 0.25);
+}
+
+.btn-primary:hover {
+  background: rgb(21 128 61);
+}
+
+.btn-secondary {
+  border: 1px solid rgb(209 213 219);
+  padding: 0.5rem 1.25rem;
+  border-radius: 0.75rem;
+  transition: all 200ms;
+  background: rgba(255, 255, 255, 0.7);
+}
+
+.btn-secondary:hover {
+  background: rgb(243 244 246);
+}
+
+.btn-danger {
+  background: rgb(225 29 72); /* rose-600 */
+  color: white;
+  padding: 0.5rem 1.25rem;
+  border-radius: 0.75rem;
+  transition: all 200ms;
+  box-shadow: 0 4px 12px rgba(225, 29, 72, 0.25);
+}
+
+.btn-danger:hover {
+  background: rgb(190 18 60); /* rose-700 */
+}
+
+/* Checkbox rows */
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.75rem;
+  border-radius: 0.5rem;
+  cursor: pointer;
+  transition: all 150ms;
+}
+
+.checkbox-row:hover {
+  background: rgba(187, 247, 208, 0.6); /* green-100/60 */
+}
+
+.checkbox-row input[type='checkbox'] {
+  width: 1rem;
+  height: 1rem;
+  accent-color: rgb(22 163 74);
+}
+
+/* Modal animations */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes scaleIn {
+  from {
+    transform: scale(0.95);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+.animate-fadeIn {
+  animation: fadeIn 0.2s ease-in-out;
+}
+
+.animate-scaleIn {
+  animation: scaleIn 0.2s ease-in-out;
+}
+
+/* Smooth scrolling */
+* {
+  scroll-behavior: smooth;
+}
+
+/* Scrollbar styling (Firefox only via @supports) */
+@supports (scrollbar-color: auto) {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: #16a34a transparent;
+  }
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #16a34a;
+  border-radius: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@media print {
+  body {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  .page-break {
+    break-after: page;
+    page-break-after: always;
+  }
+
+  /* Keep tables readable in print */
+  table {
+    page-break-inside: avoid;
+  }
+}

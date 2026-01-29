@@ -1,0 +1,217 @@
+from __future__ import annotations
+
+import uuid
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from api.deps import require_admin
+from core.db import get_db
+from models.academic_year import AcademicYear
+from models.program import Program
+from models.subject import Subject
+from schemas.subject import SubjectCreate, SubjectOut, SubjectPut, SubjectUpdate
+
+
+router = APIRouter()
+
+
+def _validate_subject_constraints(
+    *,
+    subject_type: str,
+    sessions_per_week: int,
+    max_per_day: int,
+    lab_block_size_slots: int,
+) -> None:
+    errors: list[str] = []
+
+    st = str(subject_type).upper()
+
+    if int(sessions_per_week) < 1:
+        errors.append("SESSIONS_PER_WEEK_LT_1")
+    if int(max_per_day) < 1:
+        errors.append("MAX_PER_DAY_LT_1")
+    if int(max_per_day) > int(sessions_per_week):
+        errors.append("MAX_PER_DAY_GT_SESSIONS_PER_WEEK")
+    if int(sessions_per_week) > 6:
+        errors.append("SESSIONS_PER_WEEK_GT_6")
+
+    if st == "THEORY":
+        if int(lab_block_size_slots) != 1:
+            errors.append("THEORY_LAB_BLOCK_MUST_BE_1")
+    elif st == "LAB":
+        if int(lab_block_size_slots) < 2:
+            errors.append("LAB_BLOCK_SIZE_LT_2")
+    else:
+        errors.append("INVALID_SUBJECT_TYPE")
+
+    if int(sessions_per_week) * int(lab_block_size_slots) > 12:
+        errors.append("WEEKLY_SLOT_LOAD_EXCEEDS_12")
+
+    if errors:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "INVALID_SUBJECT_CONSTRAINTS",
+                "errors": errors,
+            },
+        )
+
+
+def _get_program(db: Session, program_code: str) -> Program:
+    program = db.execute(select(Program).where(Program.code == program_code)).scalar_one_or_none()
+    if program is None:
+        raise HTTPException(status_code=404, detail="PROGRAM_NOT_FOUND")
+    return program
+
+
+def _get_academic_year(db: Session, year_number: int) -> AcademicYear:
+    ay = db.execute(select(AcademicYear).where(AcademicYear.year_number == int(year_number))).scalar_one_or_none()
+    if ay is None:
+        raise HTTPException(status_code=404, detail="ACADEMIC_YEAR_NOT_FOUND")
+    return ay
+
+
+@router.get("/", response_model=list[SubjectOut])
+def list_subjects(
+    program_code: str | None = Query(default=None),
+    academic_year_number: int | None = Query(default=None, ge=1, le=4),
+    _admin=Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> list[SubjectOut]:
+    q = select(Subject).order_by(Subject.code.asc())
+
+    if program_code is not None:
+        program = _get_program(db, program_code)
+        q = q.where(Subject.program_id == program.id)
+
+    if academic_year_number is not None:
+        ay = _get_academic_year(db, int(academic_year_number))
+        q = q.where(Subject.academic_year_id == ay.id)
+
+    return db.execute(q).scalars().all()
+
+
+@router.post("/", response_model=SubjectOut)
+def create_subject(
+    payload: SubjectCreate,
+    _admin=Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> SubjectOut:
+    program = _get_program(db, payload.program_code)
+    ay = _get_academic_year(db, int(payload.academic_year_number))
+
+    _validate_subject_constraints(
+        subject_type=payload.subject_type,
+        sessions_per_week=int(payload.sessions_per_week),
+        max_per_day=int(payload.max_per_day),
+        lab_block_size_slots=int(payload.lab_block_size_slots),
+    )
+
+    subject = Subject(
+        program_id=program.id,
+        academic_year_id=ay.id,
+        code=payload.code,
+        name=payload.name,
+        subject_type=payload.subject_type,
+        sessions_per_week=payload.sessions_per_week,
+        max_per_day=payload.max_per_day,
+        lab_block_size_slots=payload.lab_block_size_slots,
+        is_active=payload.is_active,
+    )
+    db.add(subject)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="CONFLICT")
+    db.refresh(subject)
+    return subject
+
+
+@router.patch("/{subject_id}", response_model=SubjectOut)
+def update_subject(
+    subject_id: uuid.UUID,
+    payload: SubjectUpdate,
+    _admin=Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> SubjectOut:
+    subject = db.get(Subject, subject_id)
+    if subject is None:
+        raise HTTPException(status_code=404, detail="SUBJECT_NOT_FOUND")
+
+    updates = payload.model_dump(exclude_unset=True)
+    for k, v in updates.items():
+        setattr(subject, k, v)
+
+    if {
+        "subject_type",
+        "sessions_per_week",
+        "max_per_day",
+        "lab_block_size_slots",
+    }.intersection(updates.keys()):
+        _validate_subject_constraints(
+            subject_type=str(subject.subject_type),
+            sessions_per_week=int(subject.sessions_per_week),
+            max_per_day=int(subject.max_per_day),
+            lab_block_size_slots=int(subject.lab_block_size_slots),
+        )
+
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="CONFLICT")
+    db.refresh(subject)
+    return subject
+
+
+@router.put("/{subject_id}", response_model=SubjectOut)
+def put_subject(
+    subject_id: uuid.UUID,
+    payload: SubjectPut,
+    _admin=Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> SubjectOut:
+    subject = db.get(Subject, subject_id)
+    if subject is None:
+        raise HTTPException(status_code=404, detail="SUBJECT_NOT_FOUND")
+
+    _validate_subject_constraints(
+        subject_type=payload.subject_type,
+        sessions_per_week=int(payload.sessions_per_week),
+        max_per_day=int(payload.max_per_day),
+        lab_block_size_slots=int(payload.lab_block_size_slots),
+    )
+
+    subject.name = payload.name
+    subject.subject_type = payload.subject_type
+    subject.sessions_per_week = int(payload.sessions_per_week)
+    subject.max_per_day = int(payload.max_per_day)
+    subject.lab_block_size_slots = int(payload.lab_block_size_slots)
+    subject.is_active = bool(payload.is_active)
+
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="CONFLICT")
+
+    db.refresh(subject)
+    return subject
+
+
+@router.delete("/{subject_id}")
+def delete_subject(
+    subject_id: uuid.UUID,
+    _admin=Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict:
+    subject = db.get(Subject, subject_id)
+    if subject is None:
+        raise HTTPException(status_code=404, detail="SUBJECT_NOT_FOUND")
+    db.delete(subject)
+    db.commit()
+    return {"ok": True}

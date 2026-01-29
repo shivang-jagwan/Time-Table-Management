@@ -1,0 +1,20 @@
+from __future__ import annotations
+
+import uuid
+
+from sqlalchemy import Boolean, Column, DateTime
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.sql import func
+
+from models.base import Base
+
+
+class TeacherSubjectSection(Base):
+    __tablename__ = "teacher_subject_sections"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    teacher_id = Column(UUID(as_uuid=True), nullable=False)
+    subject_id = Column(UUID(as_uuid=True), nullable=False)
+    section_id = Column(UUID(as_uuid=True), nullable=False)
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())

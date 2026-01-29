@@ -1,0 +1,58 @@
+from __future__ import annotations
+
+import uuid
+from datetime import datetime
+
+from pydantic import BaseModel, Field
+
+
+class SubjectBase(BaseModel):
+    program_code: str = Field(min_length=1)
+    academic_year_number: int = Field(ge=1, le=4)
+    code: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    subject_type: str = Field(min_length=1)
+    sessions_per_week: int = Field(default=0, ge=0)
+    max_per_day: int = Field(default=1, ge=0)
+    lab_block_size_slots: int = Field(default=1, ge=1)
+    is_active: bool = True
+
+
+class SubjectCreate(SubjectBase):
+    pass
+
+
+class SubjectUpdate(BaseModel):
+    code: str | None = None
+    name: str | None = None
+    subject_type: str | None = None
+    sessions_per_week: int | None = Field(default=None, ge=0)
+    max_per_day: int | None = Field(default=None, ge=0)
+    lab_block_size_slots: int | None = Field(default=None, ge=1)
+    is_active: bool | None = None
+
+
+class SubjectPut(BaseModel):
+    name: str = Field(min_length=1)
+    subject_type: str = Field(min_length=1)
+    sessions_per_week: int = Field(ge=1, le=6)
+    max_per_day: int = Field(ge=1)
+    lab_block_size_slots: int = Field(ge=1)
+    is_active: bool = True
+
+
+class SubjectOut(BaseModel):
+    id: uuid.UUID
+    program_id: uuid.UUID
+    academic_year_id: uuid.UUID
+    code: str
+    name: str
+    subject_type: str
+    sessions_per_week: int
+    max_per_day: int
+    lab_block_size_slots: int
+    is_active: bool
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
