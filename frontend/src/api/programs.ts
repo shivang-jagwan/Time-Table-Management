@@ -11,11 +11,11 @@ export type ProgramCreate = {
 }
 
 export async function listPrograms(): Promise<Program[]> {
-  return apiFetch<Program[]>('/api/programs')
+  return apiFetch<Program[]>('/api/programs/')
 }
 
 export async function createProgram(payload: ProgramCreate): Promise<Program> {
-  return apiFetch<Program>('/api/programs', {
+  return apiFetch<Program>('/api/programs/', {
     method: 'POST',
     body: JSON.stringify(payload),
   })
