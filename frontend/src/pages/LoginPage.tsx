@@ -4,24 +4,6 @@ import { useNavigate } from 'react-router-dom'
 import { Toast } from '../components/Toast'
 import { useAuth } from '../auth/AuthProvider'
 
-// Default to 127.0.0.1 instead of localhost to avoid IPv6 (::1) resolution issues on Windows
-// when the backend is bound to IPv4 only.
-// Also normalize env-provided localhost base to 127.0.0.1.
-const RAW_API_BASE = import.meta.env.VITE_API_BASE ?? ''
-
-function normalizeApiBase(raw: string): string {
-  if (!raw) return ''
-  try {
-    const u = new URL(raw)
-    if (u.hostname === 'localhost') u.hostname = '127.0.0.1'
-    return u.toString().replace(/\/$/, '')
-  } catch {
-    return raw.replace(/\/$/, '').replace(/^http:\/\/localhost(?=:\d+|$)/, 'http://127.0.0.1')
-  }
-}
-
-const API_BASE = import.meta.env.DEV ? '' : normalizeApiBase(RAW_API_BASE)
-
 export function LoginPage() {
   const navigate = useNavigate()
   const { login } = useAuth()

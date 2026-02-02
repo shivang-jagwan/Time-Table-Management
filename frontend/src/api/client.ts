@@ -15,9 +15,9 @@ function normalizeApiBase(raw: string): string {
   }
 }
 
-// In production, if VITE_API_BASE is empty, we default to same-origin.
-// This is intentional for Vercel deployments that proxy `/api/*` to the backend via `vercel.json`.
-const API_BASE = import.meta.env.DEV ? '' : normalizeApiBase(RAW_API_BASE)
+// Production should use same-origin (Vercel proxy) to avoid third-party cookie issues.
+// Use VITE_API_BASE only in dev/local setups.
+const API_BASE = import.meta.env.DEV ? normalizeApiBase(RAW_API_BASE) : ''
 
 export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
