@@ -1,18 +1,16 @@
 from __future__ import annotations
 
-"""Create `users` table and seed the default production admin user.
+"""Create `users` table and (optionally) seed an initial production admin user.
 
 Safe to run multiple times.
 
-Default user:
-- username: graphicerahill
-- role: ADMIN
-- password hash: bcrypt (no plaintext stored)
-
-NOTE: You should change this password after first login.
+IMPORTANT SECURITY NOTE:
+This script does NOT ship with any default admin credentials. Provide them explicitly
+via flags or environment variables.
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -24,18 +22,36 @@ if str(BACKEND_DIR) not in sys.path:
 from sqlalchemy import text
 
 from core.database import ENGINE
-
-
-DEFAULT_USERNAME = "graphicerahill"
-DEFAULT_ROLE = "ADMIN"
-# bcrypt hash for password 'Graphic@ERA123'
-DEFAULT_PASSWORD_HASH = "$2b$12$jg/TOq7ggcc0bCBKWGViuOHFhUypQlkcZaAg/WG9Pq21GI.WMiPRK"
+from core.security import hash_password
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--yes", action="store_true", help="Actually apply changes")
+    parser.add_argument(
+        "--username",
+        default=None,
+        help="Admin username (or set SEED_ADMIN_USERNAME env var)",
+    )
+    parser.add_argument(
+        "--password",
+        default=None,
+        help="Admin password (or set SEED_ADMIN_PASSWORD env var)",
+    )
     args = parser.parse_args()
+
+    username = (args.username or "").strip() or None
+    if username is None:
+        username = (
+            (os.environ.get("SEED_ADMIN_USERNAME") or os.environ.get("ADMIN_SEED_USERNAME") or "").strip()
+            or None
+        )
+
+    password = args.password if args.password not in {None, ""} else None
+    if password is None:
+        password = os.environ.get("SEED_ADMIN_PASSWORD") or os.environ.get("ADMIN_SEED_PASSWORD")
+
+    password_hash = hash_password(password) if username and password else None
 
     statements = [
         "CREATE EXTENSION IF NOT EXISTS pgcrypto;",
@@ -76,67 +92,71 @@ def main() -> None:
         for s in statements:
             print("---")
             print(s.strip())
+        if username and password:
+            print("---")
+            print(f"Would seed admin user: {username!r}")
+        else:
+            print("---")
+            print("No admin seeding requested (provide --username + --password or env vars).")
         return
 
     with ENGINE.begin() as conn:
         for s in statements:
             conn.execute(
                 text(s),
-                {
-                    "username": DEFAULT_USERNAME,
-                    "password_hash": DEFAULT_PASSWORD_HASH,
-                    "role": DEFAULT_ROLE,
-                },
+                {},
             )
 
-        # Seed default admin. Some legacy schemas have a NOT NULL `name` column.
-        has_name = (
-            conn.execute(
-                text(
-                    """
-                    select 1
-                    from information_schema.columns
-                    where table_schema='public'
-                      and table_name='users'
-                      and column_name='name'
-                    limit 1
-                    """.strip()
+        if username and password_hash:
+            # Seed default admin. Some legacy schemas have a NOT NULL `name` column.
+            has_name = (
+                conn.execute(
+                    text(
+                        """
+                        select 1
+                        from information_schema.columns
+                        where table_schema='public'
+                          and table_name='users'
+                          and column_name='name'
+                        limit 1
+                        """.strip()
+                    )
+                ).first()
+                is not None
+            )
+            if has_name:
+                conn.execute(
+                    text(
+                        """
+                        insert into users (name, username, password_hash, role, is_active)
+                        values (:username, :username, :password_hash, 'ADMIN', true)
+                        on conflict (username) do nothing
+                        """.strip()
+                    ),
+                    {
+                        "username": username,
+                        "password_hash": password_hash,
+                    },
                 )
-            ).first()
-            is not None
-        )
-        if has_name:
-            conn.execute(
-                text(
-                    """
-                    insert into users (name, username, password_hash, role, is_active)
-                    values (:username, :username, :password_hash, :role, true)
-                    on conflict (username) do nothing
-                    """.strip()
-                ),
-                {
-                    "username": DEFAULT_USERNAME,
-                    "password_hash": DEFAULT_PASSWORD_HASH,
-                    "role": DEFAULT_ROLE,
-                },
-            )
-        else:
-            conn.execute(
-                text(
-                    """
-                    insert into users (username, password_hash, role, is_active)
-                    values (:username, :password_hash, :role, true)
-                    on conflict (username) do nothing
-                    """.strip()
-                ),
-                {
-                    "username": DEFAULT_USERNAME,
-                    "password_hash": DEFAULT_PASSWORD_HASH,
-                    "role": DEFAULT_ROLE,
-                },
-            )
+            else:
+                conn.execute(
+                    text(
+                        """
+                        insert into users (username, password_hash, role, is_active)
+                        values (:username, :password_hash, 'ADMIN', true)
+                        on conflict (username) do nothing
+                        """.strip()
+                    ),
+                    {
+                        "username": username,
+                        "password_hash": password_hash,
+                    },
+                )
 
-    print("OK: ensured users table and seeded default admin user (if missing).")
+    if username and password_hash:
+        print("OK: ensured users table and seeded admin user (if missing).")
+    else:
+        print("OK: ensured users table (no admin seeding requested).")
 
 
 if __name__ == "__main__":

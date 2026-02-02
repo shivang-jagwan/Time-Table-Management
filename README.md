@@ -120,6 +120,8 @@ To avoid that, this repo includes a Vercel rewrite so the browser talks to Verce
    - `ENVIRONMENT=production`
    - `DATABASE_URL=...`
    - `JWT_SECRET_KEY=...`
+   - `SEED_ADMIN_USERNAME=...` (one-time bootstrap; create your initial admin)
+   - `SEED_ADMIN_PASSWORD=...`
    - `ALLOW_SIGNUP=false` (recommended)
    - `COOKIE_SAMESITE=lax` (works with the Vercel proxy)
 

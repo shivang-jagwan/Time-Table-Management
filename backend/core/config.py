@@ -40,6 +40,25 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("signup_default_role", "SIGNUP_DEFAULT_ROLE"),
     )
 
+    # Optional production bootstrap (recommended): seed an initial admin user.
+    # Only used if BOTH username + password are provided.
+    seed_admin_username: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "seed_admin_username",
+            "SEED_ADMIN_USERNAME",
+            "ADMIN_SEED_USERNAME",
+        ),
+    )
+    seed_admin_password: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "seed_admin_password",
+            "SEED_ADMIN_PASSWORD",
+            "ADMIN_SEED_PASSWORD",
+        ),
+    )
+
     # Runtime
     environment: str = Field(default="development", validation_alias=AliasChoices("environment", "ENVIRONMENT"))
     frontend_origin: str = Field(
@@ -63,6 +82,22 @@ class Settings(BaseSettings):
     @classmethod
     def _normalize_signup_default_role(cls, v: str) -> str:
         return (v or "USER").strip().upper()
+
+    @field_validator("seed_admin_username")
+    @classmethod
+    def _normalize_seed_admin_username(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
+
+    @field_validator("seed_admin_password")
+    @classmethod
+    def _normalize_seed_admin_password(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        # Intentionally do not strip whitespace here: passwords can contain spaces.
+        return v
 
 
 settings = Settings()

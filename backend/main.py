@@ -134,6 +134,18 @@ def create_app() -> FastAPI:
 
         return {"app": "ok", "database": db_status}
 
+    @app.on_event("startup")
+    def _startup_bootstrap() -> None:
+        # Best-effort: don't block app boot if DB is temporarily down.
+        if settings.environment.lower() != "production":
+            return
+        try:
+            from core.bootstrap import bootstrap_auth
+
+            bootstrap_auth()
+        except Exception:
+            logger.exception("Auth bootstrap failed")
+
     app.include_router(api_router, prefix="/api")
     return app
 
