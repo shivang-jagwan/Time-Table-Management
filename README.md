@@ -84,6 +84,7 @@ In the `timetable-backend` service → **Environment**:
 - `DATABASE_URL` = your Postgres URL (Supabase or Render Postgres)
 - `JWT_SECRET_KEY` = long random secret
 - `FRONTEND_ORIGIN` = your frontend origin (example: `https://timetable-frontend.onrender.com` or your custom domain)
+   - Note: do not include a trailing `/` (example: `https://example.com`, not `https://example.com/`)
 
 Optional (only if frontend+backend are on different “sites” / different eTLD+1):
 

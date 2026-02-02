@@ -50,9 +50,19 @@ class Settings(BaseSettings):
     @field_validator("frontend_origin")
     @classmethod
     def _normalize_frontend_origin(cls, v: str) -> str:
-        # The browser Origin header never includes a trailing slash.
-        # Keeping a trailing slash in config causes CORSMiddleware to reject the origin.
-        return (v or "").strip().rstrip("/")
+        # Render/Vercel UI often leads people to paste a trailing slash.
+        # Starlette CORS expects the Origin to match exactly (no trailing slash).
+        return v.strip().rstrip("/")
+
+    @field_validator("cookie_samesite")
+    @classmethod
+    def _normalize_cookie_samesite(cls, v: str) -> str:
+        return (v or "lax").strip().lower()
+
+    @field_validator("signup_default_role")
+    @classmethod
+    def _normalize_signup_default_role(cls, v: str) -> str:
+        return (v or "USER").strip().upper()
 
 
 settings = Settings()
