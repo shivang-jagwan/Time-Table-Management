@@ -7,6 +7,8 @@ export type Room = {
   room_type: 'CLASSROOM' | 'LT' | 'LAB' | string
   capacity: number
   is_active: boolean
+  is_special: boolean
+  special_note?: string | null
   created_at: string
 }
 
@@ -16,6 +18,8 @@ export type RoomCreate = {
   room_type: 'CLASSROOM' | 'LT' | 'LAB' | string
   capacity: number
   is_active: boolean
+  is_special?: boolean
+  special_note?: string | null
 }
 
 export type RoomPut = RoomCreate
@@ -37,6 +41,14 @@ export async function deleteRoom(id: string): Promise<{ ok: true }> {
 
 export async function putRoom(id: string, payload: RoomPut): Promise<Room> {
   return apiFetch<Room>(`/api/rooms/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  })
+}
+
+export async function putRoomWithForce(id: string, payload: RoomPut, force: boolean): Promise<Room> {
+  const qs = force ? '?force=true' : ''
+  return apiFetch<Room>(`/api/rooms/${id}${qs}`, {
     method: 'PUT',
     body: JSON.stringify(payload),
   })

@@ -1,9 +1,11 @@
 import React from 'react'
 import { Navigate } from 'react-router-dom'
-import { isLoggedIn } from '../api/client'
+import { useAuth } from '../auth/AuthProvider'
 
 export function RedirectIfAuth({ children }: { children: React.ReactNode }) {
-  if (isLoggedIn()) {
+  const { state } = useAuth()
+
+  if (state.status === 'authenticated') {
     return <Navigate to="/dashboard" replace />
   }
 

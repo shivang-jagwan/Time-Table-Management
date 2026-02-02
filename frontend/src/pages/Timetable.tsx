@@ -9,6 +9,7 @@ import {
   listRuns,
   listTimeSlots,
   listFixedEntries,
+  listSpecialAllotments,
   upsertFixedEntry,
   deleteFixedEntry,
   listSectionRequiredSubjects,
@@ -17,6 +18,7 @@ import {
   type TimeSlot,
   type TimetableEntry,
   type FixedTimetableEntry,
+  type SpecialAllotment,
   type RequiredSubject,
   type AssignedTeacher,
 } from '../api/solver'
@@ -106,6 +108,33 @@ function groupGridForCell(entries: TimetableGridEntry[]) {
   return { nonElective, electiveGroups }
 }
 
+type CollapsedGridEntry = TimetableGridEntry & { section_codes: string[] }
+
+function collapseCombinedGridEntries(items: TimetableGridEntry[]): CollapsedGridEntry[] {
+  const byKey = new Map<string, CollapsedGridEntry>()
+
+  for (const e of items) {
+    const key = [e.subject_code, e.room_code, String(e.year_number), String(e.elective_block_id ?? '')].join('|')
+    const existing = byKey.get(key)
+    if (!existing) {
+      byKey.set(key, { ...e, section_codes: [e.section_code] })
+      continue
+    }
+    if (!existing.section_codes.includes(e.section_code)) {
+      existing.section_codes.push(e.section_code)
+    }
+  }
+
+  const collapsed = Array.from(byKey.values())
+  for (const e of collapsed) e.section_codes.sort((a, b) => a.localeCompare(b))
+  collapsed.sort((a, b) => {
+    const aKey = `${a.year_number}-${a.section_codes.join(',')}-${a.subject_code}`
+    const bKey = `${b.year_number}-${b.section_codes.join(',')}-${b.subject_code}`
+    return aKey.localeCompare(bKey)
+  })
+  return collapsed
+}
+
 function groupSectionCellEntries(items: TimetableEntry[]) {
   const nonElective: TimetableEntry[] = []
   const byBlock = new Map<string, { name: string; entries: TimetableEntry[] }>()
@@ -146,6 +175,13 @@ function EntryTooltip({ lines }: { lines: string[] }) {
   )
 }
 
+function yearFromSectionCode(code: string): number | null {
+  const m = /^Y(\d+)\b/i.exec(String(code ?? '').trim())
+  if (!m) return null
+  const n = Number(m[1])
+  return Number.isFinite(n) ? n : null
+}
+
 export function Timetable() {
   const { programCode, academicYearNumber } = useLayoutContext()
   const [params, setParams] = useSearchParams()
@@ -159,6 +195,7 @@ export function Timetable() {
 
   const [sections, setSections] = React.useState<Section[]>([])
   const [fixedEntries, setFixedEntries] = React.useState<FixedTimetableEntry[]>([])
+  const [specialAllotments, setSpecialAllotments] = React.useState<SpecialAllotment[]>([])
   const [requiredSubjects, setRequiredSubjects] = React.useState<RequiredSubject[]>([])
   const [rooms, setRooms] = React.useState<Room[]>([])
   const [teachers, setTeachers] = React.useState<Teacher[]>([])
@@ -189,7 +226,30 @@ export function Timetable() {
     return runs.find((r) => r.id === runId) ?? null
   }, [runs, runId])
 
-  const runHasEntries = selectedRun?.status === 'FEASIBLE' || selectedRun?.status === 'OPTIMAL'
+  const runHasEntries =
+    selectedRun?.status === 'FEASIBLE' || selectedRun?.status === 'SUBOPTIMAL' || selectedRun?.status === 'OPTIMAL'
+
+  const roomById = React.useMemo(() => {
+    const m = new Map<string, Room>()
+    for (const r of rooms) m.set(r.id, r)
+    return m
+  }, [rooms])
+
+  const roomByCode = React.useMemo(() => {
+    const m = new Map<string, Room>()
+    for (const r of rooms) m.set(r.code, r)
+    return m
+  }, [rooms])
+
+  function fmtRoomCodeById(roomId: string, fallbackCode: string): string {
+    const r = roomById.get(roomId)
+    return r?.is_special ? `🔒 ${fallbackCode}` : fallbackCode
+  }
+
+  function fmtRoomCodeByCode(roomCode: string): string {
+    const r = roomByCode.get(roomCode)
+    return r?.is_special ? `🔒 ${roomCode}` : roomCode
+  }
 
   function runTag(r: RunSummary): string {
     const scope = String((r as any).parameters?.scope ?? '')
@@ -215,7 +275,7 @@ export function Timetable() {
   const filteredRuns = React.useMemo(() => {
     const base = scopeFilteredRuns
     if (showAllRuns) return base
-    return base.filter((r) => r.status === 'FEASIBLE' || r.status === 'OPTIMAL')
+    return base.filter((r) => r.status === 'FEASIBLE' || r.status === 'SUBOPTIMAL' || r.status === 'OPTIMAL')
   }, [scopeFilteredRuns, showAllRuns])
 
   const runsForSelect = React.useMemo(() => {
@@ -252,11 +312,13 @@ export function Timetable() {
   async function refreshFixedData(sectionId: string) {
     if (!sectionId) return
     try {
-      const [fe, subj] = await Promise.all([
+      const [fe, sa, subj] = await Promise.all([
         listFixedEntries({ section_id: sectionId }),
+        listSpecialAllotments({ section_id: sectionId }),
         listSectionRequiredSubjects({ section_id: sectionId }),
       ])
       setFixedEntries(fe)
+      setSpecialAllotments(sa)
       setRequiredSubjects(subj.filter((s) => Boolean(s.is_active)))
     } catch (e: any) {
       showToast(`Fixed slots load failed: ${String(e?.message ?? e)}`, 3500)
@@ -332,8 +394,12 @@ export function Timetable() {
 
       if (!runId && r.length > 0) {
         const preferred =
-          r.find((x) => String((x as any).parameters?.scope ?? '') === 'PROGRAM_GLOBAL' && (x.status === 'FEASIBLE' || x.status === 'OPTIMAL')) ??
-          r.find((x) => x.status === 'FEASIBLE' || x.status === 'OPTIMAL') ??
+          r.find(
+            (x) =>
+              String((x as any).parameters?.scope ?? '') === 'PROGRAM_GLOBAL' &&
+              (x.status === 'OPTIMAL' || x.status === 'FEASIBLE' || x.status === 'SUBOPTIMAL'),
+          ) ??
+          r.find((x) => x.status === 'OPTIMAL' || x.status === 'FEASIBLE' || x.status === 'SUBOPTIMAL') ??
           r[0]
         const p = new URLSearchParams(params)
         p.set('runId', preferred.id)
@@ -442,6 +508,42 @@ export function Timetable() {
     return Array.from(new Set(entries.map((e) => e.section_code))).sort()
   }, [entries])
 
+  const sectionCodesForYear = React.useMemo(() => {
+    const yn = Number(academicYearNumber)
+    return sectionCodes.filter((c) => {
+      const y = yearFromSectionCode(c)
+      return y == null || y === yn
+    })
+  }, [sectionCodes, academicYearNumber])
+
+  const sectionsForYear = React.useMemo(() => {
+    const yn = Number(academicYearNumber)
+    return sections.filter((s) => {
+      const y = yearFromSectionCode(s.code)
+      return y == null || y === yn
+    })
+  }, [sections, academicYearNumber])
+
+  React.useEffect(() => {
+    if (view !== 'SECTION') return
+    const options = runHasEntries
+      ? sectionCodesForYear
+      : sectionsForYear
+          .slice()
+          .sort((a, b) => a.code.localeCompare(b.code))
+          .map((s) => s.code)
+
+    if (!options.length) return
+    if (!sectionCode) {
+      setSection(options[0])
+      return
+    }
+    if (!options.includes(sectionCode)) {
+      setSection(options[0])
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view, runHasEntries, sectionCodesForYear, sectionsForYear, academicYearNumber])
+
   const slotsByDay = React.useMemo(() => {
     const map = new Map<number, TimeSlot[]>()
     for (const s of slots) {
@@ -511,6 +613,26 @@ export function Timetable() {
     }
     return map
   }, [fixedEntries, requiredSubjects])
+
+  const specialByCell = React.useMemo(() => {
+    const subjById = new Map(requiredSubjects.map((s) => [s.id, s]))
+    const map = new Map<CellKey, { entry: SpecialAllotment; isStart: boolean }>()
+    for (const e of specialAllotments.filter((x) => x.is_active)) {
+      const baseKey = cellKey(e.day_of_week, e.slot_index)
+      map.set(baseKey, { entry: e, isStart: true })
+
+      if (String(e.subject_type) === 'LAB') {
+        const subj = subjById.get(e.subject_id)
+        const block = Number(subj?.lab_block_size_slots ?? 1)
+        if (block > 1) {
+          for (let j = 1; j < block; j++) {
+            map.set(cellKey(e.day_of_week, e.slot_index + j), { entry: e, isStart: false })
+          }
+        }
+      }
+    }
+    return map
+  }, [specialAllotments, requiredSubjects])
 
   const [fixedModalOpen, setFixedModalOpen] = React.useState(false)
   const [fixedModalCell, setFixedModalCell] = React.useState<{ day: number; slotIndex: number; slotId: string } | null>(
@@ -883,13 +1005,13 @@ export function Timetable() {
                   id="tt_section"
                   ariaLabel="Section"
                   className="mt-1 text-sm"
-                  disabled={loading || (runHasEntries ? sectionCodes.length === 0 : sections.length === 0)}
+                  disabled={loading || (runHasEntries ? sectionCodesForYear.length === 0 : sectionsForYear.length === 0)}
                   value={
                     runHasEntries
-                      ? sectionCodes.length === 0
+                      ? sectionCodesForYear.length === 0
                         ? '__none__'
                         : sectionCode
-                      : sections.length === 0
+                      : sectionsForYear.length === 0
                         ? '__none__'
                         : sectionCode
                   }
@@ -899,12 +1021,12 @@ export function Timetable() {
                   }}
                   options={
                     runHasEntries
-                      ? sectionCodes.length === 0
+                      ? sectionCodesForYear.length === 0
                         ? [{ value: '__none__', label: 'No sections in this run', disabled: true }]
-                        : sectionCodes.map((c) => ({ value: c, label: c }))
-                      : sections.length === 0
+                        : sectionCodesForYear.map((c) => ({ value: c, label: c }))
+                      : sectionsForYear.length === 0
                         ? [{ value: '__none__', label: 'No sections found (create Sections first)', disabled: true }]
-                        : sections
+                        : sectionsForYear
                             .slice()
                             .sort((a, b) => a.code.localeCompare(b.code))
                             .map((s) => ({ value: s.code, label: s.code }))
@@ -1084,6 +1206,17 @@ export function Timetable() {
                           const key = cellKey(d, slotIndex)
 
                           const fixedInfo = fixedByCell.get(key) ?? null
+                          const specialInfo = specialByCell.get(key) ?? null
+
+                          const specialTitle = specialInfo
+                            ? [
+                                `Special lock: ${specialInfo.entry.subject_code} (${specialInfo.entry.subject_type})`,
+                                `${specialInfo.entry.teacher_code} · ${fmtRoomCodeById(specialInfo.entry.room_id, specialInfo.entry.room_code)}`,
+                                specialInfo.entry.reason ? `Reason: ${specialInfo.entry.reason}` : null,
+                              ]
+                                .filter(Boolean)
+                                .join('\n')
+                            : undefined
 
                           if (labSpans.skipCells.has(key)) {
                             return null
@@ -1097,27 +1230,44 @@ export function Timetable() {
                             <td
                               key={`${d}:${slotIndex}`}
                               colSpan={labSpan?.colSpan}
+                              title={specialTitle}
                               className={
                                 'border-t px-3 py-2 align-top ' +
                                 (hasThisSlot
-                                  ? fixedInfo
-                                    ? 'bg-amber-50'
-                                    : 'bg-white'
+                                  ? specialInfo
+                                    ? 'bg-rose-50'
+                                    : fixedInfo
+                                      ? 'bg-amber-50'
+                                      : 'bg-white'
                                   : 'bg-slate-50 text-slate-400')
                               }
-                              onClick={() => (hasThisSlot ? openFixedModal(d, slotIndex) : null)}
+                              onClick={() => (hasThisSlot && !specialInfo ? openFixedModal(d, slotIndex) : null)}
                             >
                               {!hasThisSlot ? (
                                 <div className="text-xs">—</div>
                               ) : items.length === 0 ? (
-                                fixedInfo ? (
+                                specialInfo ? (
+                                  <div className="rounded-xl border border-rose-200 bg-white p-2">
+                                    <div className="text-xs font-semibold text-slate-900">
+                                      🔒 {specialInfo.entry.subject_code}{' '}
+                                      <span className="text-slate-500">({specialInfo.entry.subject_type})</span>
+                                    </div>
+                                    <div className="mt-0.5 text-[11px] text-slate-600">
+                                      {specialInfo.entry.teacher_code} · {fmtRoomCodeById(specialInfo.entry.room_id, specialInfo.entry.room_code)}
+                                    </div>
+                                    <div className="mt-0.5 text-[11px] font-medium text-rose-700">Special lock</div>
+                                    {!specialInfo.isStart ? (
+                                      <div className="mt-0.5 text-[11px] text-slate-500">(lab block continuation)</div>
+                                    ) : null}
+                                  </div>
+                                ) : fixedInfo ? (
                                   <div className="rounded-xl border border-amber-200 bg-white p-2">
                                     <div className="text-xs font-semibold text-slate-900">
                                       🔒 {fixedInfo.entry.subject_code}{' '}
                                       <span className="text-slate-500">({fixedInfo.entry.subject_type})</span>
                                     </div>
                                     <div className="mt-0.5 text-[11px] text-slate-600">
-                                      {fixedInfo.entry.teacher_code} · {fixedInfo.entry.room_code}
+                                      {fixedInfo.entry.teacher_code} · {fmtRoomCodeById(fixedInfo.entry.room_id, fixedInfo.entry.room_code)}
                                     </div>
                                     {!fixedInfo.isStart ? (
                                       <div className="mt-0.5 text-[11px] text-slate-500">(lab block continuation)</div>
@@ -1131,12 +1281,17 @@ export function Timetable() {
                               ) : labSpan ? (
                                 <div className="rounded-xl border bg-slate-50 p-2">
                                   <div className="text-xs font-semibold text-slate-900">
-                                    {fixedInfo ? '🔒 ' : ''}
+                                    {specialInfo || fixedInfo ? '🔒 ' : ''}
                                     {labSpan.entry.subject_code} <span className="text-slate-500">(Lab · 2 hrs)</span>
                                   </div>
                                   <div className="mt-0.5 text-[11px] text-slate-600">
-                                    {labSpan.entry.teacher_code} · {labSpan.entry.room_code}
+                                    {labSpan.entry.teacher_code} · {fmtRoomCodeById(labSpan.entry.room_id, labSpan.entry.room_code)}
                                   </div>
+                                  {specialInfo ? (
+                                    <div className="mt-0.5 text-[11px] font-medium text-rose-700">Special lock</div>
+                                  ) : fixedInfo ? (
+                                    <div className="mt-0.5 text-[11px] font-medium text-amber-700">🔒 Fixed</div>
+                                  ) : null}
                                   <div className="mt-0.5 text-[11px] text-slate-500">
                                     {WEEKDAYS[labSpan.entry.day_of_week] ?? `D${labSpan.entry.day_of_week}`} #{labSpan.entry.slot_index} ({labSpan.entry.start_time}-{labSpan.endTime})
                                   </div>
@@ -1146,13 +1301,13 @@ export function Timetable() {
                                   {grouped.blocks.map((b) => (
                                     <div key={b.blockId} className="rounded-xl border border-indigo-200 bg-indigo-50 p-2">
                                       <div className="text-xs font-semibold text-slate-900">
-                                        {fixedInfo ? '🔒 ' : ''}🎓 {b.name}{' '}
+                                        {specialInfo || fixedInfo ? '🔒 ' : ''}🎓 {b.name}{' '}
                                         <span className="text-slate-500">({b.entries.length} parallel)</span>
                                       </div>
                                       <div className="mt-1 space-y-0.5">
                                         {b.entries.map((e) => (
                                           <div key={e.id} className="text-[11px] text-slate-700">
-                                            {e.subject_code} · {e.teacher_code} · {e.room_code}
+                                            {e.subject_code} · {e.teacher_code} · {fmtRoomCodeById(e.room_id, e.room_code)}
                                           </div>
                                         ))}
                                       </div>
@@ -1162,11 +1317,13 @@ export function Timetable() {
                                   {grouped.nonElective.map((e) => (
                                     <div key={e.id} className="rounded-xl border bg-slate-50 p-2">
                                       <div className="text-xs font-semibold text-slate-900">{e.subject_code}</div>
-                                      {fixedInfo ? (
+                                      {specialInfo ? (
+                                        <div className="mt-0.5 text-[11px] font-medium text-rose-700">🔒 Special lock</div>
+                                      ) : fixedInfo ? (
                                         <div className="mt-0.5 text-[11px] font-medium text-amber-700">🔒 Fixed</div>
                                       ) : null}
                                       <div className="mt-0.5 text-[11px] text-slate-600">
-                                        {e.teacher_code} · {e.room_code}
+                                        {e.teacher_code} · {fmtRoomCodeById(e.room_id, e.room_code)}
                                       </div>
                                       <div className="mt-0.5 text-[11px] text-slate-500">
                                         {fmtSlotLabel({
@@ -1271,6 +1428,7 @@ export function Timetable() {
                         options={[
                           { value: '__none__', label: 'Select…' },
                           ...rooms
+                            .filter((r) => !Boolean((r as any).is_special))
                             .slice()
                             .sort((a, b) => a.code.localeCompare(b.code))
                             .map((r) => ({
@@ -1394,12 +1552,15 @@ export function Timetable() {
                             ) : (
                               <div className="space-y-2">
                                 {grouped.electiveGroups.map((g) => {
+                                  const listItems =
+                                    view === 'FACULTY' ? collapseCombinedGridEntries(g.items) : g.items.map((e) => ({ ...e, section_codes: [e.section_code] }))
+
                                   const lines = [
                                     `ELECTIVE: ${g.name} (${g.items.length} parallel)`,
-                                    ...g.items.map((e) =>
+                                    ...listItems.map((e) =>
                                       view === 'ROOM'
                                         ? `${e.subject_code} — ${e.section_code} (Y${e.year_number}) — ${e.teacher_name}`
-                                        : `${e.subject_code} — ${e.section_code} (Y${e.year_number}) — ${e.room_code}`,
+                                        : `${e.subject_code} — ${e.section_codes.join(' + ')} (Y${e.year_number}) — ${fmtRoomCodeByCode(e.room_code)}`,
                                     ),
                                   ]
 
@@ -1414,19 +1575,21 @@ export function Timetable() {
                                         <span className="ml-1 text-slate-500">({g.items.length} parallel)</span>
                                       </div>
                                       <div className="mt-0.5 space-y-0.5 text-[11px] text-slate-700">
-                                        {g.items.slice(0, 3).map((e, idx) => (
-                                          <div key={`${e.section_code}:${e.subject_code}:${idx}`}>
-                                            <span className="font-semibold">{e.section_code}</span>
+                                        {listItems.slice(0, 3).map((e, idx) => (
+                                          <div key={`${e.section_codes.join('+')}:${e.subject_code}:${idx}`}>
+                                            <span className="font-semibold">
+                                              {view === 'ROOM' ? e.section_code : e.section_codes.join(' + ')}
+                                            </span>
                                             <span className="text-slate-500"> · </span>
                                             <span>{e.subject_code}</span>
                                             <span className="text-slate-500"> · </span>
-                                            <span>{view === 'ROOM' ? e.teacher_name : e.room_code}</span>
+                                            <span>{view === 'ROOM' ? e.teacher_name : fmtRoomCodeByCode(e.room_code)}</span>
                                             <span className="text-slate-500"> · </span>
                                             <span>Y{e.year_number}</span>
                                           </div>
                                         ))}
-                                        {g.items.length > 3 ? (
-                                          <div className="text-[11px] text-slate-500">+{g.items.length - 3} more</div>
+                                        {listItems.length > 3 ? (
+                                          <div className="text-[11px] text-slate-500">+{listItems.length - 3} more</div>
                                         ) : null}
                                       </div>
                                       <EntryTooltip lines={lines} />
@@ -1434,14 +1597,18 @@ export function Timetable() {
                                   )
                                 })}
 
-                                {grouped.nonElective.map((e, idx) => {
+                                {(view === 'FACULTY'
+                                  ? collapseCombinedGridEntries(grouped.nonElective)
+                                  : grouped.nonElective.map((e) => ({ ...e, section_codes: [e.section_code] }))).map((e, idx) => {
+                                  const sectionLabel =
+                                    view === 'FACULTY' ? e.section_codes.join(' + ') : e.section_code
                                   const title =
                                     view === 'ROOM'
                                       ? `${e.subject_code} — ${e.section_code} (Y${e.year_number}) — ${e.teacher_name}`
-                                      : `${e.subject_code} — ${e.section_code} (Y${e.year_number}) — ${e.room_code}`
+                                      : `${e.subject_code} — ${sectionLabel} (Y${e.year_number}) — ${fmtRoomCodeByCode(e.room_code)}`
                                   return (
                                     <div
-                                      key={`${e.day}:${e.slot_index}:${e.section_code}:${e.subject_code}:${idx}`}
+                                      key={`${e.day}:${e.slot_index}:${sectionLabel}:${e.subject_code}:${idx}`}
                                       className="group relative rounded-xl border bg-emerald-50 p-2"
                                       title={title}
                                     >
@@ -1452,9 +1619,9 @@ export function Timetable() {
                                         </div>
                                       </div>
                                       <div className="mt-0.5 text-[11px] text-slate-700">
-                                        <span className="font-semibold">{e.section_code}</span>
+                                        <span className="font-semibold">{sectionLabel}</span>
                                         <span className="text-slate-500"> · </span>
-                                        <span>{view === 'ROOM' ? e.teacher_name : e.room_code}</span>
+                                        <span>{view === 'ROOM' ? e.teacher_name : fmtRoomCodeByCode(e.room_code)}</span>
                                       </div>
                                       <div className="mt-0.5 text-[11px] text-slate-500">
                                         {WEEKDAYS[e.day] ?? `D${e.day}`} #{e.slot_index} ({e.start_time}-{e.end_time})
@@ -1466,13 +1633,13 @@ export function Timetable() {
                                             ? [
                                                 `${e.subject_code} — ${e.section_code} (Y${e.year_number})`,
                                                 `Teacher: ${e.teacher_name}`,
-                                                `Room: ${e.room_code}`,
+                                                `Room: ${fmtRoomCodeByCode(e.room_code)}`,
                                                 `Time: ${WEEKDAYS[e.day] ?? `D${e.day}`} #${e.slot_index} (${e.start_time}-${e.end_time})`,
                                               ]
                                             : [
-                                                `${e.subject_code} — ${e.section_code} (Y${e.year_number})`,
-                                                `Room: ${e.room_code}`,
-                                                `Teacher: ${e.teacher_name}`,
+                                                `${e.subject_code} — ${sectionLabel} (Y${e.year_number})`,
+                                                `Sections: ${sectionLabel}`,
+                                                `Room: ${fmtRoomCodeByCode(e.room_code)}`,
                                                 `Time: ${WEEKDAYS[e.day] ?? `D${e.day}`} #${e.slot_index} (${e.start_time}-${e.end_time})`,
                                               ]
                                         }

@@ -1,9 +1,10 @@
 // Default to 127.0.0.1 instead of localhost to avoid IPv6 (::1) resolution issues on Windows
 // when the backend is bound to IPv4 only.
 // Also normalize any env-provided localhost base to 127.0.0.1 (common source of “CORS”/ERR_FAILED in dev).
-const RAW_API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:8000'
+const RAW_API_BASE = import.meta.env.VITE_API_BASE ?? ''
 
 function normalizeApiBase(raw: string): string {
+  if (!raw) return ''
   try {
     const u = new URL(raw)
     if (u.hostname === 'localhost') u.hostname = '127.0.0.1'
@@ -14,35 +15,17 @@ function normalizeApiBase(raw: string): string {
   }
 }
 
-const API_BASE = normalizeApiBase(RAW_API_BASE)
-
-const DEMO_TOKEN_KEY = 'demo_token'
-const ACCESS_TOKEN_KEY = 'access_token'
-
-function getToken(): string | null {
-  return localStorage.getItem(ACCESS_TOKEN_KEY)
-}
-
-export function setDemoToken(): void {
-  localStorage.setItem(DEMO_TOKEN_KEY, 'demo-admin')
-}
-
-export function clearDemoToken(): void {
-  localStorage.removeItem(DEMO_TOKEN_KEY)
-}
-
-export function hasDemoToken(): boolean {
-  return Boolean(localStorage.getItem(DEMO_TOKEN_KEY))
-}
+// In production, if VITE_API_BASE is empty, we default to same-origin.
+// This is intentional for Vercel deployments that proxy `/api/*` to the backend via `vercel.json`.
+const API_BASE = import.meta.env.DEV ? '' : normalizeApiBase(RAW_API_BASE)
 
 export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
-  const token = getToken()
   const res = await fetch(`${API_BASE}${path}`, {
     ...init,
+    credentials: 'include',
     headers: {
       'Content-Type': 'application/json',
       ...(init?.headers ?? {}),
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
   })
 
@@ -125,29 +108,10 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
   return (await res.json()) as T
 }
 
-export async function devLogin(): Promise<void> {
-  const paths = ['/api/dev/token', '/api/auth/dev-login']
-  let lastError: unknown = null
-
-  for (const path of paths) {
-    try {
-      const data = await apiFetch<{ access_token: string; token_type: string }>(path, { method: 'POST' })
-      localStorage.setItem(ACCESS_TOKEN_KEY, data.access_token)
-      return
-    } catch (err) {
-      lastError = err
-    }
+export async function logout(): Promise<void> {
+  try {
+    await apiFetch('/api/auth/logout', { method: 'POST' })
+  } catch {
+    // Best-effort logout; cookie may already be cleared.
   }
-
-  throw lastError
-}
-
-export function logout(): void {
-  localStorage.removeItem(ACCESS_TOKEN_KEY)
-  localStorage.removeItem(DEMO_TOKEN_KEY)
-}
-
-export function isLoggedIn(): boolean {
-  // UI auth for Phase 1/2 is demo-token based; keep JWT token support for later.
-  return hasDemoToken() || Boolean(getToken())
 }

@@ -1,0 +1,20 @@
+from __future__ import annotations
+
+import uuid
+
+from sqlalchemy import Boolean, Column, DateTime, String, Text
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.sql import func
+
+from models.base import Base
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    username = Column(String(100), nullable=False, unique=True)
+    password_hash = Column(Text, nullable=False)
+    role = Column(String(20), nullable=False, default="ADMIN")
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())

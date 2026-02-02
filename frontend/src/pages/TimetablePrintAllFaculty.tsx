@@ -2,6 +2,7 @@ import React from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { useLayoutContext } from '../components/Layout'
 import { listTimeSlots, type TimeSlot } from '../api/solver'
+import { listRooms, type Room } from '../api/rooms'
 import { listTeachers, type Teacher } from '../api/teachers'
 import { getFacultyTimetable, type TimetableGridEntry } from '../api/timetable'
 
@@ -72,6 +73,33 @@ function groupGridForCell(entries: TimetableGridEntry[]) {
   return { nonElective, electiveGroups }
 }
 
+type CollapsedGridEntry = TimetableGridEntry & { section_codes: string[] }
+
+function collapseCombinedGridEntries(items: TimetableGridEntry[]): CollapsedGridEntry[] {
+  const byKey = new Map<string, CollapsedGridEntry>()
+
+  for (const e of items) {
+    const key = [e.subject_code, e.room_code, String(e.year_number), String(e.elective_block_id ?? '')].join('|')
+    const existing = byKey.get(key)
+    if (!existing) {
+      byKey.set(key, { ...e, section_codes: [e.section_code] })
+      continue
+    }
+    if (!existing.section_codes.includes(e.section_code)) {
+      existing.section_codes.push(e.section_code)
+    }
+  }
+
+  const collapsed = Array.from(byKey.values())
+  for (const e of collapsed) e.section_codes.sort((a, b) => a.localeCompare(b))
+  collapsed.sort((a, b) => {
+    const aKey = `${a.year_number}-${a.section_codes.join(',')}-${a.subject_code}`
+    const bKey = `${b.year_number}-${b.section_codes.join(',')}-${b.subject_code}`
+    return aKey.localeCompare(bKey)
+  })
+  return collapsed
+}
+
 async function mapWithConcurrency<T, R>(
   items: T[],
   limit: number,
@@ -103,11 +131,13 @@ function PrintGrid({
   title,
   subtitle,
   items,
+  fmtRoomCode,
 }: {
   slots: TimeSlot[]
   title: string
   subtitle: string
   items: TimetableGridEntry[]
+  fmtRoomCode: (roomCode: string) => string
 }) {
   const { slotIndices, days, daySlotIndexSet } = React.useMemo(() => slotsIndexAndDays(slots), [slots])
   const byCell = React.useMemo(() => toGridCellMap(items), [items])
@@ -171,13 +201,13 @@ function PrintGrid({
                               <div key={g.blockId} className="rounded-xl border bg-indigo-50 p-2">
                                 <div className="text-xs font-semibold text-slate-900">ELECTIVE: {g.name}</div>
                                 <div className="mt-0.5 space-y-0.5 text-[11px] text-slate-700">
-                                  {g.items.map((e, idx) => (
-                                    <div key={`${e.section_code}:${e.subject_code}:${idx}`}>
-                                      <span className="font-semibold">{e.section_code}</span>
+                                  {collapseCombinedGridEntries(g.items).map((e, idx) => (
+                                    <div key={`${e.section_codes.join('+')}:${e.subject_code}:${idx}`}>
+                                      <span className="font-semibold">{e.section_codes.join(' + ')}</span>
                                       <span className="text-slate-500"> · </span>
                                       <span>{e.subject_code}</span>
                                       <span className="text-slate-500"> · </span>
-                                      <span>{e.room_code}</span>
+                                      <span>{fmtRoomCode(e.room_code)}</span>
                                       <span className="text-slate-500"> · </span>
                                       <span>Y{e.year_number}</span>
                                     </div>
@@ -186,8 +216,8 @@ function PrintGrid({
                               </div>
                             ))}
 
-                            {grouped.nonElective.map((e, idx) => (
-                              <div key={`${e.section_code}:${e.subject_code}:${idx}`} className="rounded-xl border bg-emerald-50 p-2">
+                            {collapseCombinedGridEntries(grouped.nonElective).map((e, idx) => (
+                              <div key={`${e.section_codes.join('+')}:${e.subject_code}:${idx}`} className="rounded-xl border bg-emerald-50 p-2">
                                 <div className="flex items-center justify-between gap-2">
                                   <div className="text-xs font-semibold text-slate-900">{e.subject_code}</div>
                                   <div className="inline-flex rounded-full bg-emerald-600 px-2 py-0.5 text-[11px] font-semibold text-white">
@@ -195,9 +225,9 @@ function PrintGrid({
                                   </div>
                                 </div>
                                 <div className="mt-0.5 text-[11px] text-slate-700">
-                                  <span className="font-semibold">{e.section_code}</span>
+                                  <span className="font-semibold">{e.section_codes.join(' + ')}</span>
                                   <span className="text-slate-500"> · </span>
-                                  <span>{e.room_code}</span>
+                                  <span>{fmtRoomCode(e.room_code)}</span>
                                 </div>
                               </div>
                             ))}
@@ -226,11 +256,23 @@ export function TimetablePrintAllFaculty() {
   const [error, setError] = React.useState<string>('')
 
   const [slots, setSlots] = React.useState<TimeSlot[]>([])
+  const [rooms, setRooms] = React.useState<Room[]>([])
   const [teachers, setTeachers] = React.useState<Teacher[]>([])
   const [grids, setGrids] = React.useState<
     Array<{ teacherId: string; teacherCode: string; teacherName: string; entries: TimetableGridEntry[] }>
   >([])
   const [autoPrinted, setAutoPrinted] = React.useState(false)
+
+  const roomByCode = React.useMemo(() => {
+    const m = new Map<string, Room>()
+    for (const r of rooms) m.set(r.code, r)
+    return m
+  }, [rooms])
+
+  function fmtRoomCode(roomCode: string): string {
+    const r = roomByCode.get(roomCode)
+    return r?.is_special ? `🔒 ${roomCode}` : roomCode
+  }
 
   React.useEffect(() => {
     if (!runId) return
@@ -240,9 +282,10 @@ export function TimetablePrintAllFaculty() {
       setError('')
       setProgress({ done: 0, total: 0 })
       try {
-        const [s, t] = await Promise.all([listTimeSlots(), listTeachers()])
+        const [s, r, t] = await Promise.all([listTimeSlots(), listRooms(), listTeachers()])
         if (cancelled) return
         setSlots(s)
+        setRooms(r.filter((x) => Boolean(x.is_active)))
 
         const active = t.filter((x) => Boolean(x.is_active)).sort((a, b) => a.code.localeCompare(b.code))
         setTeachers(active)
@@ -345,6 +388,7 @@ export function TimetablePrintAllFaculty() {
                   title={`Faculty ${g.teacherCode} — ${g.teacherName}`}
                   subtitle={`Weekly load: ${g.entries.length} slots`}
                   items={g.entries}
+                  fmtRoomCode={fmtRoomCode}
                 />
                 {idx < grids.length - 1 ? <div className="page-break mt-10" /> : null}
               </div>

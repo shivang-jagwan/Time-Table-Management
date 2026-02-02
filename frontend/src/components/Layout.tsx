@@ -1,6 +1,6 @@
 import React from 'react'
 import { Outlet, useNavigate } from 'react-router-dom'
-import { logout } from '../api/client'
+import { useAuth } from '../auth/AuthProvider'
 import { Header } from './layout/Header'
 import { Sidebar } from './Sidebar'
 
@@ -21,13 +21,14 @@ export function useLayoutContext(): LayoutContextValue {
 
 export function Layout() {
   const navigate = useNavigate()
+  const { logout } = useAuth()
   const [collapsed, setCollapsed] = React.useState(false)
   const [mobileSidebarOpen, setMobileSidebarOpen] = React.useState(false)
   const [programCode, setProgramCode] = React.useState('CSE')
   const [academicYearNumber, setAcademicYearNumber] = React.useState(3)
 
-  function onLogout() {
-    logout()
+  async function onLogout() {
+    await logout()
     navigate('/login')
   }
 

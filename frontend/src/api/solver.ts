@@ -17,6 +17,7 @@ export type RunDetail = RunSummary & {
 
 export type SolverConflict = {
   severity: 'INFO' | 'WARN' | 'ERROR'
+  id?: string | null
   conflict_type: string
   message: string
   section_id?: string | null
@@ -24,6 +25,7 @@ export type SolverConflict = {
   subject_id?: string | null
   room_id?: string | null
   slot_id?: string | null
+  details?: Record<string, any>
   metadata: Record<string, any>
 }
 
@@ -35,9 +37,34 @@ export type GenerateTimetableResponse = {
 
 export type SolveTimetableResponse = {
   run_id: string
-  status: 'FAILED_VALIDATION' | 'INFEASIBLE' | 'FEASIBLE' | 'OPTIMAL' | 'ERROR'
+  status: 'FAILED_VALIDATION' | 'INFEASIBLE' | 'FEASIBLE' | 'SUBOPTIMAL' | 'OPTIMAL' | 'ERROR'
   entries_written: number
   conflicts: SolverConflict[]
+
+  reason_summary?: string | null
+  diagnostics?: Record<string, any>[]
+  objective_score?: number | null
+  improvements_possible?: boolean | null
+  warnings?: string[]
+  soft_conflicts?: SolverConflict[]
+  solver_stats?: Record<string, any>
+}
+
+export type SolveTimetableRequest = {
+  program_code: string
+  academic_year_number: number
+  seed?: number | null
+  max_time_seconds?: number
+  relax_teacher_load_limits?: boolean
+  require_optimal?: boolean
+}
+
+export type SolveGlobalTimetableRequest = {
+  program_code: string
+  seed?: number | null
+  max_time_seconds?: number
+  relax_teacher_load_limits?: boolean
+  require_optimal?: boolean
 }
 
 export async function generateTimetable(payload: {
@@ -61,32 +88,22 @@ export async function generateTimetableGlobal(payload: {
   })
 }
 
-export async function solveTimetable(payload: {
-  program_code: string
-  academic_year_number: number
-  seed?: number | null
-  max_time_seconds?: number
-  relax_teacher_load_limits?: boolean
-}): Promise<SolveTimetableResponse> {
+export async function solveTimetable(payload: SolveTimetableRequest): Promise<SolveTimetableResponse> {
   return apiFetch<SolveTimetableResponse>('/api/solver/solve', {
     method: 'POST',
     body: JSON.stringify(payload),
   })
 }
 
-export async function solveTimetableGlobal(payload: {
-  program_code: string
-  seed?: number | null
-  max_time_seconds?: number
-  relax_teacher_load_limits?: boolean
-}): Promise<SolveTimetableResponse> {
+export async function solveTimetableGlobal(payload: SolveGlobalTimetableRequest): Promise<SolveTimetableResponse> {
   return apiFetch<SolveTimetableResponse>('/api/solver/solve-global', {
     method: 'POST',
     body: JSON.stringify({
       program_code: payload.program_code,
       seed: payload.seed ?? null,
-      max_time_seconds: payload.max_time_seconds ?? 120,
+      max_time_seconds: payload.max_time_seconds ?? 300,
       relax_teacher_load_limits: Boolean(payload.relax_teacher_load_limits),
+      require_optimal: Boolean(payload.require_optimal),
     }),
   })
 }
@@ -205,6 +222,38 @@ export type FixedTimetableEntry = {
   created_at: string
 }
 
+export type SpecialAllotment = {
+  id: string
+
+  section_id: string
+  section_code: string
+  section_name: string
+
+  subject_id: string
+  subject_code: string
+  subject_name: string
+  subject_type: string
+
+  teacher_id: string
+  teacher_code: string
+  teacher_name: string
+
+  room_id: string
+  room_code: string
+  room_name: string
+  room_type: string
+
+  slot_id: string
+  day_of_week: number
+  slot_index: number
+  start_time: string
+  end_time: string
+
+  reason?: string | null
+  is_active: boolean
+  created_at: string
+}
+
 export async function listFixedEntries(params: {
   section_id: string
   include_inactive?: boolean
@@ -230,6 +279,36 @@ export async function upsertFixedEntry(payload: {
 
 export async function deleteFixedEntry(entry_id: string): Promise<{ ok: true }> {
   return apiFetch<{ ok: true }>(`/api/solver/fixed-entries/${entry_id}`, { method: 'DELETE' })
+}
+
+export async function listSpecialAllotments(params: {
+  section_id: string
+  include_inactive?: boolean
+}): Promise<SpecialAllotment[]> {
+  const qs = new URLSearchParams({ section_id: params.section_id })
+  if (params.include_inactive) qs.set('include_inactive', 'true')
+  const data = await apiFetch<{ entries: SpecialAllotment[] }>(
+    `/api/solver/special-allotments?${qs.toString()}`,
+  )
+  return data.entries
+}
+
+export async function upsertSpecialAllotment(payload: {
+  section_id: string
+  subject_id: string
+  teacher_id: string
+  room_id: string
+  slot_id: string
+  reason?: string | null
+}): Promise<SpecialAllotment> {
+  return apiFetch<SpecialAllotment>(`/api/solver/special-allotments`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export async function deleteSpecialAllotment(entry_id: string): Promise<{ ok: true }> {
+  return apiFetch<{ ok: true }>(`/api/solver/special-allotments/${entry_id}`, { method: 'DELETE' })
 }
 
 export type RequiredSubject = {

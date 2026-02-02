@@ -8,6 +8,7 @@ from sqlalchemy.exc import OperationalError as SAOperationalError
 from sqlalchemy.orm import Session
 
 from api.deps import require_admin
+from core.config import settings
 from core.db import (
     DatabaseUnavailableError,
     get_db,
@@ -21,6 +22,7 @@ from models.section import Section
 from models.section_elective import SectionElective
 from models.section_subject import SectionSubject
 from models.section_time_window import SectionTimeWindow
+from models.section_elective_block import SectionElectiveBlock
 from models.subject import Subject
 from models.teacher import Teacher
 from models.teacher_subject_section import TeacherSubjectSection
@@ -29,8 +31,12 @@ from models.timetable_conflict import TimetableConflict
 from models.timetable_entry import TimetableEntry
 from models.timetable_run import TimetableRun
 from models.fixed_timetable_entry import FixedTimetableEntry
+from models.special_allotment import SpecialAllotment
 from models.track_subject import TrackSubject
 from models.elective_block import ElectiveBlock
+from models.elective_block_subject import ElectiveBlockSubject
+from models.combined_subject_group import CombinedSubjectGroup
+from models.combined_subject_section import CombinedSubjectSection
 from schemas.solver import (
     GenerateTimetableRequest,
     GenerateGlobalTimetableRequest,
@@ -50,6 +56,9 @@ from schemas.solver import (
     FixedTimetableEntryOut,
     ListFixedTimetableEntriesResponse,
     UpsertFixedTimetableEntryRequest,
+    SpecialAllotmentOut,
+    ListSpecialAllotmentsResponse,
+    UpsertSpecialAllotmentRequest,
 )
 from schemas.subject import SubjectOut
 from services.solver_validation import validate_prereqs
@@ -103,6 +112,7 @@ def _validate_fixed_entry_refs(
     teacher: Teacher,
     room: Room,
     slot: TimeSlot,
+    allow_special_room: bool = False,
 ) -> None:
     if subject.program_id != section.program_id:
         raise HTTPException(status_code=400, detail="SUBJECT_PROGRAM_MISMATCH")
@@ -114,6 +124,8 @@ def _validate_fixed_entry_refs(
         raise HTTPException(status_code=400, detail="TEACHER_NOT_ACTIVE")
     if not bool(room.is_active):
         raise HTTPException(status_code=400, detail="ROOM_NOT_ACTIVE")
+    if not bool(allow_special_room) and bool(getattr(room, "is_special", False)):
+        raise HTTPException(status_code=400, detail="ROOM_IS_SPECIAL")
 
     # Section must be working at this slot (time window).
     w = (
@@ -174,6 +186,96 @@ def _validate_fixed_entry_refs(
             )
             if not exists:
                 raise HTTPException(status_code=400, detail="LAB_BLOCK_SLOT_MISSING")
+
+
+def _validate_special_allotment_refs(
+    db: Session,
+    *,
+    section: Section,
+    subject: Subject,
+    teacher: Teacher,
+    room: Room,
+    slot: TimeSlot,
+    existing_id: uuid.UUID | None = None,
+) -> None:
+    # Basic reference and feasibility checks are identical to fixed entries.
+    _validate_fixed_entry_refs(
+        db,
+        section=section,
+        subject=subject,
+        teacher=teacher,
+        room=room,
+        slot=slot,
+        allow_special_room=True,
+    )
+
+    if not bool(getattr(room, "is_special", False)):
+        raise HTTPException(status_code=400, detail="SPECIAL_ALLOTMENT_ROOM_NOT_SPECIAL")
+
+    # Not supported: special locks for elective blocks (would need to lock the entire block).
+    in_block = (
+        db.execute(
+            select(SectionElectiveBlock.id)
+            .join(ElectiveBlockSubject, ElectiveBlockSubject.block_id == SectionElectiveBlock.block_id)
+            .where(SectionElectiveBlock.section_id == section.id)
+            .where(ElectiveBlockSubject.subject_id == subject.id)
+            .limit(1)
+        ).first()
+        is not None
+    )
+    if in_block:
+        raise HTTPException(status_code=400, detail="SUBJECT_IN_ELECTIVE_BLOCK_NOT_SUPPORTED")
+
+    # Not supported: special locks for combined-class subjects.
+    in_combined = (
+        db.execute(
+            select(CombinedSubjectGroup.id)
+            .join(CombinedSubjectSection, CombinedSubjectSection.combined_group_id == CombinedSubjectGroup.id)
+            .where(CombinedSubjectGroup.subject_id == subject.id)
+            .where(CombinedSubjectSection.section_id == section.id)
+            .limit(1)
+        ).first()
+        is not None
+    )
+    if in_combined:
+        raise HTTPException(status_code=400, detail="SUBJECT_IN_COMBINED_CLASS_NOT_SUPPORTED")
+
+    # Disallow placing a special allotment where a fixed entry already exists.
+    fixed_exists = (
+        db.execute(
+            select(FixedTimetableEntry.id)
+            .where(FixedTimetableEntry.section_id == section.id)
+            .where(FixedTimetableEntry.slot_id == slot.id)
+            .where(FixedTimetableEntry.is_active.is_(True))
+            .limit(1)
+        ).first()
+        is not None
+    )
+    if fixed_exists:
+        raise HTTPException(status_code=400, detail="SLOT_HAS_FIXED_ENTRY")
+
+    # Teacher/room uniqueness across the whole program per-slot (active only).
+    q_teacher = (
+        select(SpecialAllotment.id)
+        .where(SpecialAllotment.teacher_id == teacher.id)
+        .where(SpecialAllotment.slot_id == slot.id)
+        .where(SpecialAllotment.is_active.is_(True))
+    )
+    if existing_id is not None:
+        q_teacher = q_teacher.where(SpecialAllotment.id != existing_id)
+    if db.execute(q_teacher.limit(1)).first() is not None:
+        raise HTTPException(status_code=400, detail="SPECIAL_ALLOTMENT_TEACHER_SLOT_CONFLICT")
+
+    q_room = (
+        select(SpecialAllotment.id)
+        .where(SpecialAllotment.room_id == room.id)
+        .where(SpecialAllotment.slot_id == slot.id)
+        .where(SpecialAllotment.is_active.is_(True))
+    )
+    if existing_id is not None:
+        q_room = q_room.where(SpecialAllotment.id != existing_id)
+    if db.execute(q_room.limit(1)).first() is not None:
+        raise HTTPException(status_code=400, detail="SPECIAL_ALLOTMENT_ROOM_SLOT_CONFLICT")
 
 
 @router.get("/section-required-subjects", response_model=list[SubjectOut])
@@ -311,6 +413,20 @@ def upsert_fixed_entry(
     if allowed_subject_ids and subject.id not in allowed_subject_ids:
         raise HTTPException(status_code=400, detail="SUBJECT_NOT_ALLOWED_FOR_SECTION")
 
+    # Prevent a fixed entry from being placed where a special allotment already exists.
+    special_exists = (
+        db.execute(
+            select(SpecialAllotment.id)
+            .where(SpecialAllotment.section_id == payload.section_id)
+            .where(SpecialAllotment.slot_id == payload.slot_id)
+            .where(SpecialAllotment.is_active.is_(True))
+            .limit(1)
+        ).first()
+        is not None
+    )
+    if special_exists:
+        raise HTTPException(status_code=400, detail="SLOT_HAS_SPECIAL_ALLOTMENT")
+
     _validate_fixed_entry_refs(db, section=section, subject=subject, teacher=teacher, room=room, slot=slot)
 
     # Upsert by (section, slot)
@@ -392,6 +508,188 @@ def delete_fixed_entry(
     row = db.get(FixedTimetableEntry, entry_id)
     if row is None:
         raise HTTPException(status_code=404, detail="FIXED_ENTRY_NOT_FOUND")
+    row.is_active = False
+    db.commit()
+    return {"ok": True}
+
+
+@router.get("/special-allotments", response_model=ListSpecialAllotmentsResponse)
+def list_special_allotments(
+    section_id: uuid.UUID,
+    include_inactive: bool = Query(default=False),
+    _admin=Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    section = db.get(Section, section_id)
+    if section is None:
+        raise HTTPException(status_code=404, detail="SECTION_NOT_FOUND")
+
+    q = (
+        select(SpecialAllotment, Section, Subject, Teacher, Room, TimeSlot)
+        .join(Section, Section.id == SpecialAllotment.section_id)
+        .join(Subject, Subject.id == SpecialAllotment.subject_id)
+        .join(Teacher, Teacher.id == SpecialAllotment.teacher_id)
+        .join(Room, Room.id == SpecialAllotment.room_id)
+        .join(TimeSlot, TimeSlot.id == SpecialAllotment.slot_id)
+        .where(SpecialAllotment.section_id == section_id)
+    )
+    if not include_inactive:
+        q = q.where(SpecialAllotment.is_active.is_(True))
+    q = q.order_by(TimeSlot.day_of_week.asc(), TimeSlot.slot_index.asc())
+
+    rows = db.execute(q).all()
+    out: list[SpecialAllotmentOut] = []
+    for sa, sec, subj, teacher, room, slot in rows:
+        out.append(
+            SpecialAllotmentOut(
+                id=sa.id,
+                section_id=sec.id,
+                section_code=sec.code,
+                section_name=sec.name,
+                subject_id=subj.id,
+                subject_code=subj.code,
+                subject_name=subj.name,
+                subject_type=str(subj.subject_type),
+                teacher_id=teacher.id,
+                teacher_code=teacher.code,
+                teacher_name=teacher.full_name,
+                room_id=room.id,
+                room_code=room.code,
+                room_name=room.name,
+                room_type=str(room.room_type),
+                slot_id=slot.id,
+                day_of_week=int(slot.day_of_week),
+                slot_index=int(slot.slot_index),
+                start_time=slot.start_time.strftime("%H:%M"),
+                end_time=slot.end_time.strftime("%H:%M"),
+                reason=getattr(sa, "reason", None),
+                is_active=bool(sa.is_active),
+                created_at=sa.created_at,
+            )
+        )
+    return ListSpecialAllotmentsResponse(entries=out)
+
+
+@router.post("/special-allotments", response_model=SpecialAllotmentOut)
+def upsert_special_allotment(
+    payload: UpsertSpecialAllotmentRequest,
+    _admin=Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    section = db.get(Section, payload.section_id)
+    if section is None:
+        raise HTTPException(status_code=404, detail="SECTION_NOT_FOUND")
+    subject = db.get(Subject, payload.subject_id)
+    if subject is None:
+        raise HTTPException(status_code=404, detail="SUBJECT_NOT_FOUND")
+    teacher = db.get(Teacher, payload.teacher_id)
+    if teacher is None:
+        raise HTTPException(status_code=404, detail="TEACHER_NOT_FOUND")
+    room = db.get(Room, payload.room_id)
+    if room is None:
+        raise HTTPException(status_code=404, detail="ROOM_NOT_FOUND")
+    if not bool(getattr(room, "is_special", False)):
+        raise HTTPException(status_code=400, detail="SPECIAL_ALLOTMENT_ROOM_NOT_SPECIAL")
+    slot = db.get(TimeSlot, payload.slot_id)
+    if slot is None:
+        raise HTTPException(status_code=404, detail="SLOT_NOT_FOUND")
+
+    allowed_subject_ids = set(_required_subject_ids_for_section(db, program_id=section.program_id, section=section))
+    if allowed_subject_ids and subject.id not in allowed_subject_ids:
+        raise HTTPException(status_code=400, detail="SUBJECT_NOT_ALLOWED_FOR_SECTION")
+
+    # Upsert by (section, slot)
+    existing = (
+        db.execute(
+            select(SpecialAllotment)
+            .where(SpecialAllotment.section_id == payload.section_id)
+            .where(SpecialAllotment.slot_id == payload.slot_id)
+            .where(SpecialAllotment.is_active.is_(True))
+        )
+        .scalars()
+        .first()
+    )
+
+    _validate_special_allotment_refs(
+        db,
+        section=section,
+        subject=subject,
+        teacher=teacher,
+        room=room,
+        slot=slot,
+        existing_id=existing.id if existing is not None else None,
+    )
+
+    if existing is None:
+        existing = SpecialAllotment(
+            section_id=payload.section_id,
+            subject_id=payload.subject_id,
+            teacher_id=payload.teacher_id,
+            room_id=payload.room_id,
+            slot_id=payload.slot_id,
+            reason=payload.reason,
+            is_active=True,
+        )
+        db.add(existing)
+    else:
+        existing.subject_id = payload.subject_id
+        existing.teacher_id = payload.teacher_id
+        existing.room_id = payload.room_id
+        existing.reason = payload.reason
+
+    db.commit()
+
+    row = (
+        db.execute(
+            select(SpecialAllotment, Section, Subject, Teacher, Room, TimeSlot)
+            .join(Section, Section.id == SpecialAllotment.section_id)
+            .join(Subject, Subject.id == SpecialAllotment.subject_id)
+            .join(Teacher, Teacher.id == SpecialAllotment.teacher_id)
+            .join(Room, Room.id == SpecialAllotment.room_id)
+            .join(TimeSlot, TimeSlot.id == SpecialAllotment.slot_id)
+            .where(SpecialAllotment.id == existing.id)
+        )
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=500, detail="SPECIAL_ALLOTMENT_WRITE_FAILED")
+    sa, sec, subj, teacher, room, slot = row
+    return SpecialAllotmentOut(
+        id=sa.id,
+        section_id=sec.id,
+        section_code=sec.code,
+        section_name=sec.name,
+        subject_id=subj.id,
+        subject_code=subj.code,
+        subject_name=subj.name,
+        subject_type=str(subj.subject_type),
+        teacher_id=teacher.id,
+        teacher_code=teacher.code,
+        teacher_name=teacher.full_name,
+        room_id=room.id,
+        room_code=room.code,
+        room_name=room.name,
+        room_type=str(room.room_type),
+        slot_id=slot.id,
+        day_of_week=int(slot.day_of_week),
+        slot_index=int(slot.slot_index),
+        start_time=slot.start_time.strftime("%H:%M"),
+        end_time=slot.end_time.strftime("%H:%M"),
+        reason=getattr(sa, "reason", None),
+        is_active=bool(sa.is_active),
+        created_at=sa.created_at,
+    )
+
+
+@router.delete("/special-allotments/{entry_id}")
+def delete_special_allotment(
+    entry_id: uuid.UUID,
+    _admin=Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    row = db.get(SpecialAllotment, entry_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="SPECIAL_ALLOTMENT_NOT_FOUND")
     row.is_active = False
     db.commit()
     return {"ok": True}
@@ -505,31 +803,84 @@ def list_run_conflicts(
     if run is None:
         raise HTTPException(status_code=404, detail="RUN_NOT_FOUND")
 
-    rows = (
-        db.execute(
-            select(TimetableConflict)
-            .where(TimetableConflict.run_id == run_id)
-            .order_by(TimetableConflict.created_at.asc())
-        )
-        .scalars()
-        .all()
-    )
+    rows = db.execute(
+        select(TimetableConflict, Section, Subject, Teacher, Room, TimeSlot)
+        .outerjoin(Section, Section.id == TimetableConflict.section_id)
+        .outerjoin(Teacher, Teacher.id == TimetableConflict.teacher_id)
+        .outerjoin(Subject, Subject.id == TimetableConflict.subject_id)
+        .outerjoin(Room, Room.id == TimetableConflict.room_id)
+        .outerjoin(TimeSlot, TimeSlot.id == TimetableConflict.slot_id)
+        .where(TimetableConflict.run_id == run_id)
+        .order_by(TimetableConflict.created_at.asc())
+    ).all()
 
     return ListRunConflictsResponse(
         run_id=run_id,
         conflicts=[
-            SolverConflict(
-                severity=str(c.severity),
-                conflict_type=c.conflict_type,
-                message=c.message,
-                section_id=c.section_id,
-                teacher_id=c.teacher_id,
-                subject_id=c.subject_id,
-                room_id=c.room_id,
-                slot_id=c.slot_id,
-                metadata=c.metadata_json or {},
-            )
-            for c in rows
+            (
+                lambda c, sec, subj, teacher, room, slot: SolverConflict(
+                    id=c.id,
+                    severity=str(c.severity),
+                    conflict_type=c.conflict_type,
+                    message=c.message,
+                    section_id=c.section_id,
+                    teacher_id=c.teacher_id,
+                    subject_id=c.subject_id,
+                    room_id=c.room_id,
+                    slot_id=c.slot_id,
+                    details={
+                        **{
+                            **(
+                                {
+                                    "section_code": sec.code,
+                                    "section_name": sec.name,
+                                }
+                                if sec is not None
+                                else {}
+                            ),
+                            **(
+                                {
+                                    "subject_code": subj.code,
+                                    "subject_name": subj.name,
+                                    "subject_type": str(subj.subject_type),
+                                }
+                                if subj is not None
+                                else {}
+                            ),
+                            **(
+                                {
+                                    "teacher_code": teacher.code,
+                                    "teacher_name": teacher.full_name,
+                                }
+                                if teacher is not None
+                                else {}
+                            ),
+                            **(
+                                {
+                                    "room_code": room.code,
+                                    "room_name": room.name,
+                                    "room_type": str(room.room_type),
+                                }
+                                if room is not None
+                                else {}
+                            ),
+                            **(
+                                {
+                                    "day_of_week": slot.day_of_week,
+                                    "slot_index": slot.slot_index,
+                                    "start_time": slot.start_time.isoformat(),
+                                    "end_time": slot.end_time.isoformat(),
+                                }
+                                if slot is not None
+                                else {}
+                            ),
+                        },
+                        **(c.details_json or c.metadata_json or {}),
+                    },
+                    metadata=c.metadata_json or {},
+                )
+            )(*row)
+            for row in rows
         ],
     )
 
@@ -711,7 +1062,8 @@ def generate_timetable(
                         subject_id=c.subject_id,
                         room_id=c.room_id,
                         slot_id=c.slot_id,
-                        metadata=c.metadata or {},
+                        details=(c.details_json or c.metadata_json or {}),
+                        metadata=(c.metadata_json or c.details_json or {}),
                     )
                     for c in conflicts
                 ],
@@ -733,7 +1085,7 @@ def generate_timetable(
                     subject_id=c.subject_id,
                     room_id=c.room_id,
                     slot_id=c.slot_id,
-                    metadata=c.metadata or {},
+                    metadata=(c.metadata_json or c.details_json or {}),
                 )
                 for c in warnings
             ],
@@ -843,7 +1195,8 @@ def generate_timetable_global(
                         subject_id=c.subject_id,
                         room_id=c.room_id,
                         slot_id=c.slot_id,
-                        metadata=c.metadata or {},
+                        details=(c.details_json or c.metadata_json or {}),
+                        metadata=(c.metadata_json or c.details_json or {}),
                     )
                     for c in conflicts
                 ],
@@ -864,7 +1217,7 @@ def generate_timetable_global(
                     subject_id=c.subject_id,
                     room_id=c.room_id,
                     slot_id=c.slot_id,
-                    metadata=c.metadata or {},
+                    metadata=(c.metadata_json or c.details_json or {}),
                 )
                 for c in warnings
             ],
@@ -887,6 +1240,10 @@ def solve_timetable(
     db: Session = Depends(get_db),
 ):
     try:
+        max_time_seconds = float(payload.max_time_seconds)
+        if settings.environment.lower() == "production":
+            max_time_seconds = min(max_time_seconds, 30.0)
+
         # Explicit connectivity validation before creating any rows.
         validate_db_connection(db)
 
@@ -899,8 +1256,9 @@ def solve_timetable(
             parameters={
                 "program_code": payload.program_code,
                 "academic_year_number": payload.academic_year_number,
-                "max_time_seconds": payload.max_time_seconds,
+                "max_time_seconds": max_time_seconds,
                 "relax_teacher_load_limits": payload.relax_teacher_load_limits,
+                "require_optimal": payload.require_optimal,
                 "scope": "ACADEMIC_YEAR",
             },
         )
@@ -972,7 +1330,8 @@ def solve_timetable(
                         subject_id=c.subject_id,
                         room_id=c.room_id,
                         slot_id=c.slot_id,
-                        metadata=c.metadata or {},
+                        details=(c.details_json or c.metadata_json or {}),
+                        metadata=(c.metadata_json or c.details_json or {}),
                     )
                     for c in conflicts
                 ],
@@ -999,14 +1358,38 @@ def solve_timetable(
             program_id=program.id,
             academic_year_id=ay.id,
             seed=payload.seed,
-            max_time_seconds=payload.max_time_seconds,
+            max_time_seconds=max_time_seconds,
             enforce_teacher_load_limits=not payload.relax_teacher_load_limits,
+            require_optimal=payload.require_optimal,
         )
+
+        # Soft conflicts (warnings) created during solve (e.g., room assignment conflicts).
+        soft_conflicts: list[TimetableConflict] = []
+        if str(result.status) in {"FEASIBLE", "OPTIMAL"}:
+            soft_conflicts = (
+                db.execute(
+                    select(TimetableConflict)
+                    .where(TimetableConflict.run_id == run.id)
+                    .where(func.upper(TimetableConflict.severity) == "WARN")
+                    .order_by(TimetableConflict.created_at.asc())
+                    .limit(200)
+                )
+                .scalars()
+                .all()
+            )
 
         return SolveTimetableResponse(
             run_id=run.id,
             status=result.status,
             entries_written=result.entries_written,
+            reason_summary=getattr(result, "reason_summary", None),
+            diagnostics=getattr(result, "diagnostics", []) or [],
+            objective_score=getattr(result, "objective_score", None),
+            improvements_possible=True
+            if str(result.status) in {"FEASIBLE", "SUBOPTIMAL"}
+            else (False if str(result.status) == "OPTIMAL" else None),
+            warnings=getattr(result, "warnings", []) or [],
+            solver_stats=getattr(result, "solver_stats", {}) or {},
             conflicts=(
                 [
                     SolverConflict(
@@ -1018,12 +1401,14 @@ def solve_timetable(
                         subject_id=c.subject_id,
                         room_id=c.room_id,
                         slot_id=c.slot_id,
-                        metadata=c.metadata or {},
+                        details=(c.details_json or c.metadata_json or {}),
+                        metadata=(c.metadata_json or c.details_json or {}),
                     )
                     for c in warnings
                 ]
                 + [
                     SolverConflict(
+                        id=c.id,
                         severity=c.severity,
                         conflict_type=c.conflict_type,
                         message=c.message,
@@ -1032,11 +1417,28 @@ def solve_timetable(
                         subject_id=c.subject_id,
                         room_id=c.room_id,
                         slot_id=c.slot_id,
-                        metadata=c.metadata or {},
+                        details=(c.details_json or c.metadata_json or {}),
+                        metadata=c.metadata_json or {},
                     )
                     for c in result.conflicts
                 ]
             ),
+            soft_conflicts=[
+                SolverConflict(
+                    id=c.id,
+                    severity=c.severity,
+                    conflict_type=c.conflict_type,
+                    message=c.message,
+                    section_id=c.section_id,
+                    teacher_id=c.teacher_id,
+                    subject_id=c.subject_id,
+                    room_id=c.room_id,
+                    slot_id=c.slot_id,
+                    details=(c.details_json or c.metadata_json or {}),
+                    metadata=(c.metadata_json or c.details_json or {}),
+                )
+                for c in soft_conflicts
+            ],
         )
 
     except DatabaseUnavailableError:
@@ -1060,6 +1462,10 @@ def solve_timetable_global(
     Builds ONE CP-SAT model that schedules all active sections for the program across all academic years.
     """
     try:
+        max_time_seconds = float(payload.max_time_seconds)
+        if settings.environment.lower() == "production":
+            max_time_seconds = min(max_time_seconds, 30.0)
+
         validate_db_connection(db)
 
         run = TimetableRun(
@@ -1068,8 +1474,9 @@ def solve_timetable_global(
             status="CREATED",
             parameters={
                 "program_code": payload.program_code,
-                "max_time_seconds": payload.max_time_seconds,
+                "max_time_seconds": max_time_seconds,
                 "relax_teacher_load_limits": payload.relax_teacher_load_limits,
+                "require_optimal": payload.require_optimal,
                 "scope": "PROGRAM_GLOBAL",
             },
         )
@@ -1145,7 +1552,8 @@ def solve_timetable_global(
                         subject_id=c.subject_id,
                         room_id=c.room_id,
                         slot_id=c.slot_id,
-                        metadata=c.metadata or {},
+                        details=(c.details_json or c.metadata_json or {}),
+                        metadata=(c.metadata_json or c.details_json or {}),
                     )
                     for c in conflicts
                 ],
@@ -1168,14 +1576,35 @@ def solve_timetable_global(
             run=run,
             program_id=program.id,
             seed=payload.seed,
-            max_time_seconds=payload.max_time_seconds,
+            max_time_seconds=max_time_seconds,
             enforce_teacher_load_limits=not payload.relax_teacher_load_limits,
+            require_optimal=payload.require_optimal,
         )
+
+        soft_conflicts: list[TimetableConflict] = []
+        if str(result.status) in {"FEASIBLE", "OPTIMAL"}:
+            soft_conflicts = (
+                db.execute(
+                    select(TimetableConflict)
+                    .where(TimetableConflict.run_id == run.id)
+                    .where(func.upper(TimetableConflict.severity) == "WARN")
+                    .order_by(TimetableConflict.created_at.asc())
+                    .limit(200)
+                )
+                .scalars()
+                .all()
+            )
 
         return SolveTimetableResponse(
             run_id=run.id,
             status=result.status,
             entries_written=result.entries_written,
+            reason_summary=getattr(result, "reason_summary", None),
+            diagnostics=getattr(result, "diagnostics", []) or [],
+            objective_score=getattr(result, "objective_score", None),
+            improvements_possible=True if str(result.status) == "FEASIBLE" else (False if str(result.status) == "OPTIMAL" else None),
+            warnings=getattr(result, "warnings", []) or [],
+            solver_stats=getattr(result, "solver_stats", {}) or {},
             conflicts=(
                 [
                     SolverConflict(
@@ -1187,12 +1616,14 @@ def solve_timetable_global(
                         subject_id=c.subject_id,
                         room_id=c.room_id,
                         slot_id=c.slot_id,
-                        metadata=c.metadata or {},
+                        details=(c.details_json or c.metadata_json or {}),
+                        metadata=(c.metadata_json or c.details_json or {}),
                     )
                     for c in warnings
                 ]
                 + [
                     SolverConflict(
+                        id=c.id,
                         severity=c.severity,
                         conflict_type=c.conflict_type,
                         message=c.message,
@@ -1201,11 +1632,28 @@ def solve_timetable_global(
                         subject_id=c.subject_id,
                         room_id=c.room_id,
                         slot_id=c.slot_id,
-                        metadata=c.metadata or {},
+                        details=(c.details_json or c.metadata_json or {}),
+                        metadata=c.metadata_json or {},
                     )
                     for c in result.conflicts
                 ]
             ),
+            soft_conflicts=[
+                SolverConflict(
+                    id=c.id,
+                    severity=c.severity,
+                    conflict_type=c.conflict_type,
+                    message=c.message,
+                    section_id=c.section_id,
+                    teacher_id=c.teacher_id,
+                    subject_id=c.subject_id,
+                    room_id=c.room_id,
+                    slot_id=c.slot_id,
+                    details=(c.details_json or c.metadata_json or {}),
+                    metadata=(c.metadata_json or c.details_json or {}),
+                )
+                for c in soft_conflicts
+            ],
         )
 
     except DatabaseUnavailableError:

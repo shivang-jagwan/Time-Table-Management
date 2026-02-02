@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -12,6 +12,7 @@ from api.deps import require_admin
 from core.db import get_db
 from models.fixed_timetable_entry import FixedTimetableEntry
 from models.room import Room
+from models.special_allotment import SpecialAllotment
 from models.timetable_entry import TimetableEntry
 from schemas.room import RoomCreate, RoomOut, RoomUpdate
 
@@ -28,6 +29,24 @@ def _ensure_unique_room_code(db: Session, *, code: str, exclude_room_id: uuid.UU
         q = q.where(Room.id != exclude_room_id)
     if db.execute(q.limit(1)).first() is not None:
         raise HTTPException(status_code=409, detail="ROOM_CODE_ALREADY_EXISTS")
+
+
+def _room_in_use_flags(db: Session, *, room_id: uuid.UUID) -> dict[str, bool]:
+    used_in_runs = (
+        db.execute(select(TimetableEntry.id).where(TimetableEntry.room_id == room_id).limit(1)).first() is not None
+    )
+    used_in_fixed = (
+        db.execute(select(FixedTimetableEntry.id).where(FixedTimetableEntry.room_id == room_id).limit(1)).first()
+        is not None
+    )
+    used_in_special = (
+        db.execute(select(SpecialAllotment.id).where(SpecialAllotment.room_id == room_id).limit(1)).first() is not None
+    )
+    return {
+        "used_in_timetable_entries": bool(used_in_runs),
+        "used_in_fixed_entries": bool(used_in_fixed),
+        "used_in_special_allotments": bool(used_in_special),
+    }
 
 
 @router.get("/", response_model=list[RoomOut])
@@ -47,6 +66,8 @@ def create_room(
     data = payload.model_dump()
     data["code"] = str(data["code"]).strip()
     data["name"] = str(data["name"]).strip()
+    if data.get("special_note") is not None:
+        data["special_note"] = str(data["special_note"]).strip() or None
     if not data["code"]:
         raise HTTPException(status_code=400, detail="INVALID_CODE")
     if not data["name"]:
@@ -69,6 +90,7 @@ def create_room(
 def put_room(
     room_id: uuid.UUID,
     payload: RoomCreate,
+    force: bool = Query(default=False),
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> RoomOut:
@@ -79,6 +101,8 @@ def put_room(
     data = payload.model_dump()
     data["code"] = str(data["code"]).strip()
     data["name"] = str(data["name"]).strip()
+    if data.get("special_note") is not None:
+        data["special_note"] = str(data["special_note"]).strip() or None
     if not data["code"]:
         raise HTTPException(status_code=400, detail="INVALID_CODE")
     if not data["name"]:
@@ -98,11 +122,28 @@ def put_room(
                 str(room.code),
             )
 
+    if bool(data.get("is_special")) and not bool(getattr(room, "is_special", False)):
+        flags = _room_in_use_flags(db, room_id=room_id)
+        if any(flags.values()) and not force:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ROOM_IN_USE_CONFIRM_REQUIRED",
+                    "errors": [
+                        "Room is referenced by existing timetable/fixed/special rows.",
+                        f"Usage: {flags}",
+                        "Retry with ?force=true to confirm.",
+                    ],
+                },
+            )
+
     room.code = data["code"]
     room.name = data["name"]
     room.room_type = data["room_type"]
     room.capacity = int(data["capacity"])
     room.is_active = bool(data["is_active"])
+    room.is_special = bool(data.get("is_special"))
+    room.special_note = data.get("special_note")
 
     try:
         db.commit()
@@ -117,6 +158,7 @@ def put_room(
 def update_room(
     room_id: uuid.UUID,
     payload: RoomUpdate,
+    force: bool = Query(default=False),
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> RoomOut:
@@ -135,6 +177,9 @@ def update_room(
         if not updates["name"]:
             raise HTTPException(status_code=400, detail="INVALID_NAME")
 
+    if "special_note" in updates and updates.get("special_note") is not None:
+        updates["special_note"] = str(updates["special_note"]).strip() or None
+
     if "room_type" in updates and updates.get("room_type") is not None and str(room.room_type) != str(updates["room_type"]):
         used_in_runs = db.execute(select(TimetableEntry.id).where(TimetableEntry.room_id == room_id).limit(1)).first()
         used_in_fixed = db.execute(
@@ -145,6 +190,21 @@ def update_room(
                 "Room type changed for room_id=%s (code=%s) but room is referenced by timetable/fixed entries",
                 str(room_id),
                 str(room.code),
+            )
+
+    if updates.get("is_special") is True and not bool(getattr(room, "is_special", False)):
+        flags = _room_in_use_flags(db, room_id=room_id)
+        if any(flags.values()) and not force:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ROOM_IN_USE_CONFIRM_REQUIRED",
+                    "errors": [
+                        "Room is referenced by existing timetable/fixed/special rows.",
+                        f"Usage: {flags}",
+                        "Retry with ?force=true to confirm.",
+                    ],
+                },
             )
     for k, v in updates.items():
         setattr(room, k, v)

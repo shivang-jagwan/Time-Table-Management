@@ -221,7 +221,6 @@ export function Dashboard() {
           <div className="text-sm font-semibold text-slate-900">Electives</div>
           <div className="mt-3 flex flex-wrap gap-2">
             <Link className="btn-secondary text-sm" to="/elective-blocks">Elective Blocks</Link>
-            <Link className="btn-secondary text-sm" to="/electives">Legacy Electives</Link>
             <Link className="btn-secondary text-sm" to="/combined-classes">Combined Classes</Link>
           </div>
         </div>

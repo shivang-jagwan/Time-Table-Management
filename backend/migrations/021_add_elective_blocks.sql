@@ -11,18 +11,17 @@ CREATE TABLE IF NOT EXISTS elective_blocks (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   program_id uuid NOT NULL REFERENCES programs(id) ON DELETE RESTRICT,
   academic_year_id uuid NOT NULL REFERENCES academic_years(id) ON DELETE RESTRICT,
-  semester integer NOT NULL,
   name text NOT NULL,
   code text NULL,
   is_active boolean NOT NULL DEFAULT true,
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS ix_elective_blocks_program_year_semester
-  ON elective_blocks(program_id, academic_year_id, semester);
+CREATE INDEX IF NOT EXISTS ix_elective_blocks_program_year
+  ON elective_blocks(program_id, academic_year_id);
 
-CREATE UNIQUE INDEX IF NOT EXISTS ux_elective_blocks_program_year_semester_name
-  ON elective_blocks(program_id, academic_year_id, semester, name);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_elective_blocks_program_year_name
+  ON elective_blocks(program_id, academic_year_id, name);
 
 CREATE TABLE IF NOT EXISTS elective_block_subjects (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

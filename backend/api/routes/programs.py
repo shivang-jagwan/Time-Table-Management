@@ -18,7 +18,6 @@ router = APIRouter()
 
 @router.get("/", response_model=list[ProgramOut])
 def list_programs(
-    _admin=Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> list[ProgramOut]:
     return db.execute(select(Program).order_by(Program.code.asc())).scalars().all()

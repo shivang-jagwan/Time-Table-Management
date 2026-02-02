@@ -24,17 +24,20 @@ class GenerateGlobalTimetableRequest(BaseModel):
 
 
 class SolveTimetableRequest(GenerateTimetableRequest):
-    max_time_seconds: float = Field(default=10.0, gt=0)
+    max_time_seconds: float = Field(default=60.0, gt=0)
     relax_teacher_load_limits: bool = False
+    require_optimal: bool = True
 
 
 class SolveGlobalTimetableRequest(GenerateGlobalTimetableRequest):
-    max_time_seconds: float = Field(default=120.0, gt=0)
+    max_time_seconds: float = Field(default=300.0, gt=0)
     relax_teacher_load_limits: bool = False
+    require_optimal: bool = True
 
 
 class SolverConflict(BaseModel):
-    severity: Literal["ERROR", "WARN"] = "ERROR"
+    id: uuid.UUID | None = None
+    severity: Literal["INFO", "WARN", "ERROR"] = "ERROR"
     conflict_type: str
     message: str
     section_id: uuid.UUID | None = None
@@ -42,6 +45,9 @@ class SolverConflict(BaseModel):
     subject_id: uuid.UUID | None = None
     room_id: uuid.UUID | None = None
     slot_id: uuid.UUID | None = None
+    # New structured payload for UI drill-down. Prefer this over `metadata`.
+    details: dict[str, Any] = Field(default_factory=dict)
+    # Legacy: kept so older frontend builds still work.
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -53,9 +59,18 @@ class GenerateTimetableResponse(BaseModel):
 
 class SolveTimetableResponse(BaseModel):
     run_id: uuid.UUID
-    status: Literal["FAILED_VALIDATION", "INFEASIBLE", "FEASIBLE", "OPTIMAL", "ERROR"]
+    status: Literal["FAILED_VALIDATION", "INFEASIBLE", "FEASIBLE", "SUBOPTIMAL", "OPTIMAL", "ERROR"]
     entries_written: int = 0
     conflicts: list[SolverConflict] = Field(default_factory=list)
+
+    # Extended solver result details
+    reason_summary: str | None = None
+    diagnostics: list[dict[str, Any]] = Field(default_factory=list)
+    objective_score: int | None = None
+    improvements_possible: bool | None = None
+    warnings: list[str] = Field(default_factory=list)
+    soft_conflicts: list[SolverConflict] = Field(default_factory=list)
+    solver_stats: dict[str, Any] = Field(default_factory=dict)
 
 
 class RunSummary(BaseModel):
@@ -174,6 +189,51 @@ class UpsertFixedTimetableEntryRequest(BaseModel):
     teacher_id: uuid.UUID
     room_id: uuid.UUID
     slot_id: uuid.UUID
+
+
+class SpecialAllotmentOut(BaseModel):
+    id: uuid.UUID
+
+    section_id: uuid.UUID
+    section_code: str
+    section_name: str
+
+    subject_id: uuid.UUID
+    subject_code: str
+    subject_name: str
+    subject_type: str
+
+    teacher_id: uuid.UUID
+    teacher_code: str
+    teacher_name: str
+
+    room_id: uuid.UUID
+    room_code: str
+    room_name: str
+    room_type: str
+
+    slot_id: uuid.UUID
+    day_of_week: int
+    slot_index: int
+    start_time: str
+    end_time: str
+
+    reason: str | None = None
+    is_active: bool
+    created_at: datetime
+
+
+class ListSpecialAllotmentsResponse(BaseModel):
+    entries: list[SpecialAllotmentOut] = Field(default_factory=list)
+
+
+class UpsertSpecialAllotmentRequest(BaseModel):
+    section_id: uuid.UUID
+    subject_id: uuid.UUID
+    teacher_id: uuid.UUID
+    room_id: uuid.UUID
+    slot_id: uuid.UUID
+    reason: str | None = None
 
 
 class EligibleTeacherOut(BaseModel):

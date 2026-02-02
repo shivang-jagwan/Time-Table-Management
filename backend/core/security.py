@@ -3,23 +3,37 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import bcrypt
 from jose import jwt
 
 from core.config import settings
 
 
-ALGORITHM = "HS256"
+
+def hash_password(password: str) -> str:
+    hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=12))
+    return hashed.decode("utf-8")
 
 
-def create_access_token(*, subject: str, expires_minutes: int = 60 * 24) -> str:
+def verify_password(password: str, password_hash: str) -> bool:
+    try:
+        return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
+    except Exception:
+        return False
+
+
+def create_access_token(*, user_id: str, username: str, role: str) -> str:
     now = datetime.now(timezone.utc)
+    expires_minutes = int(settings.access_token_expire_minutes)
     payload: dict[str, Any] = {
-        "sub": subject,
+        "sub": user_id,
+        "username": username,
+        "role": role,
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(minutes=expires_minutes)).timestamp()),
     }
-    return jwt.encode(payload, settings.jwt_secret, algorithm=ALGORITHM)
+    return jwt.encode(payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
 
 
 def decode_token(token: str) -> dict[str, Any]:
-    return jwt.decode(token, settings.jwt_secret, algorithms=[ALGORITHM])
+    return jwt.decode(token, settings.jwt_secret_key, algorithms=[settings.jwt_algorithm])

@@ -82,10 +82,16 @@ export function PremiumSelect({
   contentClassName,
   ariaLabel,
 }: Props) {
+  const controlledValue = value ?? ''
+
   const selectedLabel = React.useMemo(() => {
-    if (!value) return ''
-    return options.find((o) => o.value === value)?.label ?? ''
-  }, [options, value])
+    if (!controlledValue) return ''
+    return options.find((o) => o.value === controlledValue)?.label ?? ''
+  }, [options, controlledValue])
+
+  // Radix Select forbids Select.Item values being an empty string.
+  // Empty string is reserved for clearing the selection / showing the placeholder.
+  const safeOptions = React.useMemo(() => options.filter((o) => o.value !== ''), [options])
 
   const isSearchable = searchable !== false
   const showSearchInput = isSearchable && options.length >= searchMinOptions
@@ -98,17 +104,17 @@ export function PremiumSelect({
 
   const normalizedQuery = query.trim().toLowerCase()
   const filteredOptions = React.useMemo(() => {
-    if (!showSearchInput) return options
-    if (!normalizedQuery) return options
+    if (!showSearchInput) return safeOptions
+    if (!normalizedQuery) return safeOptions
     const fn =
       filterOption ??
       ((o: PremiumSelectOption, q: string) => String(o.label).toLowerCase().includes(q) || String(o.value).toLowerCase().includes(q))
-    return options.filter((o) => fn(o, normalizedQuery))
-  }, [filterOption, normalizedQuery, options, showSearchInput])
+    return safeOptions.filter((o) => fn(o, normalizedQuery))
+  }, [filterOption, normalizedQuery, safeOptions, showSearchInput])
 
   return (
     <Select.Root
-      value={value || undefined}
+      value={controlledValue}
       onValueChange={onValueChange}
       disabled={disabled}
       open={open}

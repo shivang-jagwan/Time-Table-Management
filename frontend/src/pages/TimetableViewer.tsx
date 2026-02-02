@@ -15,6 +15,13 @@ import { PremiumSelect } from '../components/PremiumSelect'
 
 const WEEKDAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
 
+function yearFromSectionCode(code: string): number | null {
+  const m = /^Y(\d+)\b/i.exec(String(code ?? '').trim())
+  if (!m) return null
+  const n = Number(m[1])
+  return Number.isFinite(n) ? n : null
+}
+
 function shortId(id: string): string {
   return id.split('-')[0] ?? id
 }
@@ -86,6 +93,22 @@ export function TimetableViewer({ onToast }: { onToast: (msg: string) => void })
     const set = new Set(entries.map((e) => e.section_code))
     return Array.from(set).sort()
   }, [entries])
+
+  const sectionCodesForYear = React.useMemo(() => {
+    const yn = Number(academicYearNumber)
+    return sectionCodes.filter((c) => {
+      const y = yearFromSectionCode(c)
+      return y == null || y === yn
+    })
+  }, [sectionCodes, academicYearNumber])
+
+  React.useEffect(() => {
+    if (!sectionCode) return
+    if (sectionCodesForYear.length === 0) return
+    if (!sectionCodesForYear.includes(sectionCode)) {
+      setSectionCode('')
+    }
+  }, [sectionCode, sectionCodesForYear])
 
   const slotIndices = React.useMemo(() => {
     const set = new Set<number>()
@@ -329,7 +352,7 @@ export function TimetableViewer({ onToast }: { onToast: (msg: string) => void })
             onValueChange={(v) => setSectionCode(v === '__all__' ? '' : v)}
             options={[
               { value: '__all__', label: 'All sections' },
-              ...sectionCodes.map((c) => ({ value: c, label: c })),
+              ...sectionCodesForYear.map((c) => ({ value: c, label: c })),
             ]}
           />
         </div>

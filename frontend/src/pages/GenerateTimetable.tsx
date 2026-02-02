@@ -23,6 +23,14 @@ function fmtOrtoolsStatus(code: unknown): string {
   return map[n] ? `${n} — ${map[n]}` : String(n)
 }
 
+function prettyDiagType(t: unknown): string {
+  const s = String(t ?? '')
+  return s
+    .replace(/_/g, ' ')
+    .toLowerCase()
+    .replace(/\b([a-z])/g, (m) => m.toUpperCase())
+}
+
 export function GenerateTimetable() {
   const { programCode } = useLayoutContext()
   const [toast, setToast] = React.useState('')
@@ -30,8 +38,9 @@ export function GenerateTimetable() {
   const [slotCount, setSlotCount] = React.useState<number | null>(null)
 
   const [seed, setSeed] = React.useState<string>('')
-  const [maxTimeSeconds, setMaxTimeSeconds] = React.useState<number>(120)
+  const [maxTimeSeconds, setMaxTimeSeconds] = React.useState<number>(300)
   const [relaxTeacherLoadLimits, setRelaxTeacherLoadLimits] = React.useState(false)
+  const [requireOptimal, setRequireOptimal] = React.useState(true)
 
   const [lastRun, setLastRun] = React.useState<SolveTimetableResponse | null>(null)
   const [lastValidationConflicts, setLastValidationConflicts] = React.useState<SolverConflict[]>([])
@@ -95,6 +104,7 @@ export function GenerateTimetable() {
         seed: Number.isFinite(s as any) ? s : null,
         max_time_seconds: Number(maxTimeSeconds),
         relax_teacher_load_limits: Boolean(relaxTeacherLoadLimits),
+        require_optimal: Boolean(requireOptimal),
       })
       setLastRun(res)
       showToast(`Solve status: ${res.status}`)
@@ -250,6 +260,17 @@ export function GenerateTimetable() {
                   <span className="text-slate-700 font-medium">Relax teacher load limits</span>
                 </label>
               </div>
+
+              <div className="flex items-end">
+                <label className="checkbox-row w-full rounded-lg border border-white/40 bg-white/70">
+                  <input
+                    type="checkbox"
+                    checked={requireOptimal}
+                    onChange={(e) => setRequireOptimal(e.target.checked)}
+                  />
+                  <span className="text-slate-700 font-medium">Require OPTIMAL solution</span>
+                </label>
+              </div>
             </div>
 
             <div className="grid gap-3 md:grid-cols-2">
@@ -272,9 +293,88 @@ export function GenerateTimetable() {
             {lastRun ? (
               <div className="rounded-2xl border bg-slate-50 p-4">
                 <div className="text-sm font-semibold text-slate-900">Last solve</div>
-                <div className="mt-1 text-sm text-slate-700">Status: {lastRun.status}</div>
+                <div className="mt-1 text-sm text-slate-700">
+                  Status:{' '}
+                  <span className="font-semibold">
+                    {lastRun.status === 'INFEASIBLE'
+                      ? '🔴 INFEASIBLE'
+                      : lastRun.status === 'ERROR'
+                        ? '🟠 ERROR'
+                        : lastRun.status === 'OPTIMAL'
+                          ? '🟢 OPTIMAL'
+                          : lastRun.status === 'SUBOPTIMAL'
+                            ? '🟡 SUBOPTIMAL'
+                          : lastRun.status === 'FEASIBLE'
+                            ? '🟡 FEASIBLE'
+                            : lastRun.status}
+                  </span>
+                </div>
                 <div className="mt-1 text-sm text-slate-700">Entries written: {lastRun.entries_written}</div>
                 <div className="mt-1 text-sm text-slate-700">Conflicts: {lastRun.conflicts.length}</div>
+
+                {lastRun.objective_score != null &&
+                (lastRun.status === 'FEASIBLE' || lastRun.status === 'SUBOPTIMAL' || lastRun.status === 'OPTIMAL') ? (
+                  <div className="mt-1 text-sm text-slate-700">Objective score: {lastRun.objective_score}</div>
+                ) : null}
+
+                {lastRun.solver_stats?.ortools_status != null ? (
+                  <div className="mt-1 text-xs text-slate-500">
+                    OR-Tools status: {fmtOrtoolsStatus(lastRun.solver_stats.ortools_status)}
+                  </div>
+                ) : null}
+
+                {lastRun.status === 'INFEASIBLE' ? (
+                  <div className="mt-3 rounded-2xl border border-rose-200 bg-rose-50 p-3 text-sm text-slate-800">
+                    <div className="font-semibold">Summary</div>
+                    <div className="mt-1">{lastRun.reason_summary ?? 'Solver reported infeasible.'}</div>
+
+                    {Array.isArray(lastRun.diagnostics) && lastRun.diagnostics.length > 0 ? (
+                      <div className="mt-3 space-y-2">
+                        {lastRun.diagnostics.slice(0, 8).map((d: any, i: number) => (
+                          <div key={i} className="rounded-xl border bg-white p-3">
+                            <div className="text-sm font-semibold text-slate-900">
+                              {i + 1}️⃣ {prettyDiagType(d?.type)}
+                            </div>
+                            <div className="mt-1 text-sm text-slate-700">{String(d?.explanation ?? '')}</div>
+                            {d?.teacher || d?.section || d?.subject ? (
+                              <div className="mt-2 text-xs text-slate-500">
+                                {d?.teacher ? <span>Teacher: {String(d.teacher)} </span> : null}
+                                {d?.section ? <span>Section: {String(d.section)} </span> : null}
+                                {d?.subject ? <span>Subject: {String(d.subject)} </span> : null}
+                              </div>
+                            ) : null}
+                          </div>
+                        ))}
+                        {lastRun.diagnostics.length > 8 ? (
+                          <div className="text-xs text-slate-600">Showing first 8 diagnostics.</div>
+                        ) : null}
+
+                        <details className="rounded-xl border bg-white p-3">
+                          <summary className="cursor-pointer text-sm font-semibold text-slate-900">Show full diagnostic JSON</summary>
+                          <pre className="mt-2 max-h-[320px] overflow-auto text-xs text-slate-700">
+                            {JSON.stringify(lastRun.diagnostics, null, 2)}
+                          </pre>
+                        </details>
+                      </div>
+                    ) : (
+                      <div className="mt-2 text-xs text-slate-600">No structured diagnostics produced for this run.</div>
+                    )}
+                  </div>
+                ) : null}
+
+                {Array.isArray(lastRun.warnings) && lastRun.warnings.length > 0 ? (
+                  <div className="mt-3 rounded-2xl border border-amber-200 bg-amber-50 p-3 text-sm text-slate-800">
+                    <div className="font-semibold">Warnings</div>
+                    <ul className="mt-2 list-disc space-y-1 pl-5">
+                      {lastRun.warnings.slice(0, 8).map((w, i) => (
+                        <li key={i}>{w}</li>
+                      ))}
+                    </ul>
+                    {lastRun.warnings.length > 8 ? (
+                      <div className="mt-2 text-xs text-slate-600">Showing first 8 warnings.</div>
+                    ) : null}
+                  </div>
+                ) : null}
 
                 {lastRun.status === 'ERROR' ? (
                   <div className="mt-3 rounded-2xl border border-amber-200 bg-amber-50 p-3 text-sm text-slate-800">

@@ -27,6 +27,8 @@ class Room(Base):
     room_type = Column(ROOM_TYPE, nullable=False)
     capacity = Column(Integer, nullable=False, default=0)
     is_active = Column(Boolean, nullable=False, default=True)
+    is_special = Column(Boolean, nullable=False, default=False)
+    special_note = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     __table_args__ = (

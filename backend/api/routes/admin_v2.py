@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -18,16 +18,21 @@ from models.program import Program
 from models.section import Section
 from models.section_elective import SectionElective
 from models.section_time_window import SectionTimeWindow
+from models.special_allotment import SpecialAllotment
 from models.subject import Subject
 from models.teacher import Teacher
 from models.teacher_subject_section import TeacherSubjectSection
+from models.teacher_subject_year import TeacherSubjectYear
 from models.time_slot import TimeSlot
+from models.timetable_entry import TimetableEntry
 from models.timetable_run import TimetableRun
+from models.track_subject import TrackSubject
 from models.elective_block import ElectiveBlock
 from models.elective_block_subject import ElectiveBlockSubject
 from models.section_elective_block import SectionElectiveBlock
 from schemas.admin import (
     AdminActionResult,
+    AcademicYearOut,
     BulkSetCoreElectiveRequest,
     ClearTimetablesRequest,
     CombinedSubjectGroupOut,
@@ -41,6 +46,9 @@ from schemas.admin import (
     ElectiveBlockSectionOut,
     ElectiveBlockSubjectOut,
     GenerateTimeSlotsRequest,
+    EnsureAcademicYearsRequest,
+    MapProgramDataToYearRequest,
+    MapProgramDataToYearResponse,
     SectionElectiveOut,
     SetElectiveBlockSectionsRequest,
     SetDefaultSectionWindowsRequest,
@@ -62,11 +70,254 @@ def _get_academic_year(db: Session, year_number: int) -> AcademicYear:
     return year
 
 
+def _get_or_create_academic_year(db: Session, year_number: int, *, activate: bool = True) -> AcademicYear:
+    year = db.execute(select(AcademicYear).where(AcademicYear.year_number == int(year_number))).scalars().first()
+    if year is not None:
+        if activate and not year.is_active:
+            year.is_active = True
+        return year
+
+    year = AcademicYear(year_number=int(year_number), is_active=bool(activate))
+    db.add(year)
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        # Best-effort retry in case another request created it.
+        year = db.execute(select(AcademicYear).where(AcademicYear.year_number == int(year_number))).scalars().first()
+        if year is None:
+            raise
+    return year
+
+
 def _get_program(db: Session, program_code: str) -> Program:
     program = db.execute(select(Program).where(Program.code == program_code)).scalar_one_or_none()
     if program is None:
         raise HTTPException(status_code=404, detail="PROGRAM_NOT_FOUND")
     return program
+
+
+@router.get("/academic-years", response_model=list[AcademicYearOut])
+def list_academic_years(
+    db: Session = Depends(get_db),
+) -> list[AcademicYearOut]:
+    return db.execute(select(AcademicYear).order_by(AcademicYear.year_number.asc())).scalars().all()
+
+
+@router.post("/academic-years/ensure", response_model=AdminActionResult)
+def ensure_academic_years(
+    payload: EnsureAcademicYearsRequest,
+    _admin=Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> AdminActionResult:
+    created = 0
+    updated = 0
+
+    for n in payload.year_numbers:
+        if int(n) < 1 or int(n) > 4:
+            raise HTTPException(status_code=422, detail="INVALID_ACADEMIC_YEAR")
+
+        before = db.execute(select(AcademicYear).where(AcademicYear.year_number == int(n))).scalars().first()
+        year = _get_or_create_academic_year(db, int(n), activate=payload.activate)
+        if before is None:
+            created += 1
+        elif payload.activate and not before.is_active and year.is_active:
+            updated += 1
+
+    db.commit()
+    return AdminActionResult(ok=True, created=created, updated=updated, deleted=0)
+
+
+@router.post("/programs/map-data-to-year", response_model=MapProgramDataToYearResponse)
+def map_program_data_to_year(
+    payload: MapProgramDataToYearRequest,
+    _admin=Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> MapProgramDataToYearResponse:
+    program = _get_program(db, payload.program_code.strip())
+    if payload.from_academic_year_number == payload.to_academic_year_number:
+        raise HTTPException(status_code=422, detail="FROM_YEAR_EQUALS_TO_YEAR")
+
+    from_year = _get_or_create_academic_year(db, int(payload.from_academic_year_number), activate=True)
+    to_year = _get_or_create_academic_year(db, int(payload.to_academic_year_number), activate=True)
+
+    deleted: dict[str, int] = {}
+    updated_counts: dict[str, int] = {}
+
+    # Helper subqueries for program scoping.
+    program_subject_ids = select(Subject.id).where(Subject.program_id == program.id)
+    program_section_ids = select(Section.id).where(Section.program_id == program.id)
+
+    def _maybe_exec(stmt, *, key: str, bucket: dict[str, int]):
+        if payload.dry_run:
+            bucket[key] = 0
+            return
+        res = db.execute(stmt)
+        bucket[key] = res.rowcount or 0
+
+    # Optional: clear target-year data first to avoid uniqueness conflicts.
+    if payload.replace_target:
+        _maybe_exec(
+            delete(TimetableEntry).where(
+                TimetableEntry.academic_year_id == to_year.id,
+                TimetableEntry.section_id.in_(program_section_ids),
+            ),
+            key="timetable_entries",
+            bucket=deleted,
+        )
+        _maybe_exec(
+            delete(SpecialAllotment).where(
+                SpecialAllotment.section_id.in_(
+                    select(Section.id).where(Section.program_id == program.id, Section.academic_year_id == to_year.id)
+                )
+            ),
+            key="special_allotments",
+            bucket=deleted,
+        )
+        _maybe_exec(
+            delete(SectionElective).where(
+                SectionElective.section_id.in_(
+                    select(Section.id).where(Section.program_id == program.id, Section.academic_year_id == to_year.id)
+                )
+            ),
+            key="section_electives",
+            bucket=deleted,
+        )
+        _maybe_exec(
+            delete(SectionTimeWindow).where(
+                SectionTimeWindow.section_id.in_(
+                    select(Section.id).where(Section.program_id == program.id, Section.academic_year_id == to_year.id)
+                )
+            ),
+            key="section_time_windows",
+            bucket=deleted,
+        )
+        _maybe_exec(
+            delete(TeacherSubjectYear).where(
+                TeacherSubjectYear.academic_year_id == to_year.id,
+                TeacherSubjectYear.subject_id.in_(program_subject_ids),
+            ),
+            key="teacher_subject_years",
+            bucket=deleted,
+        )
+        _maybe_exec(
+            delete(TrackSubject).where(
+                TrackSubject.program_id == program.id,
+                TrackSubject.academic_year_id == to_year.id,
+            ),
+            key="track_subjects",
+            bucket=deleted,
+        )
+
+        # Combined groups are unique per (year, subject). Clearing target-year groups for this program is safest.
+        _maybe_exec(
+            delete(CombinedSubjectGroup).where(
+                CombinedSubjectGroup.academic_year_id == to_year.id,
+                CombinedSubjectGroup.subject_id.in_(program_subject_ids),
+            ),
+            key="combined_subject_groups",
+            bucket=deleted,
+        )
+
+        _maybe_exec(
+            delete(ElectiveBlock).where(
+                ElectiveBlock.program_id == program.id,
+                ElectiveBlock.academic_year_id == to_year.id,
+            ),
+            key="elective_blocks",
+            bucket=deleted,
+        )
+
+        _maybe_exec(
+            delete(Section).where(
+                Section.program_id == program.id,
+                Section.academic_year_id == to_year.id,
+            ),
+            key="sections",
+            bucket=deleted,
+        )
+        _maybe_exec(
+            delete(Subject).where(
+                Subject.program_id == program.id,
+                Subject.academic_year_id == to_year.id,
+            ),
+            key="subjects",
+            bucket=deleted,
+        )
+
+    # Update core year-scoped entities.
+    _maybe_exec(
+        update(Subject)
+        .where(Subject.program_id == program.id, Subject.academic_year_id == from_year.id)
+        .values(academic_year_id=to_year.id),
+        key="subjects",
+        bucket=updated_counts,
+    )
+    _maybe_exec(
+        update(Section)
+        .where(Section.program_id == program.id, Section.academic_year_id == from_year.id)
+        .values(academic_year_id=to_year.id),
+        key="sections",
+        bucket=updated_counts,
+    )
+
+    _maybe_exec(
+        update(ElectiveBlock)
+        .where(ElectiveBlock.program_id == program.id, ElectiveBlock.academic_year_id == from_year.id)
+        .values(academic_year_id=to_year.id),
+        key="elective_blocks",
+        bucket=updated_counts,
+    )
+    _maybe_exec(
+        update(TrackSubject)
+        .where(TrackSubject.program_id == program.id, TrackSubject.academic_year_id == from_year.id)
+        .values(academic_year_id=to_year.id),
+        key="track_subjects",
+        bucket=updated_counts,
+    )
+
+    _maybe_exec(
+        update(TeacherSubjectYear)
+        .where(TeacherSubjectYear.academic_year_id == from_year.id, TeacherSubjectYear.subject_id.in_(program_subject_ids))
+        .values(academic_year_id=to_year.id),
+        key="teacher_subject_years",
+        bucket=updated_counts,
+    )
+
+    _maybe_exec(
+        update(CombinedSubjectGroup)
+        .where(CombinedSubjectGroup.academic_year_id == from_year.id, CombinedSubjectGroup.subject_id.in_(program_subject_ids))
+        .values(academic_year_id=to_year.id),
+        key="combined_subject_groups",
+        bucket=updated_counts,
+    )
+
+    _maybe_exec(
+        update(TimetableEntry)
+        .where(TimetableEntry.academic_year_id == from_year.id, TimetableEntry.section_id.in_(program_section_ids))
+        .values(academic_year_id=to_year.id),
+        key="timetable_entries",
+        bucket=updated_counts,
+    )
+
+    if not payload.dry_run:
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="YEAR_MAPPING_CONFLICT: likely uniqueness collision. Try replace_target=true.",
+            )
+
+    return MapProgramDataToYearResponse(
+        ok=True,
+        from_academic_year_number=int(payload.from_academic_year_number),
+        to_academic_year_number=int(payload.to_academic_year_number),
+        deleted=deleted,
+        updated=updated_counts,
+        message="dry_run" if payload.dry_run else None,
+    )
 
 
 def _parse_hhmm(value: str) -> datetime:
@@ -512,9 +763,9 @@ def set_teacher_subject_sections(
         if conflict_rows:
             conflicts = [
                 {
-                    "section_id": sec.id,
+                    "section_id": str(sec.id),
                     "section_code": sec.code,
-                    "existing_teacher_id": t.id,
+                    "existing_teacher_id": str(t.id),
                     "existing_teacher_code": t.code,
                 }
                 for _tss, t, sec in conflict_rows

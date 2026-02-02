@@ -7,7 +7,16 @@
 **/.ruff_cache/
 
 **/*.log
+**/*.err
 
 frontend/node_modules/
 frontend/dist/
 backend/.python-version
+
+# Local dev run artifacts
+backend/backend_dev.*
+backend/_dev_uvicorn.*
+backend/_uvicorn.*
+backend/uvicorn.*
+backend/detached_uvicorn.log
+frontend/frontend_dev.*

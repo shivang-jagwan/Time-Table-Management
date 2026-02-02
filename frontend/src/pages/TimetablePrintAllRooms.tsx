@@ -232,6 +232,12 @@ export function TimetablePrintAllRooms() {
   >([])
   const [autoPrinted, setAutoPrinted] = React.useState(false)
 
+  const roomById = React.useMemo(() => {
+    const m = new Map<string, Room>()
+    for (const r of rooms) m.set(r.id, r)
+    return m
+  }, [rooms])
+
   React.useEffect(() => {
     if (!runId) return
     let cancelled = false
@@ -337,7 +343,7 @@ export function TimetablePrintAllRooms() {
               <div key={g.roomId}>
                 <PrintGrid
                   slots={slots}
-                  title={`Room ${g.roomCode}`}
+                  title={`${roomById.get(g.roomId)?.is_special ? '🔒 ' : ''}Room ${g.roomCode}`}
                   subtitle={`Weekly load: ${g.entries.length} slots`}
                   items={g.entries}
                 />

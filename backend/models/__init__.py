@@ -17,6 +17,8 @@ from models.time_slot import TimeSlot
 from models.track_subject import TrackSubject
 from models.academic_year import AcademicYear
 from models.fixed_timetable_entry import FixedTimetableEntry
+from models.special_allotment import SpecialAllotment
+from models.user import User
 
 __all__ = [
 	"Program",
@@ -37,5 +39,7 @@ __all__ = [
 	"TimeSlot",
 	"TrackSubject",
 	"FixedTimetableEntry",
+	"SpecialAllotment",
+	"User",
 ]
 

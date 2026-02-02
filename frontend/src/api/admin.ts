@@ -8,6 +8,56 @@ export type AdminActionResult = {
   message?: string | null
 }
 
+export type AcademicYearOut = {
+  id: string
+  year_number: number
+  is_active: boolean
+  created_at: string
+}
+
+export async function listAcademicYears(): Promise<AcademicYearOut[]> {
+  return apiFetch<AcademicYearOut[]>('/api/admin/academic-years')
+}
+
+export async function ensureAcademicYears(payload?: {
+  year_numbers?: number[]
+  activate?: boolean
+}): Promise<AdminActionResult> {
+  return apiFetch<AdminActionResult>('/api/admin/academic-years/ensure', {
+    method: 'POST',
+    body: JSON.stringify({
+      year_numbers: payload?.year_numbers ?? [1, 2, 3, 4],
+      activate: payload?.activate ?? true,
+    }),
+  })
+}
+
+export type MapProgramDataToYearResponse = {
+  ok: boolean
+  from_academic_year_number: number
+  to_academic_year_number: number
+  deleted: Record<string, number>
+  updated: Record<string, number>
+  message?: string | null
+}
+
+export async function mapProgramDataToYear(payload: {
+  program_code: string
+  from_academic_year_number: number
+  to_academic_year_number: number
+  replace_target?: boolean
+  dry_run?: boolean
+}): Promise<MapProgramDataToYearResponse> {
+  return apiFetch<MapProgramDataToYearResponse>('/api/admin/programs/map-data-to-year', {
+    method: 'POST',
+    body: JSON.stringify({
+      ...payload,
+      replace_target: payload.replace_target ?? false,
+      dry_run: payload.dry_run ?? false,
+    }),
+  })
+}
+
 export type GenerateTimeSlotsRequest = {
   days: number[]
   start_time: string // HH:MM

@@ -22,6 +22,7 @@ from models.teacher import Teacher
 from models.teacher_subject_section import TeacherSubjectSection
 from models.time_slot import TimeSlot
 from models.fixed_timetable_entry import FixedTimetableEntry
+from models.special_allotment import SpecialAllotment
 from models.timetable_conflict import TimetableConflict
 from models.timetable_run import TimetableRun
 from models.track_subject import TrackSubject
@@ -42,6 +43,7 @@ class ValidationConflict:
 
 def persist_conflicts(db: Session, *, run: TimetableRun, conflicts: Iterable[ValidationConflict]) -> None:
     for c in conflicts:
+        payload = c.metadata or {}
         db.add(
             TimetableConflict(
                 run_id=run.id,
@@ -53,7 +55,8 @@ def persist_conflicts(db: Session, *, run: TimetableRun, conflicts: Iterable[Val
                 subject_id=c.subject_id,
                 room_id=c.room_id,
                 slot_id=c.slot_id,
-                metadata_json=c.metadata or {},
+                details_json=payload,
+                metadata_json=payload,
             )
         )
 
@@ -239,6 +242,18 @@ def validate_prereqs(
             ValidationConflict(
                 conflict_type="MISSING_ROOMS",
                 message="No rooms configured. Populate rooms before generating timetables.",
+            )
+        )
+
+    # Non-special rooms are required for auto-assigned room solving.
+    if (
+        db.execute(select(Room.id).where(Room.is_active.is_(True)).where(Room.is_special.is_(False)).limit(1)).first()
+        is None
+    ):
+        conflicts.append(
+            ValidationConflict(
+                conflict_type="MISSING_NON_SPECIAL_ROOMS",
+                message="No non-special active rooms configured. Normal timetable entries cannot be assigned rooms.",
             )
         )
 
@@ -621,6 +636,8 @@ def validate_prereqs(
             teacher_by_id = {t.id: t for t in teacher_rows}
 
             teacher_required_slots = defaultdict(int)  # teacher_id -> total occupied slots/week
+            teacher_affected_sections: dict[Any, set[Any]] = defaultdict(set)
+            teacher_affected_subjects: dict[Any, set[Any]] = defaultdict(set)
             for sec_id, subj_id in required_pairs:
                 teachers = teachers_by_section_subject.get((sec_id, subj_id), set())
                 if len(teachers) != 1:
@@ -629,6 +646,8 @@ def validate_prereqs(
                 subj = subj_by_id.get(subj_id)
                 if subj is None:
                     continue
+                teacher_affected_sections[teacher_id].add(sec_id)
+                teacher_affected_subjects[teacher_id].add(subj_id)
                 spw = int(getattr(subj, "sessions_per_week", 0) or 0)
                 block = int(getattr(subj, "lab_block_size_slots", 1) or 1)
                 if str(getattr(subj, "subject_type", "")).upper() == "LAB":
@@ -641,17 +660,29 @@ def validate_prereqs(
                 if teacher is None:
                     continue
                 if required > int(getattr(teacher, "max_per_week", 0) or 0):
+                    max_per_week = int(getattr(teacher, "max_per_week", 0) or 0)
+                    affected_section_ids = sorted([str(x) for x in teacher_affected_sections.get(teacher_id, set())])
+                    affected_subject_ids = sorted([str(x) for x in teacher_affected_subjects.get(teacher_id, set())])
                     conflicts.append(
                         ValidationConflict(
                             conflict_type="TEACHER_LOAD_EXCEEDS_MAX_PER_WEEK",
                             message="Assigned teaching load exceeds teacher.max_per_week; solve will be infeasible.",
                             teacher_id=teacher_id,
-                            metadata={"required_slots_per_week": int(required), "max_per_week": int(teacher.max_per_week)},
+                            metadata={
+                                "teacher_id": str(teacher_id),
+                                "teacher_name": str(getattr(teacher, "full_name", "") or getattr(teacher, "code", "")),
+                                "max_per_week": max_per_week,
+                                "assigned_slots": int(required),
+                                "difference": int(required) - max_per_week,
+                                "affected_section_ids": affected_section_ids,
+                                "affected_subject_ids": affected_subject_ids,
+                            },
                         )
                     )
 
     # Fixed timetable entries (hard locks) validation.
     if section_ids:
+        fixed_section_slot_pairs: set[tuple[Any, Any]] = set()
         fixed_rows: list[FixedTimetableEntry] = (
             db.execute(
                 select(FixedTimetableEntry)
@@ -662,9 +693,13 @@ def validate_prereqs(
             .all()
         )
 
+        for fe in fixed_rows:
+            fixed_section_slot_pairs.add((fe.section_id, fe.slot_id))
+
         if fixed_rows:
             fixed_subject_ids = {r.subject_id for r in fixed_rows}
             fixed_teacher_ids = {r.teacher_id for r in fixed_rows}
+            fixed_room_ids = {r.room_id for r in fixed_rows}
 
             fixed_subjects = (
                 db.execute(select(Subject).where(Subject.id.in_(list(fixed_subject_ids))))
@@ -677,8 +712,15 @@ def validate_prereqs(
                 .all()
             )
 
+            fixed_rooms = (
+                db.execute(select(Room).where(Room.id.in_(list(fixed_room_ids))))
+                .scalars()
+                .all()
+            )
+
             fixed_subject_by_id = {s.id: s for s in fixed_subjects}
             fixed_teacher_by_id = {t.id: t for t in fixed_teachers}
+            fixed_room_by_id = {r.id: r for r in fixed_rooms}
 
             # Precompute allowed subject ids per section (mapping override else track curriculum).
             allowed_subject_ids_by_section: dict[Any, set[Any]] = {}
@@ -753,6 +795,7 @@ def validate_prereqs(
             for fe in fixed_rows:
                 subj = fixed_subject_by_id.get(fe.subject_id)
                 teacher = fixed_teacher_by_id.get(fe.teacher_id)
+                room = fixed_room_by_id.get(fe.room_id)
 
                 if subj is None:
                     conflicts.append(
@@ -778,6 +821,32 @@ def validate_prereqs(
                         )
                     )
                     continue
+
+                if room is None:
+                    conflicts.append(
+                        ValidationConflict(
+                            conflict_type="FIXED_ROOM_NOT_FOUND",
+                            message="Fixed entry references a room that does not exist.",
+                            section_id=fe.section_id,
+                            room_id=fe.room_id,
+                            subject_id=fe.subject_id,
+                            slot_id=fe.slot_id,
+                        )
+                    )
+                    continue
+
+                if bool(getattr(room, "is_special", False)):
+                    conflicts.append(
+                        ValidationConflict(
+                            conflict_type="FIXED_ROOM_IS_SPECIAL",
+                            message="Fixed entries cannot use special rooms. Use a Special Allotment lock instead.",
+                            section_id=fe.section_id,
+                            room_id=fe.room_id,
+                            subject_id=fe.subject_id,
+                            slot_id=fe.slot_id,
+                            metadata={"room_code": str(getattr(room, "code", ""))},
+                        )
+                    )
 
                 day_idx = slot_id_to_day_index.get(fe.slot_id)
                 if day_idx is None:
@@ -931,6 +1000,356 @@ def validate_prereqs(
                     )
                 else:
                     fixed_teacher_slot_seen[key] = fe.section_id
+
+    # Special allotments (hard locked events) validation.
+    if section_ids:
+        special_rows: list[SpecialAllotment] = (
+            db.execute(
+                select(SpecialAllotment)
+                .where(SpecialAllotment.section_id.in_(section_ids))
+                .where(SpecialAllotment.is_active.is_(True))
+            )
+            .scalars()
+            .all()
+        )
+
+        if special_rows:
+            special_subject_ids = {r.subject_id for r in special_rows}
+            special_teacher_ids = {r.teacher_id for r in special_rows}
+            special_room_ids = {r.room_id for r in special_rows if r.room_id is not None}
+
+            special_subjects = (
+                db.execute(select(Subject).where(Subject.id.in_(list(special_subject_ids))))
+                .scalars()
+                .all()
+            )
+            special_teachers = (
+                db.execute(select(Teacher).where(Teacher.id.in_(list(special_teacher_ids))))
+                .scalars()
+                .all()
+            )
+
+            special_rooms = (
+                db.execute(select(Room).where(Room.id.in_(list(special_room_ids))))
+                .scalars()
+                .all()
+            )
+
+            special_subject_by_id = {s.id: s for s in special_subjects}
+            special_teacher_by_id = {t.id: t for t in special_teachers}
+            special_room_by_id = {r.id: r for r in special_rooms}
+
+            # Precompute allowed subject ids per section (mapping override else track curriculum).
+            allowed_subject_ids_by_section: dict[Any, set[Any]] = {}
+
+            track_rows_all = (
+                db.execute(select(TrackSubject).where(TrackSubject.program_id == program_id))
+                .scalars()
+                .all()
+            )
+            track_by_year_track: dict[tuple[Any, str], list[TrackSubject]] = defaultdict(list)
+            for r in track_rows_all:
+                track_by_year_track[(r.academic_year_id, str(r.track))].append(r)
+
+            elective_by_section = {}
+            elective_rows = (
+                db.execute(select(SectionElective).where(SectionElective.section_id.in_(section_ids)))
+                .scalars()
+                .all()
+            )
+            for e in elective_rows:
+                elective_by_section[e.section_id] = e.subject_id
+
+            for section in sections:
+                mapped = mapped_subject_ids_by_section.get(section.id, [])
+                if mapped:
+                    allowed_subject_ids_by_section[section.id] = set(mapped)
+                    continue
+
+                effective_year_id = academic_year_id if academic_year_id is not None else section.academic_year_id
+                rows = track_by_year_track.get((effective_year_id, str(section.track)), [])
+                mandatory = [r for r in rows if not r.is_elective]
+                elective_options = [r for r in rows if r.is_elective]
+                allowed = {r.subject_id for r in mandatory}
+                if elective_options:
+                    sel = elective_by_section.get(section.id)
+                    if sel is not None:
+                        allowed.add(sel)
+                allowed_subject_ids_by_section[section.id] = allowed
+
+            # Assignment lookup: (section, subject) -> teacher_id
+            assign_rows = (
+                db.execute(
+                    select(
+                        TeacherSubjectSection.section_id,
+                        TeacherSubjectSection.subject_id,
+                        TeacherSubjectSection.teacher_id,
+                    )
+                    .where(TeacherSubjectSection.section_id.in_(section_ids))
+                    .where(TeacherSubjectSection.is_active.is_(True))
+                )
+                .all()
+            )
+            assigned_teacher_by_section_subject: dict[tuple[Any, Any], Any] = {}
+            dup_assigned: set[tuple[Any, Any]] = set()
+            for sec_id, subj_id, teacher_id in assign_rows:
+                key = (sec_id, subj_id)
+                if key in assigned_teacher_by_section_subject and assigned_teacher_by_section_subject[key] != teacher_id:
+                    dup_assigned.add(key)
+                else:
+                    assigned_teacher_by_section_subject[key] = teacher_id
+
+            special_teacher_slot_seen: dict[tuple[Any, Any], Any] = {}
+            special_room_slot_seen: dict[tuple[Any, Any], Any] = {}
+
+            for sa in special_rows:
+                subj = special_subject_by_id.get(sa.subject_id)
+                teacher = special_teacher_by_id.get(sa.teacher_id)
+                if sa.room_id is None:
+                    conflicts.append(
+                        ValidationConflict(
+                            conflict_type="SPECIAL_ROOM_MISSING",
+                            message="Special allotment must specify a room.",
+                            section_id=sa.section_id,
+                            teacher_id=sa.teacher_id,
+                            subject_id=sa.subject_id,
+                            slot_id=sa.slot_id,
+                        )
+                    )
+                    continue
+
+                room = special_room_by_id.get(sa.room_id)
+                if room is None:
+                    conflicts.append(
+                        ValidationConflict(
+                            conflict_type="SPECIAL_ROOM_NOT_FOUND",
+                            message="Special allotment references a room that does not exist.",
+                            section_id=sa.section_id,
+                            room_id=sa.room_id,
+                            teacher_id=sa.teacher_id,
+                            subject_id=sa.subject_id,
+                            slot_id=sa.slot_id,
+                        )
+                    )
+                    continue
+
+                if not bool(getattr(room, "is_special", False)):
+                    conflicts.append(
+                        ValidationConflict(
+                            conflict_type="SPECIAL_ROOM_NOT_SPECIAL",
+                            message="Special allotments must use rooms marked as special.",
+                            section_id=sa.section_id,
+                            room_id=sa.room_id,
+                            teacher_id=sa.teacher_id,
+                            subject_id=sa.subject_id,
+                            slot_id=sa.slot_id,
+                            metadata={"room_code": str(getattr(room, "code", ""))},
+                        )
+                    )
+
+                if subj is None:
+                    conflicts.append(
+                        ValidationConflict(
+                            conflict_type="SPECIAL_SUBJECT_NOT_FOUND",
+                            message="Special allotment references a subject that does not exist.",
+                            section_id=sa.section_id,
+                            subject_id=sa.subject_id,
+                            slot_id=sa.slot_id,
+                        )
+                    )
+                    continue
+
+                if teacher is None:
+                    conflicts.append(
+                        ValidationConflict(
+                            conflict_type="SPECIAL_TEACHER_NOT_FOUND",
+                            message="Special allotment references a teacher that does not exist.",
+                            section_id=sa.section_id,
+                            teacher_id=sa.teacher_id,
+                            subject_id=sa.subject_id,
+                            slot_id=sa.slot_id,
+                        )
+                    )
+                    continue
+
+                day_idx = slot_id_to_day_index.get(sa.slot_id)
+                if day_idx is None:
+                    conflicts.append(
+                        ValidationConflict(
+                            conflict_type="SPECIAL_SLOT_NOT_FOUND",
+                            message="Special allotment references a time slot that does not exist.",
+                            section_id=sa.section_id,
+                            teacher_id=sa.teacher_id,
+                            subject_id=sa.subject_id,
+                            slot_id=sa.slot_id,
+                        )
+                    )
+                    continue
+
+                d, si = day_idx
+                w = windows_by_section_day.get((sa.section_id, int(d)))
+                if w is None or si < int(w.start_slot_index) or si > int(w.end_slot_index):
+                    conflicts.append(
+                        ValidationConflict(
+                            conflict_type="SPECIAL_SLOT_OUTSIDE_SECTION_WINDOW",
+                            message="Special allotment is outside the section's working window.",
+                            section_id=sa.section_id,
+                            teacher_id=sa.teacher_id,
+                            subject_id=sa.subject_id,
+                            slot_id=sa.slot_id,
+                            metadata={"day_of_week": int(d), "slot_index": int(si)},
+                        )
+                    )
+
+                allowed_subj = allowed_subject_ids_by_section.get(sa.section_id, set())
+                if allowed_subj and sa.subject_id not in allowed_subj:
+                    conflicts.append(
+                        ValidationConflict(
+                            conflict_type="SPECIAL_SUBJECT_NOT_ALLOWED_FOR_SECTION",
+                            message="Special allotment uses a subject that is not part of this section's curriculum/mapping.",
+                            section_id=sa.section_id,
+                            subject_id=sa.subject_id,
+                            slot_id=sa.slot_id,
+                        )
+                    )
+
+                # Special teacher must match the strict assignment.
+                if (sa.section_id, sa.subject_id) in dup_assigned:
+                    conflicts.append(
+                        ValidationConflict(
+                            conflict_type="DUPLICATE_TEACHER_ASSIGNMENT",
+                            message="Multiple teachers are assigned for this section+subject; special allotment cannot be validated.",
+                            section_id=sa.section_id,
+                            subject_id=sa.subject_id,
+                            slot_id=sa.slot_id,
+                        )
+                    )
+                else:
+                    assigned_tid = assigned_teacher_by_section_subject.get((sa.section_id, sa.subject_id))
+                    if assigned_tid is None:
+                        conflicts.append(
+                            ValidationConflict(
+                                conflict_type="MISSING_TEACHER_ASSIGNMENT",
+                                message="No teacher assigned for this section+subject; special allotment cannot be satisfied.",
+                                section_id=sa.section_id,
+                                subject_id=sa.subject_id,
+                                slot_id=sa.slot_id,
+                            )
+                        )
+                    elif sa.teacher_id != assigned_tid:
+                        conflicts.append(
+                            ValidationConflict(
+                                conflict_type="SPECIAL_TEACHER_MISMATCH_ASSIGNMENT",
+                                message="Special allotment teacher does not match the assigned teacher for this section+subject.",
+                                section_id=sa.section_id,
+                                subject_id=sa.subject_id,
+                                teacher_id=sa.teacher_id,
+                                slot_id=sa.slot_id,
+                                metadata={"assigned_teacher_id": str(assigned_tid)},
+                            )
+                        )
+
+                if teacher.weekly_off_day is not None and int(teacher.weekly_off_day) == int(d):
+                    conflicts.append(
+                        ValidationConflict(
+                            conflict_type="SPECIAL_TEACHER_WEEKLY_OFF_DAY",
+                            message="Special allotment schedules the teacher on their weekly off day.",
+                            section_id=sa.section_id,
+                            teacher_id=sa.teacher_id,
+                            subject_id=sa.subject_id,
+                            room_id=sa.room_id,
+                            slot_id=sa.slot_id,
+                            metadata={
+                                "teacher_id": str(sa.teacher_id),
+                                "teacher_name": str(getattr(teacher, "full_name", "") or getattr(teacher, "code", "")),
+                                "weekly_off_day": int(teacher.weekly_off_day),
+                                "locked_day": int(d),
+                                "locked_slot_index": int(si),
+                                "section_id": str(sa.section_id),
+                                "subject_id": str(sa.subject_id),
+                                "room_id": str(sa.room_id) if sa.room_id is not None else None,
+                            },
+                        )
+                    )
+
+                # LAB: slot represents LAB start; must fit contiguously.
+                if str(subj.subject_type) == "LAB":
+                    block = int(getattr(subj, "lab_block_size_slots", 1) or 1)
+                    if block < 1:
+                        block = 1
+                    end_idx = int(si) + block - 1
+                    if w is None or end_idx > int(w.end_slot_index):
+                        conflicts.append(
+                            ValidationConflict(
+                                conflict_type="SPECIAL_LAB_BLOCK_DOES_NOT_FIT",
+                                message="Special lab does not fit fully inside the section window as a contiguous block.",
+                                section_id=sa.section_id,
+                                teacher_id=sa.teacher_id,
+                                subject_id=sa.subject_id,
+                                slot_id=sa.slot_id,
+                                metadata={"block_size": int(block), "start_slot_index": int(si)},
+                            )
+                        )
+                    else:
+                        valid_indices = slot_indices_by_day.get(int(d), set())
+                        for j in range(block):
+                            if int(si) + j not in valid_indices:
+                                conflicts.append(
+                                    ValidationConflict(
+                                        conflict_type="SPECIAL_LAB_BLOCK_SLOT_MISSING",
+                                        message="Special lab block references a missing time slot index.",
+                                        section_id=sa.section_id,
+                                        teacher_id=sa.teacher_id,
+                                        subject_id=sa.subject_id,
+                                        slot_id=sa.slot_id,
+                                        metadata={"missing_slot_index": int(si) + j, "day_of_week": int(d)},
+                                    )
+                                )
+                                break
+
+                # Fixed + special cannot occupy the same section/slot.
+                if (sa.section_id, sa.slot_id) in fixed_section_slot_pairs:
+                    conflicts.append(
+                        ValidationConflict(
+                            conflict_type="SPECIAL_CONFLICTS_WITH_FIXED_ENTRY",
+                            message="Special allotment conflicts with an existing fixed entry in the same section/slot.",
+                            section_id=sa.section_id,
+                            subject_id=sa.subject_id,
+                            slot_id=sa.slot_id,
+                        )
+                    )
+
+                # Special teacher overlap -> guaranteed infeasible.
+                key = (sa.teacher_id, sa.slot_id)
+                other_section = special_teacher_slot_seen.get(key)
+                if other_section is not None and other_section != sa.section_id:
+                    conflicts.append(
+                        ValidationConflict(
+                            conflict_type="SPECIAL_TEACHER_OVERLAP",
+                            message="Two special allotments assign the same teacher in the same time slot across sections; model will be infeasible.",
+                            teacher_id=sa.teacher_id,
+                            slot_id=sa.slot_id,
+                            metadata={"section_ids": [str(other_section), str(sa.section_id)]},
+                        )
+                    )
+                else:
+                    special_teacher_slot_seen[key] = sa.section_id
+
+                # Special room overlap -> guaranteed infeasible for locked rooms.
+                rkey = (sa.room_id, sa.slot_id)
+                other_section = special_room_slot_seen.get(rkey)
+                if other_section is not None and other_section != sa.section_id:
+                    conflicts.append(
+                        ValidationConflict(
+                            conflict_type="SPECIAL_ROOM_OVERLAP",
+                            message="Two special allotments assign the same room in the same time slot across sections; locked rooms cannot overlap.",
+                            room_id=sa.room_id,
+                            slot_id=sa.slot_id,
+                            metadata={"section_ids": [str(other_section), str(sa.section_id)]},
+                        )
+                    )
+                else:
+                    special_room_slot_seen[rkey] = sa.section_id
 
     # Teacher capacity validation (strict mode helper): ensure total required weekly load can be covered.
     # We estimate load in *slots* per week: LAB counts as lab_block_size_slots per session.

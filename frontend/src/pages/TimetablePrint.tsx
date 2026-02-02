@@ -1,6 +1,7 @@
 import React from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { useLayoutContext } from '../components/Layout'
+import { listRooms, type Room } from '../api/rooms'
 import {
   listRunEntries,
   listTimeSlots,
@@ -58,6 +59,18 @@ export function TimetablePrint() {
   const [fixedEntries, setFixedEntries] = React.useState<FixedTimetableEntry[]>([])
   const [requiredSubjects, setRequiredSubjects] = React.useState<RequiredSubject[]>([])
   const [error, setError] = React.useState<string>('')
+  const [rooms, setRooms] = React.useState<Room[]>([])
+
+  const roomById = React.useMemo(() => {
+    const m = new Map<string, Room>()
+    for (const r of rooms) m.set(r.id, r)
+    return m
+  }, [rooms])
+
+  function fmtRoom(roomId: string, roomCode: string): string {
+    const r = roomById.get(roomId)
+    return r?.is_special ? `🔒 ${roomCode}` : roomCode
+  }
 
   React.useEffect(() => {
     if (!runId || !sectionCode) return
@@ -66,10 +79,11 @@ export function TimetablePrint() {
       setLoading(true)
       setError('')
       try {
-        const [s, e] = await Promise.all([listTimeSlots(), listRunEntries(runId, sectionCode)])
+        const [s, e, r] = await Promise.all([listTimeSlots(), listRunEntries(runId, sectionCode), listRooms()])
         if (cancelled) return
         setSlots(s)
         setEntries(e)
+        setRooms(r.filter((x) => Boolean(x.is_active)))
 
         const sectionId = e[0]?.section_id
         if (sectionId) {
@@ -283,7 +297,7 @@ export function TimetablePrint() {
                                 <div>
                                   <div className="font-semibold">🔒 {fixedInfo.entry.subject_code}</div>
                                   <div className="text-[10px] text-slate-600">
-                                    {fixedInfo.entry.teacher_code} · {fixedInfo.entry.room_code}
+                                    {fixedInfo.entry.teacher_code} · {fmtRoom(fixedInfo.entry.room_id, fixedInfo.entry.room_code)}
                                   </div>
                                   {!fixedInfo.isStart ? (
                                     <div className="text-[10px] text-slate-500">(lab block continuation)</div>
@@ -295,7 +309,7 @@ export function TimetablePrint() {
                             ) : labSpan ? (
                               <div>
                                 <div className="font-semibold">{fixedInfo ? '🔒 ' : ''}{labSpan.entry.subject_code} (Lab · 2 hrs)</div>
-                                <div className="text-[10px] text-slate-600">{labSpan.entry.teacher_code} · {labSpan.entry.room_code}</div>
+                                <div className="text-[10px] text-slate-600">{labSpan.entry.teacher_code} · {fmtRoom(labSpan.entry.room_id, labSpan.entry.room_code)}</div>
                                 <div className="text-[10px] text-slate-500">{WEEKDAYS[labSpan.entry.day_of_week] ?? `Day ${labSpan.entry.day_of_week}`} #{labSpan.entry.slot_index} ({labSpan.entry.start_time}-{labSpan.endTime})</div>
                               </div>
                             ) : (
@@ -306,7 +320,7 @@ export function TimetablePrint() {
                                     <div className="mt-0.5 space-y-0.5 text-[10px] text-slate-700">
                                       {g.items.map((e) => (
                                         <div key={e.id}>
-                                          {e.subject_code} · {e.teacher_code} · {e.room_code}
+                                          {e.subject_code} · {e.teacher_code} · {fmtRoom(e.room_id, e.room_code)}
                                         </div>
                                       ))}
                                     </div>
@@ -316,7 +330,7 @@ export function TimetablePrint() {
                                 {grouped.nonElective.map((e) => (
                                   <div key={e.id}>
                                     <div className="font-semibold">{fixedInfo ? '🔒 ' : ''}{e.subject_code}</div>
-                                    <div className="text-[10px] text-slate-600">{e.teacher_code} · {e.room_code}</div>
+                                    <div className="text-[10px] text-slate-600">{e.teacher_code} · {fmtRoom(e.room_id, e.room_code)}</div>
                                   </div>
                                 ))}
                               </div>

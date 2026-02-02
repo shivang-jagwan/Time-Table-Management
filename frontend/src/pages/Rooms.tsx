@@ -1,6 +1,6 @@
 import React from 'react'
 import { Toast } from '../components/Toast'
-import { createRoom, deleteRoom, listRooms, putRoom, Room } from '../api/rooms'
+import { createRoom, deleteRoom, listRooms, putRoom, putRoomWithForce, Room } from '../api/rooms'
 import { RoomEditModal } from '../components/RoomEditModal'
 import { PremiumSelect } from '../components/PremiumSelect'
 
@@ -25,6 +25,8 @@ export function Rooms() {
     room_type: 'CLASSROOM',
     capacity: 0,
     is_active: true,
+    is_special: false,
+    special_note: '',
   })
 
   function showToast(message: string, ms = 2500) {
@@ -57,9 +59,11 @@ export function Rooms() {
         room_type: form.room_type,
         capacity: Number(form.capacity),
         is_active: Boolean(form.is_active),
+        is_special: Boolean(form.is_special),
+        special_note: form.special_note.trim() ? form.special_note.trim() : null,
       })
       showToast('Room saved')
-      setForm((f) => ({ ...f, code: '', name: '' }))
+      setForm((f) => ({ ...f, code: '', name: '', special_note: '' }))
       await refresh()
     } catch (e: any) {
       showToast(`Save failed: ${String(e?.message ?? e)}`, 3500)
@@ -92,17 +96,34 @@ export function Rooms() {
     setEditRoom(null)
   }
 
-  async function onSaveEdit(payload: { code: string; name: string; room_type: string; capacity: number; is_active: boolean }) {
+  async function onSaveEdit(payload: any) {
     if (!editRoom) return
     setLoading(true)
     try {
-      await putRoom(editRoom.id, {
-        code: payload.code.trim(),
-        name: payload.name.trim(),
+      const nextPayload = {
+        code: String(payload.code ?? '').trim(),
+        name: String(payload.name ?? '').trim(),
         room_type: payload.room_type,
         capacity: Number(payload.capacity),
         is_active: Boolean(payload.is_active),
-      })
+        is_special: Boolean(payload.is_special),
+        special_note: String(payload.special_note ?? '').trim() ? String(payload.special_note ?? '').trim() : null,
+      }
+
+      try {
+        await putRoom(editRoom.id, nextPayload)
+      } catch (e: any) {
+        const msg = String(e?.message ?? e)
+        if (msg.includes('ROOM_IN_USE_CONFIRM_REQUIRED')) {
+          const ok = window.confirm(
+            'This room is already used in existing timetables/fixed entries/locks. Marking it as special can break those references.\n\nContinue?',
+          )
+          if (!ok) throw e
+          await putRoomWithForce(editRoom.id, nextPayload, true)
+        } else {
+          throw e
+        }
+      }
       showToast('Room updated')
       closeEdit()
       await refresh()
@@ -214,6 +235,35 @@ export function Rooms() {
               Active
             </label>
 
+            <label className="flex select-none items-center gap-2 text-sm text-slate-700">
+              <input
+                type="checkbox"
+                className="h-4 w-4 accent-amber-600"
+                checked={form.is_special}
+                onChange={(e) => setForm((f) => ({ ...f, is_special: e.target.checked }))}
+              />
+              Special room (🔒)
+            </label>
+
+            {form.is_special ? (
+              <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+                Special rooms are never auto-assigned by the solver. Use Special Allotments to place them.
+              </div>
+            ) : null}
+
+            <div>
+              <label htmlFor="room_special_note" className="text-xs font-medium text-slate-600">
+                Special note (optional)
+              </label>
+              <input
+                id="room_special_note"
+                className="input-premium mt-1 w-full text-sm"
+                value={form.special_note}
+                onChange={(e) => setForm((f) => ({ ...f, special_note: e.target.value }))}
+                placeholder="e.g., Exam hall / Seminar room"
+              />
+            </div>
+
             <button
               className="btn-primary text-sm font-semibold disabled:opacity-50"
               onClick={onCreate}
@@ -251,6 +301,7 @@ export function Rooms() {
                   <th className="px-3 py-2 text-left font-semibold">Code</th>
                   <th className="px-3 py-2 text-left font-semibold">Name</th>
                   <th className="px-3 py-2 text-left font-semibold">Type</th>
+                  <th className="px-3 py-2 text-left font-semibold">Special</th>
                   <th className="px-3 py-2 text-left font-semibold">Capacity</th>
                   <th className="px-3 py-2 text-left font-semibold">Active</th>
                   <th className="px-3 py-2 text-right font-semibold">Actions</th>
@@ -259,16 +310,28 @@ export function Rooms() {
               <tbody>
                 {filtered.length === 0 ? (
                   <tr>
-                    <td className="px-3 py-4 text-slate-600" colSpan={6}>
+                    <td className="px-3 py-4 text-slate-600" colSpan={7}>
                       No matching rooms.
                     </td>
                   </tr>
                 ) : (
                   filtered.map((r) => (
                     <tr key={r.id} className="border-t">
-                      <td className="px-3 py-2 font-medium text-slate-900">{r.code}</td>
+                      <td className="px-3 py-2 font-medium text-slate-900">
+                        {r.is_special ? '🔒 ' : ''}
+                        {r.code}
+                      </td>
                       <td className="px-3 py-2 text-slate-800">{r.name}</td>
                       <td className="px-3 py-2 text-slate-700">{r.room_type}</td>
+                      <td className="px-3 py-2">
+                        {r.is_special ? (
+                          <span className="inline-flex items-center rounded-full bg-amber-50 px-2 py-0.5 text-xs font-semibold text-amber-700">
+                            Special
+                          </span>
+                        ) : (
+                          <span className="text-xs text-slate-400">—</span>
+                        )}
+                      </td>
                       <td className="px-3 py-2 text-slate-700">{r.capacity}</td>
                       <td className="px-3 py-2">
                         <span

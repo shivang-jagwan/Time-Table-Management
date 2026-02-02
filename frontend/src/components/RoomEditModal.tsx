@@ -23,6 +23,8 @@ type FormState = {
   room_type: string
   capacity: number
   is_active: boolean
+  is_special: boolean
+  special_note: string
 }
 
 function roomToForm(r: Room): FormState {
@@ -32,6 +34,8 @@ function roomToForm(r: Room): FormState {
     room_type: r.room_type ?? 'CLASSROOM',
     capacity: Number(r.capacity ?? 0),
     is_active: Boolean(r.is_active),
+    is_special: Boolean((r as any).is_special),
+    special_note: String((r as any).special_note ?? ''),
   }
 }
 
@@ -77,7 +81,9 @@ export function RoomEditModal({ open, room, loading, onClose, onSave }: RoomEdit
     form.name.trim() !== (room.name ?? '').trim() ||
     String(form.room_type) !== String(room.room_type) ||
     Number(form.capacity) !== Number(room.capacity) ||
-    Boolean(form.is_active) !== Boolean(room.is_active)
+    Boolean(form.is_active) !== Boolean(room.is_active) ||
+    Boolean(form.is_special) !== Boolean((room as any).is_special) ||
+    String(form.special_note ?? '') !== String((room as any).special_note ?? '')
 
   async function handleSave() {
     if (!form) return
@@ -92,6 +98,8 @@ export function RoomEditModal({ open, room, loading, onClose, onSave }: RoomEdit
       room_type: form.room_type,
       capacity: Number(form.capacity),
       is_active: Boolean(form.is_active),
+      is_special: Boolean(form.is_special),
+      special_note: form.special_note.trim() ? form.special_note.trim() : null,
     }
 
     await onSave(payload)
@@ -187,6 +195,35 @@ export function RoomEditModal({ open, room, loading, onClose, onSave }: RoomEdit
               />
               <span className="text-slate-700 font-medium">Active</span>
             </label>
+
+            <label className="checkbox-row rounded-lg border border-white/40 bg-white/70">
+              <input
+                type="checkbox"
+                checked={form.is_special}
+                onChange={(e) => setForm((f) => (f ? { ...f, is_special: e.target.checked } : f))}
+              />
+              <span className="text-slate-700 font-medium">Special room (🔒)</span>
+            </label>
+
+            {form.is_special ? (
+              <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+                Special rooms are never auto-assigned by the solver. They can only be used via Special Allotments.
+              </div>
+            ) : null}
+
+            <div>
+              <label htmlFor={`${idPrefix}_special_note`} className="text-xs font-medium text-slate-600">
+                Special note (optional)
+              </label>
+              <input
+                id={`${idPrefix}_special_note`}
+                className="input-premium mt-1 w-full text-sm"
+                value={form.special_note}
+                onChange={(e) => setForm((f) => (f ? { ...f, special_note: e.target.value } : f))}
+                placeholder="e.g., Exam hall / Seminar room / Only via lock"
+                autoComplete="off"
+              />
+            </div>
 
             {errors.length ? (
               <div className="rounded-2xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">

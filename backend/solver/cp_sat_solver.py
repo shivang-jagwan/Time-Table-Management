@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from collections import defaultdict
 
 from ortools.sat.python import cp_model
@@ -25,13 +26,30 @@ from models.timetable_run import TimetableRun
 from models.time_slot import TimeSlot
 from models.track_subject import TrackSubject
 from models.fixed_timetable_entry import FixedTimetableEntry
+from models.special_allotment import SpecialAllotment
 
 
 class SolveResult:
-    def __init__(self, *, status: str, entries_written: int, conflicts: list[TimetableConflict]):
+    def __init__(
+        self,
+        *,
+        status: str,
+        entries_written: int,
+        conflicts: list[TimetableConflict],
+        diagnostics: list[dict] | None = None,
+        reason_summary: str | None = None,
+        objective_score: int | None = None,
+        warnings: list[str] | None = None,
+        solver_stats: dict | None = None,
+    ):
         self.status = status
         self.entries_written = entries_written
         self.conflicts = conflicts
+        self.diagnostics = diagnostics or []
+        self.reason_summary = reason_summary
+        self.objective_score = objective_score
+        self.warnings = warnings or []
+        self.solver_stats = solver_stats or {}
 
 
 def solve_program_year(
@@ -43,6 +61,7 @@ def solve_program_year(
     seed: int | None,
     max_time_seconds: float,
     enforce_teacher_load_limits: bool = True,
+    require_optimal: bool = False,
 ) -> SolveResult:
     return _solve_program(
         db,
@@ -52,6 +71,7 @@ def solve_program_year(
         seed=seed,
         max_time_seconds=max_time_seconds,
         enforce_teacher_load_limits=enforce_teacher_load_limits,
+        require_optimal=require_optimal,
     )
 
 
@@ -63,6 +83,7 @@ def solve_program_global(
     seed: int | None,
     max_time_seconds: float,
     enforce_teacher_load_limits: bool = True,
+    require_optimal: bool = False,
 ) -> SolveResult:
     """Program-wide solve.
 
@@ -76,6 +97,7 @@ def solve_program_global(
         seed=seed,
         max_time_seconds=max_time_seconds,
         enforce_teacher_load_limits=enforce_teacher_load_limits,
+        require_optimal=require_optimal,
     )
 
 
@@ -88,6 +110,7 @@ def _solve_program(
     seed: int | None,
     max_time_seconds: float,
     enforce_teacher_load_limits: bool,
+    require_optimal: bool,
 ) -> SolveResult:
     q_sections = select(Section).where(Section.program_id == program_id).where(Section.is_active.is_(True))
     if academic_year_id is not None:
@@ -116,9 +139,15 @@ def _solve_program(
     for w in windows:
         windows_by_section[w.section_id].append(w)
 
-    rooms: list[Room] = db.execute(select(Room).where(Room.is_active.is_(True))).scalars().all()
+    # Fetch all active rooms (including special) so we can reason about special-allotment locks.
+    rooms_all: list[Room] = db.execute(select(Room).where(Room.is_active.is_(True))).scalars().all()
+    room_by_id = {r.id: r for r in rooms_all}
+
+    # Room pool for auto-assignment: NEVER include special rooms.
     rooms_by_type = defaultdict(list)
-    for r in rooms:
+    for r in rooms_all:
+        if bool(getattr(r, "is_special", False)):
+            continue
         rooms_by_type[str(r.room_type)].append(r)
 
     q_subjects = select(Subject).where(Subject.program_id == program_id).where(Subject.is_active.is_(True))
@@ -155,6 +184,17 @@ def _solve_program(
             select(FixedTimetableEntry)
             .where(FixedTimetableEntry.section_id.in_([s.id for s in sections]))
             .where(FixedTimetableEntry.is_active.is_(True))
+        )
+        .scalars()
+        .all()
+    )
+
+    # Special allotments (hard locked events) applied pre-solve.
+    special_allotments: list[SpecialAllotment] = (
+        db.execute(
+            select(SpecialAllotment)
+            .where(SpecialAllotment.section_id.in_([s.id for s in sections]))
+            .where(SpecialAllotment.is_active.is_(True))
         )
         .scalars()
         .all()
@@ -266,6 +306,72 @@ def _solve_program(
     for key, arr in allowed_slot_indices_by_section_day.items():
         arr.sort()
 
+    # =========================
+    # Apply special allotments pre-solve
+    # =========================
+    # We treat special allotments as already-scheduled events:
+    # - remove occupied slots from variable creation
+    # - reduce required session counts accordingly
+    # - reserve rooms for greedy room assignment
+    # - write these entries directly into timetable_entries
+
+    locked_theory_sessions_by_sec_subj = defaultdict(int)  # (sec_id, subj_id) -> sessions already locked
+    locked_theory_sessions_by_sec_subj_day = defaultdict(int)  # (sec_id, subj_id, day) -> locked theory sessions
+    locked_lab_sessions_by_sec_subj = defaultdict(int)  # (sec_id, subj_id) -> lab blocks already locked
+    locked_lab_sessions_by_sec_subj_day = defaultdict(int)  # (sec_id, subj_id, day) -> locked lab blocks
+
+    locked_section_slots = set()  # (sec_id, slot_id)
+    locked_teacher_slots = set()  # (teacher_id, slot_id)
+    locked_teacher_slot_day = {}  # (teacher_id, slot_id) -> day
+
+    locked_slot_indices_by_section_day = defaultdict(set)  # (sec_id, day) -> {slot_index}
+
+    special_room_by_section_slot: dict[tuple[str, str], str] = {}
+    special_entries_to_write: list[tuple[str, str, str, str, str]] = []  # (sec, subj, teacher, room, slot)
+
+    for sa in special_allotments:
+        subj = subject_by_id.get(sa.subject_id)
+        if subj is None:
+            continue
+        di = slot_info.get(sa.slot_id)
+        if di is None:
+            continue
+        day, slot_idx = int(di[0]), int(di[1])
+
+        if str(subj.subject_type) == "LAB":
+            block = int(getattr(subj, "lab_block_size_slots", 1) or 1)
+            if block < 1:
+                block = 1
+            locked_lab_sessions_by_sec_subj[(sa.section_id, sa.subject_id)] += 1
+            locked_lab_sessions_by_sec_subj_day[(sa.section_id, sa.subject_id, day)] += 1
+
+            for j in range(block):
+                ts = slot_by_day_index.get((day, slot_idx + j))
+                if ts is None:
+                    continue
+
+                locked_section_slots.add((sa.section_id, ts.id))
+                locked_teacher_slots.add((sa.teacher_id, ts.id))
+                locked_teacher_slot_day[(sa.teacher_id, ts.id)] = day
+                locked_slot_indices_by_section_day[(sa.section_id, day)].add(int(slot_idx + j))
+
+                allowed_slots_by_section[sa.section_id].discard(ts.id)
+                special_room_by_section_slot[(sa.section_id, ts.id)] = sa.room_id
+                special_entries_to_write.append((sa.section_id, sa.subject_id, sa.teacher_id, sa.room_id, ts.id))
+            continue
+
+        # THEORY (and any other non-LAB)
+        locked_theory_sessions_by_sec_subj[(sa.section_id, sa.subject_id)] += 1
+        locked_theory_sessions_by_sec_subj_day[(sa.section_id, sa.subject_id, day)] += 1
+        locked_section_slots.add((sa.section_id, sa.slot_id))
+        locked_teacher_slots.add((sa.teacher_id, sa.slot_id))
+        locked_teacher_slot_day[(sa.teacher_id, sa.slot_id)] = day
+        locked_slot_indices_by_section_day[(sa.section_id, day)].add(int(slot_idx))
+
+        allowed_slots_by_section[sa.section_id].discard(sa.slot_id)
+        special_room_by_section_slot[(sa.section_id, sa.slot_id)] = sa.room_id
+        special_entries_to_write.append((sa.section_id, sa.subject_id, sa.teacher_id, sa.room_id, sa.slot_id))
+
     def _contiguous_starts(sorted_indices: list[int], block: int):
         if block <= 1:
             for idx in sorted_indices:
@@ -342,6 +448,108 @@ def _solve_program(
         for sid in filtered:
             combined_gid_by_sec_subj[(sid, subj_id)] = gid
 
+    # ==========================================
+    # Apply fixed entries pre-solve (speed)
+    # ==========================================
+    # Similar to special allotments, we can treat many fixed entries as already-scheduled:
+    # - remove occupied slots from variable creation
+    # - reserve rooms for greedy room assignment
+    # - write these entries directly into timetable_entries
+    #
+    # We intentionally skip:
+    # - Combined THEORY fixed entries (must drive shared combined vars)
+    # - Elective-block subjects (these are generated via z vars)
+
+    elective_subjects_by_section = defaultdict(set)  # section_id -> {subject_id}
+    for sec_id, block_ids in blocks_by_section.items():
+        for bid in block_ids:
+            for subj_id, _teacher_id in block_subject_pairs_by_block.get(bid, []):
+                elective_subjects_by_section[sec_id].add(subj_id)
+
+    fixed_room_by_section_slot: dict[tuple[str, str], str] = {}
+    fixed_entries_to_write: list[tuple[str, str, str, str, str]] = []  # (sec, subj, teacher, room, slot)
+    locked_fixed_entry_ids: set[str] = set()
+
+    for fe in fixed_entries:
+        subj = subject_by_id.get(fe.subject_id)
+        if subj is None:
+            continue
+        di = slot_info.get(fe.slot_id)
+        if di is None:
+            continue
+        day, slot_idx = int(di[0]), int(di[1])
+
+        # Skip combined THEORY here; handled later by forcing combined_x.
+        gid = combined_gid_by_sec_subj.get((fe.section_id, fe.subject_id))
+        if gid is not None and str(subj.subject_type) == "THEORY":
+            continue
+
+        # Skip elective-block subjects; handled later by forcing z vars.
+        if fe.subject_id in elective_subjects_by_section.get(fe.section_id, set()):
+            continue
+
+        if str(subj.subject_type) == "LAB":
+            block = int(getattr(subj, "lab_block_size_slots", 1) or 1)
+            if block < 1:
+                block = 1
+
+            locked_lab_sessions_by_sec_subj[(fe.section_id, fe.subject_id)] += 1
+            locked_lab_sessions_by_sec_subj_day[(fe.section_id, fe.subject_id, day)] += 1
+
+            for j in range(block):
+                ts = slot_by_day_index.get((day, slot_idx + j))
+                if ts is None:
+                    continue
+
+                locked_section_slots.add((fe.section_id, ts.id))
+                locked_teacher_slots.add((fe.teacher_id, ts.id))
+                locked_teacher_slot_day[(fe.teacher_id, ts.id)] = day
+                locked_slot_indices_by_section_day[(fe.section_id, day)].add(int(slot_idx + j))
+
+                allowed_slots_by_section[fe.section_id].discard(ts.id)
+                fixed_room_by_section_slot[(fe.section_id, ts.id)] = fe.room_id
+                fixed_entries_to_write.append((fe.section_id, fe.subject_id, fe.teacher_id, fe.room_id, ts.id))
+            locked_fixed_entry_ids.add(str(fe.id))
+            continue
+
+        # THEORY (and any other non-LAB)
+        locked_theory_sessions_by_sec_subj[(fe.section_id, fe.subject_id)] += 1
+        locked_theory_sessions_by_sec_subj_day[(fe.section_id, fe.subject_id, day)] += 1
+        locked_section_slots.add((fe.section_id, fe.slot_id))
+        locked_teacher_slots.add((fe.teacher_id, fe.slot_id))
+        locked_teacher_slot_day[(fe.teacher_id, fe.slot_id)] = day
+        locked_slot_indices_by_section_day[(fe.section_id, day)].add(int(slot_idx))
+
+        allowed_slots_by_section[fe.section_id].discard(fe.slot_id)
+        fixed_room_by_section_slot[(fe.section_id, fe.slot_id)] = fe.room_id
+        fixed_entries_to_write.append((fe.section_id, fe.subject_id, fe.teacher_id, fe.room_id, fe.slot_id))
+        locked_fixed_entry_ids.add(str(fe.id))
+
+    # ==========================================
+    # Prune impossible slots for teachers (speed)
+    # ==========================================
+    # If a teacher is already hard-locked into a slot (special allotment / fixed entry) or
+    # the slot is on their weekly off day, then any decision variable that uses
+    # that teacher in that slot can never be true.
+    teacher_disallowed_slot_ids = defaultdict(set)  # teacher_id -> {slot_id}
+    for teacher_id, slot_id in locked_teacher_slots:
+        teacher_disallowed_slot_ids[teacher_id].add(slot_id)
+    for teacher_id, teacher in teacher_by_id.items():
+        if teacher.weekly_off_day is None:
+            continue
+        off_day = int(teacher.weekly_off_day)
+        for ts in slots_by_day.get(off_day, []):
+            teacher_disallowed_slot_ids[teacher_id].add(ts.id)
+
+    # Filter LAB candidate indices and other per-day allowed indices after removing locked slots.
+    for key, locked_indices in locked_slot_indices_by_section_day.items():
+        if not locked_indices:
+            continue
+        arr = allowed_slot_indices_by_section_day.get(key)
+        if not arr:
+            continue
+        allowed_slot_indices_by_section_day[key] = [i for i in arr if i not in locked_indices]
+
     model = cp_model.CpModel()
 
     x = {}  # theory: (sec, subj, slot) -> Bool
@@ -360,6 +568,12 @@ def _solve_program(
     teacher_day_terms = defaultdict(list)  # (teacher_id, day) -> [Bool] (counted per occupied slot)
     teacher_active_days = defaultdict(set)  # teacher_id -> set(day)
 
+    # Room-capacity terms (counts concurrent sessions per slot).
+    # We model room *capacity* (how many rooms exist) rather than room identity,
+    # and do concrete room IDs with a greedy pass after solving.
+    room_terms_by_slot = defaultdict(list)  # slot_id -> [Bool] (THEORY + electives + combined theory)
+    lab_room_terms_by_slot = defaultdict(list)  # slot_id -> [Bool] (LAB occupancies)
+
     lab_start = {}  # (sec, subj, day, start_index) -> Bool
 
     lab_starts_by_sec_subj = defaultdict(list)  # (sec, subj) -> [Bool]
@@ -371,6 +585,17 @@ def _solve_program(
 
     combined_vars_by_gid = defaultdict(list)  # group_id -> [Bool]
     combined_vars_by_gid_day = defaultdict(list)  # (group_id, day) -> [Bool]
+
+    # Add special allotment occupancies as constants (pre-scheduled events)
+    for sec_id, slot_id in locked_section_slots:
+        section_slot_terms[(sec_id, slot_id)].append(1)
+    for teacher_id, slot_id in locked_teacher_slots:
+        teacher_slot_terms[(teacher_id, slot_id)].append(1)
+        teacher_all_terms[teacher_id].append(1)
+        d = locked_teacher_slot_day.get((teacher_id, slot_id))
+        if d is not None:
+            teacher_day_terms[(teacher_id, int(d))].append(1)
+            teacher_active_days[teacher_id].add(int(d))
 
     # Build variables
     for section in sections:
@@ -414,12 +639,19 @@ def _solve_program(
                         if not covered:
                             continue
 
+                        # Prune starts that would violate teacher unavailability.
+                        if any(ts.id in teacher_disallowed_slot_ids.get(assigned_teacher_id, set()) for ts in covered):
+                            continue
+
                         sv = model.NewBoolVar(f"lab_start_{section.id}_{subject_id}_{day}_{start_idx}")
                         lab_start[(section.id, subject_id, day, start_idx)] = sv
                         lab_starts_by_sec_subj[(section.id, subject_id)].append(sv)
                         lab_starts_by_sec_subj_day[(section.id, subject_id, day)].append(sv)
                         for ts in covered:
                             section_slot_terms[(section.id, ts.id)].append(sv)
+
+                            # Each covered slot consumes a LAB room.
+                            lab_room_terms_by_slot[ts.id].append(sv)
 
                             # Assigned teacher occupies every covered slot when this start is chosen.
                             teacher_slot_terms[(assigned_teacher_id, ts.id)].append(sv)
@@ -428,20 +660,37 @@ def _solve_program(
                             teacher_active_days[assigned_teacher_id].add(day)
 
                 starts = lab_starts_by_sec_subj.get((section.id, subject_id), [])
-                if starts:
-                    model.Add(sum(starts) == int(sessions_per_week))
+                locked = int(locked_lab_sessions_by_sec_subj.get((section.id, subject_id), 0) or 0)
+                needed = int(sessions_per_week) - locked
+                if needed < 0:
+                    model.Add(0 == 1)
+                elif starts:
+                    model.Add(sum(starts) == int(needed))
+                else:
+                    model.Add(int(needed) == 0)
+
                 # max_per_day (blocks)
                 for day in range(0, 6):
                     day_starts = lab_starts_by_sec_subj_day.get((section.id, subject_id, day), [])
-                    if day_starts:
-                        model.Add(sum(day_starts) <= int(subj.max_per_day))
+                    locked_day = int(locked_lab_sessions_by_sec_subj_day.get((section.id, subject_id, day), 0) or 0)
+                    cap = int(subj.max_per_day) - locked_day
+                    if cap < 0:
+                        model.Add(0 == 1)
+                    elif day_starts:
+                        model.Add(sum(day_starts) <= int(cap))
                 continue
 
             # THEORY
             for slot_id in sorted(list(allowed_slots_by_section[section.id])):
+                # Prune slots that the assigned teacher can never take.
+                if slot_id in teacher_disallowed_slot_ids.get(assigned_teacher_id, set()):
+                    continue
                 xv = model.NewBoolVar(f"x_{section.id}_{subject_id}_{slot_id}")
                 x[(section.id, subject_id, slot_id)] = xv
                 section_slot_terms[(section.id, slot_id)].append(xv)
+
+                # Consumes one THEORY-capable room in this slot.
+                room_terms_by_slot[slot_id].append(xv)
 
                 teacher_slot_terms[(assigned_teacher_id, slot_id)].append(xv)
                 teacher_all_terms[assigned_teacher_id].append(xv)
@@ -460,15 +709,23 @@ def _solve_program(
                 # With strict assignment, teacher is implicit; no extra vars needed.
 
             terms = x_by_sec_subj.get((section.id, subject_id), [])
-            if terms:
-                model.Add(sum(terms) == int(sessions_per_week))
+            locked = int(locked_theory_sessions_by_sec_subj.get((section.id, subject_id), 0) or 0)
+            needed = int(sessions_per_week) - locked
+            if needed < 0:
+                model.Add(0 == 1)
+            elif terms:
+                model.Add(sum(terms) == int(needed))
             else:
-                model.Add(int(sessions_per_week) == 0)
+                model.Add(int(needed) == 0)
 
             for day in range(0, 6):
                 day_x = x_by_sec_subj_day.get((section.id, subject_id, day), [])
-                if day_x:
-                    model.Add(sum(day_x) <= int(subj.max_per_day))
+                locked_day = int(locked_theory_sessions_by_sec_subj_day.get((section.id, subject_id, day), 0) or 0)
+                cap = int(subj.max_per_day) - locked_day
+                if cap < 0:
+                    model.Add(0 == 1)
+                elif day_x:
+                    model.Add(sum(day_x) <= int(cap))
 
     # Combined THEORY variables and constraints (shared decision variables)
     for group_id, sec_ids in group_sections.items():
@@ -507,6 +764,9 @@ def _solve_program(
             # Validation should have caught teacher assignment mismatch; skip generating vars.
             continue
         for slot_id in sorted(list(allowed)):
+            # Prune slots that the shared teacher can never take.
+            if slot_id in teacher_disallowed_slot_ids.get(assigned_teacher_id, set()):
+                continue
             gv = model.NewBoolVar(f"cg_{group_id}_{subj_id}_{slot_id}")
             combined_x[(group_id, slot_id)] = gv
             combined_vars_by_gid[group_id].append(gv)
@@ -525,6 +785,9 @@ def _solve_program(
             if d is not None:
                 teacher_day_terms[(assigned_teacher_id, int(d))].append(gv)
                 teacher_active_days[assigned_teacher_id].add(int(d))
+
+            # Combined class uses one room total (not per-section).
+            room_terms_by_slot[slot_id].append(gv)
 
         # Total sessions/week for the combined group
         model.Add(sum(combined_vars_by_gid.get(group_id, [])) == int(sessions_per_week))
@@ -565,9 +828,20 @@ def _solve_program(
                 max_per_day = 0
 
             for slot_id in sorted(list(allowed_slots_by_section.get(section.id, set()))):
+                # Prune slots where any teacher in the block is unavailable.
+                blocked = False
+                for _subj_id, teacher_id in pairs:
+                    if slot_id in teacher_disallowed_slot_ids.get(teacher_id, set()):
+                        blocked = True
+                        break
+                if blocked:
+                    continue
                 zv = model.NewBoolVar(f"z_{section.id}_{block_id}_{slot_id}")
                 z[(section.id, block_id, slot_id)] = zv
                 section_slot_terms[(section.id, slot_id)].append(zv)
+
+                # Elective block consumes one THEORY-capable room in this slot.
+                room_terms_by_slot[slot_id].append(zv)
 
                 d = slot_info.get(slot_id, (None, None))[0]
                 if d is not None:
@@ -594,16 +868,66 @@ def _solve_program(
                     model.Add(sum(day_terms) <= int(max_per_day))
 
     # =========================
+    # Room capacity constraints
+    # =========================
+    # These prevent schedules that require more simultaneous rooms than exist.
+    # Without this, a PROGRAM_GLOBAL run can schedule every section at the same time,
+    # and the greedy room assignment will be forced to create room conflicts.
+    theory_room_capacity = len(rooms_by_type.get("CLASSROOM", [])) + len(rooms_by_type.get("LT", []))
+    lab_room_capacity = len(rooms_by_type.get("LAB", []))
+
+    special_theory_by_slot = defaultdict(int)
+    special_lab_by_slot = defaultdict(int)
+    for _sec_id, subj_id, _teacher_id, _room_id, slot_id in special_entries_to_write:
+        # Special-room locks do not consume normal room capacity.
+        room = room_by_id.get(_room_id)
+        if room is not None and bool(getattr(room, "is_special", False)):
+            continue
+        subj = subject_by_id.get(subj_id)
+        if subj is not None and str(subj.subject_type) == "LAB":
+            special_lab_by_slot[slot_id] += 1
+        else:
+            special_theory_by_slot[slot_id] += 1
+
+    fixed_theory_by_slot = defaultdict(int)
+    fixed_lab_by_slot = defaultdict(int)
+    for _sec_id, subj_id, _teacher_id, _room_id, slot_id in fixed_entries_to_write:
+        # Fixed entries consume normal room capacity (validation should prevent special rooms here).
+        room = room_by_id.get(_room_id)
+        if room is not None and bool(getattr(room, "is_special", False)):
+            continue
+        subj = subject_by_id.get(subj_id)
+        if subj is not None and str(subj.subject_type) == "LAB":
+            fixed_lab_by_slot[slot_id] += 1
+        else:
+            fixed_theory_by_slot[slot_id] += 1
+
+    for ts in slots:
+        slot_id = ts.id
+        model.Add(
+            sum(room_terms_by_slot.get(slot_id, []))
+            + int(special_theory_by_slot.get(slot_id, 0))
+            + int(fixed_theory_by_slot.get(slot_id, 0))
+            <= int(theory_room_capacity)
+        )
+        model.Add(
+            sum(lab_room_terms_by_slot.get(slot_id, []))
+            + int(special_lab_by_slot.get(slot_id, 0))
+            + int(fixed_lab_by_slot.get(slot_id, 0))
+            <= int(lab_room_capacity)
+        )
+
+    # =========================
     # Apply fixed-entry hard constraints
     # =========================
-    fixed_room_by_section_slot: dict[tuple[str, str], str] = {}
-
     def _make_infeasible(_reason: str, *, section_id=None, subject_id=None, teacher_id=None, slot_id=None):
         # Force infeasible via a contradictory constraint.
         # Detailed user-facing conflicts should be raised during validation.
         model.Add(0 == 1)
 
     for fe in fixed_entries:
+        if str(fe.id) in locked_fixed_entry_ids:
+            continue
         subj = subject_by_id.get(fe.subject_id)
         if subj is None:
             _make_infeasible(
@@ -766,10 +1090,45 @@ def _solve_program(
     status = solver.Solve(model)
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         ortools_status = int(status)
+        diagnostics: list[dict] = []
+        reason_summary: str | None = None
         if status == cp_model.INFEASIBLE:
             run.status = "INFEASIBLE"
             conflict_type = "INFEASIBLE"
-            message = "Solver could not find a feasible timetable."
+            message = (
+                "Solver infeasible due to special locked allotments."
+                if special_allotments
+                else "Solver could not find a feasible timetable."
+            )
+
+            try:
+                from solver.solver_diagnostics import run_infeasibility_analysis, summarize_diagnostics
+
+                diagnostics = run_infeasibility_analysis(
+                    {
+                        "sections": sections,
+                        "section_required": section_required,
+                        "assigned_teacher_by_section_subject": assigned_teacher_by_section_subject,
+                        "subject_by_id": subject_by_id,
+                        "teacher_by_id": teacher_by_id,
+                        "slots": slots,
+                        "slot_info": slot_info,
+                        "slot_by_day_index": slot_by_day_index,
+                        "windows_by_section": windows_by_section,
+                        "fixed_entries": fixed_entries,
+                        "special_allotments": special_allotments,
+                        "group_sections": group_sections,
+                        "group_subject": group_subject,
+                        "blocks_by_section": blocks_by_section,
+                        "block_subject_pairs_by_block": block_subject_pairs_by_block,
+                        "rooms_by_type": rooms_by_type,
+                        "room_by_id": room_by_id,
+                    }
+                )
+                reason_summary = summarize_diagnostics(diagnostics)
+            except Exception:
+                diagnostics = []
+                reason_summary = None
         elif status == cp_model.UNKNOWN:
             run.status = "ERROR"
             conflict_type = "TIMEOUT"
@@ -788,21 +1147,135 @@ def _solve_program(
             severity="ERROR",
             conflict_type=conflict_type,
             message=message,
-            metadata_json={"ortools_status": ortools_status},
+            metadata_json={
+                "ortools_status": ortools_status,
+                **({"reason_summary": reason_summary} if reason_summary else {}),
+                **({"diagnostics": diagnostics} if diagnostics else {}),
+            },
         )
         db.add(conflict)
         db.commit()
-        return SolveResult(status=str(run.status), entries_written=0, conflicts=[conflict])
+        return SolveResult(
+            status=str(run.status),
+            entries_written=0,
+            conflicts=[conflict],
+            diagnostics=diagnostics,
+            reason_summary=reason_summary,
+        )
 
     db.execute(delete(TimetableEntry).where(TimetableEntry.run_id == run.id))
     entries_written = 0
 
+    objective_score = None
+    try:
+        objective_score = int(solver.ObjectiveValue())
+    except Exception:
+        objective_score = None
+
+    # Useful warnings even on FEASIBLE/OPTIMAL runs.
+    warnings: list[str] = []
+    try:
+        # Teacher weekly load usage warnings.
+        for teacher_id, teacher in teacher_by_id.items():
+            max_week = int(getattr(teacher, "max_per_week", 0) or 0)
+            if max_week <= 0:
+                continue
+            used = 0
+            for term in teacher_all_terms.get(teacher_id, []):
+                if term == 1:
+                    used += 1
+                else:
+                    used += int(solver.Value(term))
+            if used >= int(0.9 * max_week):
+                warnings.append(f"Teacher {getattr(teacher, 'code', teacher_id)} assigned {used}/{max_week} weekly load")
+
+        # Room capacity utilization warnings (based on max concurrent occupancies).
+        theory_room_capacity = len(rooms_by_type.get("CLASSROOM", [])) + len(rooms_by_type.get("LT", []))
+        lab_room_capacity = len(rooms_by_type.get("LAB", []))
+        if theory_room_capacity > 0:
+            max_used = 0
+            for ts in slots:
+                slot_id = ts.id
+                used = int(special_theory_by_slot.get(slot_id, 0) or 0) + int(fixed_theory_by_slot.get(slot_id, 0) or 0)
+                for term in room_terms_by_slot.get(slot_id, []):
+                    if term == 1:
+                        used += 1
+                    else:
+                        used += int(solver.Value(term))
+                max_used = max(max_used, used)
+            if max_used >= int(0.95 * theory_room_capacity):
+                warnings.append(f"Room utilization near capacity: max {max_used}/{theory_room_capacity} THEORY rooms used")
+
+        if lab_room_capacity > 0:
+            max_used = 0
+            for ts in slots:
+                slot_id = ts.id
+                used = int(special_lab_by_slot.get(slot_id, 0) or 0) + int(fixed_lab_by_slot.get(slot_id, 0) or 0)
+                for term in lab_room_terms_by_slot.get(slot_id, []):
+                    if term == 1:
+                        used += 1
+                    else:
+                        used += int(solver.Value(term))
+                max_used = max(max_used, used)
+            if max_used >= int(0.95 * lab_room_capacity):
+                warnings.append(f"Room utilization near capacity: max {max_used}/{lab_room_capacity} LAB rooms used")
+    except Exception:
+        warnings = []
+
+    solver_stats = {
+        "ortools_status": int(status),
+        "wall_time_seconds": float(getattr(solver, "WallTime", lambda: 0.0)()),
+        "num_branches": int(getattr(solver, "NumBranches", lambda: 0)()),
+        "num_conflicts": int(getattr(solver, "NumConflicts", lambda: 0)()),
+        "status_name": cp_model.CpSolverStatus.Name(int(status))
+        if hasattr(cp_model, "CpSolverStatus") and hasattr(cp_model.CpSolverStatus, "Name")
+        else str(int(status)),
+        "require_optimal": bool(require_optimal),
+    }
+
     # Greedy room assignment after solver (keeps CP-SAT model tractable).
     used_rooms_by_slot = defaultdict(set)  # slot_id -> set(room_id)
 
+    def _sid(slot_id) -> str:
+        return str(slot_id)
+
+    def _rid(room_id) -> str:
+        return str(room_id)
+
+    def _room_conflict_group_id(*, room_id, slot_id) -> uuid.UUID:
+        # Used only to bypass the partial unique index on (run_id, room_id, slot_id)
+        # for non-combined entries when we must persist room conflicts as warnings.
+        return uuid.uuid5(uuid.NAMESPACE_OID, f"ROOM_CONFLICT:{run.id}:{room_id}:{slot_id}")
+
+    conflicting_special_room_slots: set[tuple[str, str]] = set()  # (section_id, slot_id)
+    conflicting_fixed_room_slots: set[tuple[str, str]] = set()  # (section_id, slot_id)
+
+    # Reserve rooms for special allotments (and warn on locked room conflicts).
+    for (sec_id, slot_id), room_id in special_room_by_section_slot.items():
+        sid = _sid(slot_id)
+        rid = _rid(room_id)
+        if rid in used_rooms_by_slot[sid]:
+            conflicting_special_room_slots.add((str(sec_id), str(slot_id)))
+            db.add(
+                TimetableConflict(
+                    run_id=run.id,
+                    severity="WARN",
+                    conflict_type="SPECIAL_ROOM_CONFLICT",
+                    message="Special allotment room is already used in this slot by another locked assignment.",
+                    section_id=sec_id,
+                    room_id=room_id,
+                    slot_id=slot_id,
+                    metadata_json={},
+                )
+            )
+        used_rooms_by_slot[sid].add(rid)
+
     # Reserve rooms for fixed entries (and warn on fixed room conflicts).
     for (sec_id, slot_id), room_id in fixed_room_by_section_slot.items():
-        if room_id in used_rooms_by_slot[slot_id]:
+        sid = _sid(slot_id)
+        rid = _rid(room_id)
+        if rid in used_rooms_by_slot[sid]:
+            conflicting_fixed_room_slots.add((str(sec_id), str(slot_id)))
             db.add(
                 TimetableConflict(
                     run_id=run.id,
@@ -815,9 +1288,48 @@ def _solve_program(
                     metadata_json={},
                 )
             )
-        used_rooms_by_slot[slot_id].add(room_id)
+        used_rooms_by_slot[sid].add(rid)
+
+    # Write special allotments into the run output (they're already fully specified).
+    for sec_id, subj_id, teacher_id, room_id, slot_id in special_entries_to_write:
+        combined_conflict_id = None
+        if (str(sec_id), str(slot_id)) in conflicting_special_room_slots:
+            combined_conflict_id = _room_conflict_group_id(room_id=room_id, slot_id=slot_id)
+        db.add(
+            TimetableEntry(
+                run_id=run.id,
+                academic_year_id=section_year_by_id.get(sec_id) or run.academic_year_id,
+                section_id=sec_id,
+                subject_id=subj_id,
+                teacher_id=teacher_id,
+                room_id=room_id,
+                slot_id=slot_id,
+                combined_class_id=combined_conflict_id,
+            )
+        )
+        entries_written += 1
+
+    # Write pre-locked fixed entries into the run output.
+    for sec_id, subj_id, teacher_id, room_id, slot_id in fixed_entries_to_write:
+        combined_conflict_id = None
+        if (str(sec_id), str(slot_id)) in conflicting_fixed_room_slots:
+            combined_conflict_id = _room_conflict_group_id(room_id=room_id, slot_id=slot_id)
+        db.add(
+            TimetableEntry(
+                run_id=run.id,
+                academic_year_id=section_year_by_id.get(sec_id) or run.academic_year_id,
+                section_id=sec_id,
+                subject_id=subj_id,
+                teacher_id=teacher_id,
+                room_id=room_id,
+                slot_id=slot_id,
+                combined_class_id=combined_conflict_id,
+            )
+        )
+        entries_written += 1
 
     def pick_room(slot_id, subject_type: str) -> tuple[str | None, bool]:
+        sid = _sid(slot_id)
         candidates = []
         if subject_type == "LAB":
             candidates = rooms_by_type.get("LAB", [])
@@ -828,23 +1340,28 @@ def _solve_program(
             return None, False
 
         for room in candidates:
-            if room.id not in used_rooms_by_slot[slot_id]:
-                used_rooms_by_slot[slot_id].add(room.id)
+            rid = _rid(room.id)
+            if rid not in used_rooms_by_slot[sid]:
+                used_rooms_by_slot[sid].add(rid)
                 return room.id, True
 
         # None free; return first with conflict
-        used_rooms_by_slot[slot_id].add(candidates[0].id)
+        used_rooms_by_slot[sid].add(_rid(candidates[0].id))
         return candidates[0].id, False
 
     def pick_lt_room(slot_id) -> tuple[str | None, bool]:
-        candidates = rooms_by_type.get("LT", [])
+        sid = _sid(slot_id)
+        # Electives/combined classes prefer LT, but can fall back to CLASSROOM
+        # to match the room-capacity constraints (LT + CLASSROOM pool).
+        candidates = [*rooms_by_type.get("LT", []), *rooms_by_type.get("CLASSROOM", [])]
         if not candidates:
             return None, False
         for room in candidates:
-            if room.id not in used_rooms_by_slot[slot_id]:
-                used_rooms_by_slot[slot_id].add(room.id)
+            rid = _rid(room.id)
+            if rid not in used_rooms_by_slot[sid]:
+                used_rooms_by_slot[sid].add(rid)
                 return room.id, True
-        used_rooms_by_slot[slot_id].add(candidates[0].id)
+        used_rooms_by_slot[sid].add(_rid(candidates[0].id))
         return candidates[0].id, False
 
     def pick_room_for_block(slot_ids: list[str]) -> tuple[str | None, bool]:
@@ -854,15 +1371,16 @@ def _solve_program(
 
         # Prefer a room free in ALL slots of the block.
         for room in candidates:
-            if all(room.id not in used_rooms_by_slot[sid] for sid in slot_ids):
+            rid = _rid(room.id)
+            if all(rid not in used_rooms_by_slot[_sid(sid)] for sid in slot_ids):
                 for sid in slot_ids:
-                    used_rooms_by_slot[sid].add(room.id)
+                    used_rooms_by_slot[_sid(sid)].add(rid)
                 return room.id, True
 
         # None free for the whole block; pick the first and mark conflicts.
         room_id = candidates[0].id
         for sid in slot_ids:
-            used_rooms_by_slot[sid].add(room_id)
+            used_rooms_by_slot[_sid(sid)].add(_rid(room_id))
         return room_id, False
 
     for (sec_id, subj_id, slot_id), xv in x.items():
@@ -879,6 +1397,13 @@ def _solve_program(
             room_id, ok_room = pick_room(slot_id, str(subj.subject_type))
         if room_id is None:
             continue
+
+        combined_conflict_id = None
+        if fixed_room is not None and (str(sec_id), str(slot_id)) in conflicting_fixed_room_slots:
+            combined_conflict_id = _room_conflict_group_id(room_id=room_id, slot_id=slot_id)
+        elif not ok_room:
+            combined_conflict_id = _room_conflict_group_id(room_id=room_id, slot_id=slot_id)
+
         if not ok_room:
             db.add(
                 TimetableConflict(
@@ -902,7 +1427,7 @@ def _solve_program(
                 teacher_id=teacher_id,
                 room_id=room_id,
                 slot_id=slot_id,
-                combined_class_id=None,
+                combined_class_id=combined_conflict_id,
             )
         )
         entries_written += 1
@@ -924,6 +1449,9 @@ def _solve_program(
             room_id, ok_room = pick_lt_room(slot_id)
             if room_id is None:
                 continue
+
+            combined_conflict_id = None if ok_room else _room_conflict_group_id(room_id=room_id, slot_id=slot_id)
+
             if not ok_room:
                 db.add(
                     TimetableConflict(
@@ -948,7 +1476,7 @@ def _solve_program(
                     teacher_id=teacher_id,
                     room_id=room_id,
                     slot_id=slot_id,
-                    combined_class_id=None,
+                    combined_class_id=combined_conflict_id,
                     elective_block_id=block_id,
                 )
             )
@@ -1037,7 +1565,7 @@ def _solve_program(
             if ts is not None:
                 block_slots.append(ts)
 
-        slot_ids = [ts.id for ts in block_slots]
+        slot_ids = [str(ts.id) for ts in block_slots]
         if not slot_ids:
             continue
 
@@ -1049,6 +1577,8 @@ def _solve_program(
             room_id, ok_room = pick_room_for_block(slot_ids)
         if room_id is None:
             continue
+
+        combined_conflict_id = None if ok_room else _room_conflict_group_id(room_id=room_id, slot_id=str(slot_ids[0]))
 
         for j in range(block):
             ts = slot_by_day_index.get((day, start_idx + j))
@@ -1077,12 +1607,37 @@ def _solve_program(
                     teacher_id=chosen_t,
                     room_id=room_id,
                     slot_id=ts.id,
-                    combined_class_id=None,
+                    combined_class_id=combined_conflict_id,
                 )
             )
             entries_written += 1
 
-    run.status = "OPTIMAL" if status == cp_model.OPTIMAL else "FEASIBLE"
+    if status == cp_model.OPTIMAL:
+        run.status = "OPTIMAL"
+    elif require_optimal:
+        # CP-SAT returns FEASIBLE when a solution exists but optimality is not proven
+        # (typically due to time limit). Treat this as a distinct status so the UI/API
+        # never implies optimality.
+        run.status = "SUBOPTIMAL"
+        warnings.append("A feasible timetable was found, but optimality was not proven (SUBOPTIMAL).")
+        db.add(
+            TimetableConflict(
+                run_id=run.id,
+                severity="WARN",
+                conflict_type="SUBOPTIMAL",
+                message="Feasible timetable found but optimality not proven (time limit reached before proving OPTIMAL).",
+                metadata_json={"max_time_seconds": float(max_time_seconds)},
+            )
+        )
+    else:
+        run.status = "FEASIBLE"
     run.solver_version = "cp-sat-v1"
     db.commit()
-    return SolveResult(status=str(run.status), entries_written=entries_written, conflicts=[])
+    return SolveResult(
+        status=str(run.status),
+        entries_written=entries_written,
+        conflicts=[],
+        objective_score=objective_score,
+        warnings=warnings,
+        solver_stats=solver_stats,
+    )

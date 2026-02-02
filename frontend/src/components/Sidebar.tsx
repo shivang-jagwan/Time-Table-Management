@@ -110,17 +110,6 @@ const NAV: NavItem[] = [
     ),
   },
   {
-    to: '/electives',
-    label: 'Electives',
-    icon: (
-      <Icon>
-        <svg viewBox="0 0 24 24" className="size-5" fill="none" stroke="currentColor" strokeWidth="2">
-          <path d="M12 21s-7-4.4-7-11a4 4 0 0 1 7-2 4 4 0 0 1 7 2c0 6.6-7 11-7 11Z" />
-        </svg>
-      </Icon>
-    ),
-  },
-  {
     to: '/elective-blocks',
     label: 'Elective Blocks',
     icon: (
@@ -143,6 +132,18 @@ const NAV: NavItem[] = [
         <svg viewBox="0 0 24 24" className="size-5" fill="none" stroke="currentColor" strokeWidth="2">
           <path d="M7 7h10v10H7V7Z" />
           <path d="M4 4h6M14 4h6M4 20h6M14 20h6" />
+        </svg>
+      </Icon>
+    ),
+  },
+  {
+    to: '/special-allotments',
+    label: 'Special Allotments',
+    icon: (
+      <Icon>
+        <svg viewBox="0 0 24 24" className="size-5" fill="none" stroke="currentColor" strokeWidth="2">
+          <rect x="3" y="11" width="18" height="11" rx="2" />
+          <path d="M7 11V7a5 5 0 0 1 10 0v4" />
         </svg>
       </Icon>
     ),

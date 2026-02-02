@@ -17,7 +17,7 @@ Key consequences:
 ## API
 
 - `POST /api/solver/generate` (JSON body: `{ "program_code": "...", "academic_year_number": 3, "seed": 42 }`)
-- `POST /api/solver/solve` (JSON body: `{ "program_code": "...", "academic_year_number": 3, "seed": 42, "max_time_seconds": 60, "relax_teacher_load_limits": false }`)
+- `POST /api/solver/solve` (JSON body: `{ "program_code": "...", "academic_year_number": 3, "seed": 42, "max_time_seconds": 60, "relax_teacher_load_limits": false, "require_optimal": true }`)
 
 ## Program-wide solver (all years)
 
@@ -29,4 +29,4 @@ As of this update, the solver also supports a true program-wide mode:
 ### Endpoints
 
 - `POST /api/solver/generate-global` (JSON body: `{ "program_code": "...", "seed": 42 }`)
-- `POST /api/solver/solve-global` (JSON body: `{ "program_code": "...", "seed": 42, "max_time_seconds": 120, "relax_teacher_load_limits": false }`)
+- `POST /api/solver/solve-global` (JSON body: `{ "program_code": "...", "seed": 42, "max_time_seconds": 300, "relax_teacher_load_limits": false, "require_optimal": true }`)

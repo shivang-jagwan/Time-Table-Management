@@ -12,6 +12,89 @@
 			"isBackground": false,
 			"problemMatcher": [],
 			"group": "build"
+		},
+		{
+			"label": "db: list programs",
+			"type": "shell",
+			"command": "D:/gpt/backend/.venv/Scripts/python.exe",
+			"args": [
+				"D:/gpt/backend/migrations/list_programs.py"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "Seed hard global dataset",
+			"type": "shell",
+			"command": "D:\\gpt\\backend\\.venv\\Scripts\\python.exe",
+			"args": [
+				"D:\\gpt\\backend\\migrations\\dev_seed_hard_global_test.py"
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Reseed hard global dataset",
+			"type": "shell",
+			"command": "D:\\gpt\\backend\\.venv\\Scripts\\python.exe",
+			"args": [
+				"D:\\gpt\\backend\\migrations\\dev_seed_hard_global_test.py"
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Backend (uvicorn)",
+			"type": "shell",
+			"command": "D:\\gpt\\backend\\.venv\\Scripts\\uvicorn.exe",
+			"args": [
+				"main:app",
+				"--host",
+				"0.0.0.0",
+				"--port",
+				"8000",
+				"--reload"
+			],
+			"isBackground": true,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Backend (uvicorn, backend cwd)",
+			"type": "shell",
+			"command": "D:\\gpt\\backend\\.venv\\Scripts\\python.exe",
+			"args": [
+				"-m",
+				"uvicorn",
+				"main:app",
+				"--host",
+				"0.0.0.0",
+				"--port",
+				"8000",
+				"--reload"
+			],
+			"isBackground": true,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Backend (uvicorn, explicit app path)",
+			"type": "shell",
+			"command": "D:\\gpt\\backend\\.venv\\Scripts\\python.exe",
+			"args": [
+				"-m",
+				"uvicorn",
+				"backend.main:app",
+				"--host",
+				"0.0.0.0",
+				"--port",
+				"8000",
+				"--reload"
+			],
+			"isBackground": true,
+			"problemMatcher": [],
+			"group": "build"
 		}
 	]
 }

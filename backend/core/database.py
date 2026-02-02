@@ -5,6 +5,7 @@ from typing import Iterable
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -76,9 +77,21 @@ def get_engine() -> Engine:
         # If an older config used psycopg v3, convert to psycopg2.
         url = "postgresql+psycopg2://" + url.removeprefix("postgresql+psycopg://")
 
+    connect_args: dict[str, object] = {"connect_timeout": 3}
+
+    # Supabase requires SSL. If the URL doesn't specify sslmode, force it for *.supabase.com.
+    try:
+        parsed = make_url(url)
+        host = (parsed.host or "").lower()
+        if host.endswith("supabase.com") and "sslmode" not in (parsed.query or {}):
+            connect_args["sslmode"] = "require"
+    except Exception:
+        # If URL parsing fails, fall back to the raw URL; connect_args still applies.
+        pass
+
     # pool_pre_ping helps with stale pooled connections.
     # connect_timeout keeps outages from hanging requests (used by retries and /health).
-    return create_engine(url, pool_pre_ping=True, connect_args={"connect_timeout": 3})
+    return create_engine(url, pool_pre_ping=True, connect_args=connect_args)
 
 
 ENGINE = get_engine()

@@ -1,0 +1,42 @@
+services:
+  - type: web
+    name: timetable-backend
+    runtime: python
+    rootDir: backend
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: JWT_ALGORITHM
+        value: HS256
+      - key: ACCESS_TOKEN_EXPIRE_MINUTES
+        value: "480"
+      - key: COOKIE_SAMESITE
+        value: lax
+      - key: ALLOW_SIGNUP
+        value: "false"
+      - key: SIGNUP_DEFAULT_ROLE
+        value: USER
+      # Set these in the Render dashboard as Secrets/Env Vars (don’t commit real values)
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET_KEY
+        sync: false
+      - key: FRONTEND_ORIGIN
+        sync: false
+
+  - type: static
+    name: timetable-frontend
+    rootDir: frontend
+    plan: free
+    buildCommand: npm ci && npm run build
+    staticPublishPath: dist
+    autoDeploy: true
+    envVars:
+      # Set this in Render dashboard to your backend URL, e.g. https://timetable-backend.onrender.com
+      - key: VITE_API_BASE
+        sync: false

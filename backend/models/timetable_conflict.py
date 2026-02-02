@@ -33,5 +33,9 @@ class TimetableConflict(Base):
     room_id = Column(UUID(as_uuid=True), nullable=True)
     slot_id = Column(UUID(as_uuid=True), nullable=True)
 
+    # New structured diagnostics payload (for drill-down in UI).
+    details_json = Column("details", JSONB, nullable=True)
+
+    # Legacy field kept for backwards-compatibility.
     metadata_json = Column("metadata", JSONB, nullable=False, default=dict)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())

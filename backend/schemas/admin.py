@@ -1,8 +1,40 @@
 from __future__ import annotations
 
+from datetime import datetime
 from uuid import UUID
 
 from pydantic import BaseModel, Field
+
+
+class AcademicYearOut(BaseModel):
+    id: UUID
+    year_number: int = Field(ge=1, le=4)
+    is_active: bool
+    created_at: datetime
+
+
+class EnsureAcademicYearsRequest(BaseModel):
+    year_numbers: list[int] = Field(default_factory=lambda: [1, 2, 3, 4])
+    activate: bool = True
+
+
+class MapProgramDataToYearRequest(BaseModel):
+    program_code: str = Field(min_length=1)
+    from_academic_year_number: int = Field(ge=1, le=4)
+    to_academic_year_number: int = Field(ge=1, le=4)
+    # If true, delete any existing target-year data for this program first,
+    # to avoid uniqueness conflicts when remapping.
+    replace_target: bool = False
+    dry_run: bool = False
+
+
+class MapProgramDataToYearResponse(BaseModel):
+    ok: bool = True
+    from_academic_year_number: int = Field(ge=1, le=4)
+    to_academic_year_number: int = Field(ge=1, le=4)
+    deleted: dict[str, int] = Field(default_factory=dict)
+    updated: dict[str, int] = Field(default_factory=dict)
+    message: str | None = None
 
 
 class CombinedSubjectGroupSectionOut(BaseModel):
@@ -18,7 +50,7 @@ class CombinedSubjectGroupOut(BaseModel):
     subject_code: str
     subject_name: str
     sections: list[CombinedSubjectGroupSectionOut]
-    created_at: str
+    created_at: datetime
 
 
 class CreateCombinedSubjectGroupRequest(BaseModel):
@@ -170,7 +202,7 @@ class ElectiveBlockOut(BaseModel):
     is_active: bool = True
     subjects: list[ElectiveBlockSubjectOut] = Field(default_factory=list)
     sections: list[ElectiveBlockSectionOut] = Field(default_factory=list)
-    created_at: str
+    created_at: datetime
 
 
 class CreateElectiveBlockRequest(BaseModel):

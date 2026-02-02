@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
@@ -10,13 +12,26 @@ from sqlalchemy.exc import OperationalError as SAOperationalError
 from api.router import api_router
 from core.config import settings
 from core.db import DatabaseUnavailableError, ENGINE, is_transient_db_connectivity_error
+from core.logging import setup_logging
+
+
+logger = logging.getLogger(__name__)
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="Timetable Generator API", version="0.1.0")
+    setup_logging(environment=settings.environment)
+    is_production = settings.environment.lower() == "production"
+    app = FastAPI(
+        title="Timetable Generator API",
+        version="0.1.0",
+        docs_url=None if is_production else "/docs",
+        redoc_url=None if is_production else "/redoc",
+        openapi_url=None if is_production else "/openapi.json",
+    )
 
     @app.exception_handler(DatabaseUnavailableError)
     def _db_unavailable(_request, _exc: DatabaseUnavailableError):
+        logger.warning("Database unavailable (503)", exc_info=_exc)
         return JSONResponse(
             status_code=503,
             content={
@@ -28,6 +43,7 @@ def create_app() -> FastAPI:
     @app.exception_handler(SAOperationalError)
     def _sqlalchemy_operational_error(_request, exc: SAOperationalError):
         if is_transient_db_connectivity_error(exc):
+            logger.warning("Database transient connectivity error (503)", exc_info=exc)
             return JSONResponse(
                 status_code=503,
                 content={
@@ -90,11 +106,17 @@ def create_app() -> FastAPI:
     except Exception:
         pass
 
+    allow_origins = [settings.frontend_origin]
+    allow_origin_regex = None
+    if not is_production:
+        # Dev-friendly: allow the configured origin and any localhost port.
+        allow_origins.extend(["http://localhost:5173", "http://127.0.0.1:5173"])
+        allow_origin_regex = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
+
     app.add_middleware(
         CORSMiddleware,
-        # Dev-friendly: allow the configured origin and any localhost port.
-        allow_origins=[settings.frontend_origin],
-        allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+        allow_origins=allow_origins,
+        allow_origin_regex=allow_origin_regex,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
