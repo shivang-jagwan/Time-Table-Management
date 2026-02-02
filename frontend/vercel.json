@@ -2,7 +2,7 @@
   "rewrites": [
     {
       "source": "/api/(.*)",
-      "destination": "https://time-table-management-alna.onrender.com"
+      "destination": "https://time-table-management-alna.onrender.com/api/$1"
     },
     {
       "source": "/(.*)",
