@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic.aliases import AliasChoices
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -46,6 +46,13 @@ class Settings(BaseSettings):
         default="http://localhost:5173",
         validation_alias=AliasChoices("frontend_origin", "FRONTEND_ORIGIN"),
     )
+
+    @field_validator("frontend_origin")
+    @classmethod
+    def _normalize_frontend_origin(cls, v: str) -> str:
+        # The browser Origin header never includes a trailing slash.
+        # Keeping a trailing slash in config causes CORSMiddleware to reject the origin.
+        return (v or "").strip().rstrip("/")
 
 
 settings = Settings()
