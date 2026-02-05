@@ -64,15 +64,27 @@ export function Dashboard() {
       setLoading(true)
       setError('')
       try {
-        const results = await Promise.allSettled([
-          listSections({ program_code: programCode, academic_year_number: academicYearNumber }),
-          listSubjects({ program_code: programCode, academic_year_number: academicYearNumber }),
-          listTeachers(),
-          listRooms(),
-          listTimeSlots(),
-          listElectiveBlocks({ program_code: programCode, academic_year_number: academicYearNumber }),
-          listRuns({ program_code: programCode, limit: 15 }),
-        ])
+        const pc = programCode.trim()
+
+        const results = pc
+          ? await Promise.allSettled([
+              listSections({ program_code: pc, academic_year_number: academicYearNumber }),
+              listSubjects({ program_code: pc, academic_year_number: academicYearNumber }),
+              listTeachers(),
+              listRooms(),
+              listTimeSlots(),
+              listElectiveBlocks({ program_code: pc, academic_year_number: academicYearNumber }),
+              listRuns({ program_code: pc, limit: 15 }),
+            ])
+          : await Promise.allSettled([
+              Promise.resolve([]),
+              Promise.resolve([]),
+              listTeachers(),
+              listRooms(),
+              listTimeSlots(),
+              Promise.resolve([]),
+              Promise.resolve([]),
+            ])
 
         if (cancelled) return
 
@@ -111,6 +123,16 @@ export function Dashboard() {
           const r = sorted[0] ?? null
           setLatestRun(r)
         }
+
+        if (!pc) {
+          setSectionsTotal(0)
+          setSectionsActive(0)
+          setSubjectsTotal(0)
+          setSubjectsActive(0)
+          setBlocksTotal(0)
+          setBlocksActive(0)
+          setLatestRun(null)
+        }
       } catch (e: any) {
         if (!cancelled) setError(String(e?.message ?? e))
       } finally {
@@ -146,7 +168,9 @@ export function Dashboard() {
     <div className="space-y-6">
       <div>
         <div className="text-lg font-semibold text-slate-900">Dashboard</div>
-        <div className="mt-1 text-sm text-slate-600">Program {programCode} · Year {academicYearNumber}</div>
+        <div className="mt-1 text-sm text-slate-600">
+          Program {programCode.trim() ? programCode : '—'} · Year {academicYearNumber}
+        </div>
       </div>
 
       {error ? (

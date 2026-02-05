@@ -71,13 +71,18 @@ export function GenerateTimetable() {
   const canRun = !loading && slotCount != null && !missingTimeSlots
 
   async function onValidate() {
+    const pc = programCode.trim()
+    if (!pc) {
+      showToast('Select a program first', 3000)
+      return
+    }
     setLoading(true)
     setLastValidationConflicts([])
     setLastRun(null)
     try {
       const s = seed.trim() === '' ? null : Number(seed)
       const res = await generateTimetableGlobal({
-        program_code: programCode,
+        program_code: pc,
         seed: Number.isFinite(s as any) ? s : null,
       })
       if (res.status === 'READY_FOR_SOLVE') {
@@ -94,13 +99,18 @@ export function GenerateTimetable() {
   }
 
   async function onSolve() {
+    const pc = programCode.trim()
+    if (!pc) {
+      showToast('Select a program first', 3000)
+      return
+    }
     setLoading(true)
     setLastValidationConflicts([])
     setLastRun(null)
     try {
       const s = seed.trim() === '' ? null : Number(seed)
       const res = await solveTimetableGlobal({
-        program_code: programCode,
+        program_code: pc,
         seed: Number.isFinite(s as any) ? s : null,
         max_time_seconds: Number(maxTimeSeconds),
         relax_teacher_load_limits: Boolean(relaxTeacherLoadLimits),

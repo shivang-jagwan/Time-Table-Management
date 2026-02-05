@@ -62,10 +62,19 @@ export function CombinedClasses() {
   async function refreshRulesData(nextYear = year) {
     setLoading(true)
     try {
+      const pc = programCode.trim()
+      if (!pc) {
+        setSubjects([])
+        setSections([])
+        setGroups([])
+        setSubjectCode('')
+        setSelectedSectionCodes(new Set())
+        return
+      }
       const [subjs, secs, gs] = await Promise.all([
-        listSubjects({ program_code: programCode, academic_year_number: nextYear }),
-        listSections({ program_code: programCode, academic_year_number: nextYear }),
-        listCombinedSubjectGroups({ program_code: programCode, academic_year_number: nextYear }),
+        listSubjects({ program_code: pc, academic_year_number: nextYear }),
+        listSections({ program_code: pc, academic_year_number: nextYear }),
+        listCombinedSubjectGroups({ program_code: pc, academic_year_number: nextYear }),
       ])
       setSubjects(subjs)
       setSections(secs)
@@ -93,6 +102,11 @@ export function CombinedClasses() {
   }
 
   async function saveGroup() {
+    const pc = programCode.trim()
+    if (!pc) {
+      showToast('Select a program first', 3000)
+      return
+    }
     if (!subjectCode) {
       showToast('Select a THEORY subject first')
       return
@@ -105,7 +119,7 @@ export function CombinedClasses() {
     setLoading(true)
     try {
       await createCombinedSubjectGroup({
-        program_code: programCode,
+        program_code: pc,
         academic_year_number: year,
         subject_code: subjectCode,
         section_codes,
@@ -137,7 +151,13 @@ export function CombinedClasses() {
   async function refreshRuns() {
     setLoading(true)
     try {
-      const data = await listRuns({ program_code: programCode, limit: 25 })
+      const pc = programCode.trim()
+      if (!pc) {
+        setRuns([])
+        setRunId('')
+        return
+      }
+      const data = await listRuns({ program_code: pc, limit: 25 })
       setRuns(data)
       if (!runId && data.length > 0) setRunId(data[0].id)
     } catch (e: any) {

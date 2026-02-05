@@ -91,11 +91,21 @@ export function ElectiveBlocks() {
   async function refresh(nextYear = year) {
     setLoading(true)
     try {
+      const pc = programCode.trim()
+      if (!pc) {
+        const ts = await listTeachers()
+        setBlocks([])
+        setSubjects([])
+        setSections([])
+        setTeachers(ts)
+        setSelectedBlockId('')
+        return
+      }
       const [bs, subjs, ts, secs] = await Promise.all([
-        listElectiveBlocks({ program_code: programCode, academic_year_number: nextYear }),
-        listSubjects({ program_code: programCode, academic_year_number: nextYear }),
+        listElectiveBlocks({ program_code: pc, academic_year_number: nextYear }),
+        listSubjects({ program_code: pc, academic_year_number: nextYear }),
         listTeachers(),
-        listSections({ program_code: programCode, academic_year_number: nextYear }),
+        listSections({ program_code: pc, academic_year_number: nextYear }),
       ])
       setBlocks(bs)
       setSubjects(subjs)
@@ -118,6 +128,11 @@ export function ElectiveBlocks() {
   }, [year, programCode])
 
   async function onCreateBlock() {
+    const pc = programCode.trim()
+    if (!pc) {
+      showToast('Select a program first', 3000)
+      return
+    }
     if (!newBlockName.trim()) {
       showToast('Enter block name')
       return
@@ -125,7 +140,7 @@ export function ElectiveBlocks() {
     setLoading(true)
     try {
       const created = await createElectiveBlock({
-        program_code: programCode,
+        program_code: pc,
         academic_year_number: year,
         name: newBlockName.trim(),
         code: newBlockCode.trim() || null,

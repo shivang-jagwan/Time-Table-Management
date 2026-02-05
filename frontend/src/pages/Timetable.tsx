@@ -383,10 +383,24 @@ export function Timetable() {
   async function refreshRunsAndSlots() {
     setLoading(true)
     try {
+      const pc = programCode.trim()
+      if (!pc) {
+        const s = await listTimeSlots()
+        setRuns([])
+        setSlots(s)
+        setSections([])
+        setEntries([])
+
+        const p = new URLSearchParams(params)
+        p.delete('runId')
+        p.delete('section')
+        setParams(p, { replace: true })
+        return
+      }
       const [r, s, sec] = await Promise.all([
-        listRuns({ program_code: programCode, limit: 50 }),
+        listRuns({ program_code: pc, limit: 50 }),
         listTimeSlots(),
-        listSections({ program_code: programCode, academic_year_number: academicYearNumber }),
+        listSections({ program_code: pc, academic_year_number: academicYearNumber }),
       ])
       setRuns(r)
       setSlots(s)

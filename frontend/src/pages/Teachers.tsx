@@ -138,9 +138,15 @@ export function Teachers() {
   async function refreshAssignmentData() {
     setAssignLoading(true)
     try {
+      const pc = programCode.trim()
+      if (!pc) {
+        setAssignSubjects([])
+        setAssignSections([])
+        return
+      }
       const [subjects, sections] = await Promise.all([
-        listSubjects({ program_code: programCode, academic_year_number: academicYearNumber }),
-        listSections({ program_code: programCode, academic_year_number: academicYearNumber }),
+        listSubjects({ program_code: pc, academic_year_number: academicYearNumber }),
+        listSections({ program_code: pc, academic_year_number: academicYearNumber }),
       ])
       setAssignSubjects(subjects)
       setAssignSections(sections)

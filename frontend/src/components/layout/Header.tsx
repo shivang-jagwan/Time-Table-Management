@@ -61,10 +61,20 @@ export function Header({
   const isKnownProgram = knownProgramCodes.has(programCode)
 
   React.useEffect(() => {
-    if (!hasPrograms) return
-    if (!isKnownProgram && programCode.trim() !== '') setUseCustomProgram(true)
+    const pc = programCode.trim()
+    if (!pc) return
+    if (!isKnownProgram) setUseCustomProgram(true)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasPrograms, isKnownProgram])
+  }, [isKnownProgram, programCode])
+
+  const normalizedProgramCode = programCode.trim()
+  const programSelectValue = useCustomProgram
+    ? '__custom__'
+    : isKnownProgram
+      ? normalizedProgramCode
+      : normalizedProgramCode
+        ? '__custom__'
+        : ''
 
   const controlSelect =
     'rounded-lg border border-white/30 bg-white/15 px-3 py-2 text-sm text-white shadow-sm backdrop-blur-sm transition ' +
@@ -113,46 +123,38 @@ export function Header({
         {/* Center (desktop selectors) */}
         <div className="hidden flex-1 items-center justify-center gap-3 md:flex">
           <div className="flex items-center gap-3">
-            {hasPrograms ? (
-              <div className="flex items-center gap-2">
-                <PremiumSelect
-                  ariaLabel="Program"
-                  className={[controlSelect, 'min-w-[260px]'].join(' ')}
-                  value={useCustomProgram ? '__custom__' : isKnownProgram ? programCode : '__custom__'}
-                  onValueChange={(v) => {
-                    if (v === '__custom__') {
-                      setUseCustomProgram(true)
-                      if (programCode.trim() === '') onChangeProgramCode('')
-                      return
-                    }
-                    setUseCustomProgram(false)
-                    onChangeProgramCode(v)
-                  }}
-                  options={[
-                    ...programs.map((p) => ({ value: p.code, label: `${p.code} — ${p.name}` })),
-                    { value: '__custom__', label: 'Custom…' },
-                  ]}
-                />
-
-                {useCustomProgram ? (
-                  <input
-                    className={[controlInput, 'w-28'].join(' ')}
-                    value={programCode}
-                    onChange={(e) => onChangeProgramCode(e.target.value)}
-                    placeholder="Code"
-                    aria-label="Custom program code"
-                  />
-                ) : null}
-              </div>
-            ) : (
-              <input
-                className={[controlInput, 'w-28'].join(' ')}
-                value={programCode}
-                onChange={(e) => onChangeProgramCode(e.target.value)}
-                placeholder="CSE"
-                aria-label="Program"
+            <div className="flex items-center gap-2">
+              <PremiumSelect
+                ariaLabel="Program"
+                className={[controlSelect, 'min-w-[260px]'].join(' ')}
+                value={programSelectValue}
+                placeholder={hasPrograms ? 'Select program…' : 'No programs yet'}
+                options={[
+                  ...(hasPrograms
+                    ? programs.map((p) => ({ value: p.code, label: `${p.code} — ${p.name}` }))
+                    : [{ value: '__none__', label: 'No programs found', disabled: true }]),
+                  { value: '__custom__', label: 'Custom…' },
+                ]}
+                onValueChange={(v) => {
+                  if (v === '__custom__') {
+                    setUseCustomProgram(true)
+                    return
+                  }
+                  setUseCustomProgram(false)
+                  onChangeProgramCode(v)
+                }}
               />
-            )}
+
+              {useCustomProgram ? (
+                <input
+                  className={[controlInput, 'w-28'].join(' ')}
+                  value={programCode}
+                  onChange={(e) => onChangeProgramCode(e.target.value)}
+                  placeholder="Code"
+                  aria-label="Custom program code"
+                />
+              ) : null}
+            </div>
 
             <PremiumSelect
               ariaLabel="Academic year"

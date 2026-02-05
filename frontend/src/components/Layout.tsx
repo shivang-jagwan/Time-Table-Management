@@ -24,8 +24,8 @@ export function Layout() {
   const { logout } = useAuth()
   const [collapsed, setCollapsed] = React.useState(false)
   const [mobileSidebarOpen, setMobileSidebarOpen] = React.useState(false)
-  const [programCode, setProgramCode] = React.useState('CSE')
-  const [academicYearNumber, setAcademicYearNumber] = React.useState(3)
+  const [programCode, setProgramCode] = React.useState('')
+  const [academicYearNumber, setAcademicYearNumber] = React.useState(1)
 
   async function onLogout() {
     await logout()

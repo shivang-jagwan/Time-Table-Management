@@ -95,7 +95,12 @@ export function Subjects() {
   async function refresh() {
     setLoading(true)
     try {
-      const data = await listSubjects({ program_code: programCode, academic_year_number: academicYearNumber })
+      const pc = programCode.trim()
+      if (!pc) {
+        setItems([])
+        return
+      }
+      const data = await listSubjects({ program_code: pc, academic_year_number: academicYearNumber })
       setItems(data)
     } catch (e: any) {
       showToast(`Load failed: ${String(e?.message ?? e)}`, 3500)
@@ -110,6 +115,11 @@ export function Subjects() {
   }, [programCode, academicYearNumber])
 
   async function onCreate() {
+    const pc = programCode.trim()
+    if (!pc) {
+      showToast('Select a program first', 3000)
+      return
+    }
     const next = {
       subject_type: form.subject_type,
       sessions_per_week: Number(form.sessions_per_week),
@@ -126,7 +136,7 @@ export function Subjects() {
     setLoading(true)
     try {
       await createSubject({
-        program_code: programCode,
+        program_code: pc,
         academic_year_number: academicYearNumber,
         code: form.code.trim(),
         name: form.name.trim(),

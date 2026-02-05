@@ -332,7 +332,17 @@ export function Conflicts() {
   async function refreshRuns() {
     setLoading(true)
     try {
-      const data = await listRuns({ program_code: programCode, limit: 50 })
+      const pc = programCode.trim()
+      if (!pc) {
+        setRuns([])
+        setSelectedRunId('')
+        setDetail(null)
+        setConflicts([])
+        setEntries([])
+        setSectionFilter('')
+        return
+      }
+      const data = await listRuns({ program_code: pc, limit: 50 })
       setRuns(data)
       const requested = params.get('runId')
       if (requested) {

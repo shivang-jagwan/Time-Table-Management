@@ -61,8 +61,9 @@ export function Sections() {
   async function refresh() {
     setLoading(true)
     try {
+      const pc = programCode.trim()
       const [data, slotResp] = await Promise.all([
-        listSections({ program_code: programCode, academic_year_number: academicYearNumber }),
+        pc ? listSections({ program_code: pc, academic_year_number: academicYearNumber }) : Promise.resolve([]),
         listTimeSlots(),
       ])
       setItems(data)
@@ -124,10 +125,15 @@ export function Sections() {
   }, [programCode, academicYearNumber])
 
   async function onCreate() {
+    const pc = programCode.trim()
+    if (!pc) {
+      showToast('Select a program first', 3000)
+      return
+    }
     setLoading(true)
     try {
       await createSection({
-        program_code: programCode,
+        program_code: pc,
         academic_year_number: academicYearNumber,
         code: form.code.trim(),
         name: form.name.trim(),

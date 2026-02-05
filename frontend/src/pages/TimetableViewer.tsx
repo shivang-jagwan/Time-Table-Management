@@ -67,8 +67,8 @@ function groupForCell(entries: TimetableEntry[]) {
 
 export function TimetableViewer({ onToast }: { onToast: (msg: string) => void }) {
   const [loading, setLoading] = React.useState(false)
-  const [programCode, setProgramCode] = React.useState('CSE')
-  const [academicYearNumber, setAcademicYearNumber] = React.useState(3)
+  const [programCode, setProgramCode] = React.useState('')
+  const [academicYearNumber, setAcademicYearNumber] = React.useState(1)
   const [runScopeFilter, setRunScopeFilter] = React.useState<'ALL' | 'PROGRAM_GLOBAL' | 'YEAR_ONLY'>(
     'PROGRAM_GLOBAL',
   )

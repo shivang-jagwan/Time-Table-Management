@@ -36,41 +36,73 @@ ADMINS: list[tuple[str, str]] = [
 ]
 
 
-def _ensure_users_schema(conn) -> None:
-        # Keep this idempotent: safe across reruns.
-        statements = [
-                "CREATE EXTENSION IF NOT EXISTS pgcrypto;",
-                """
-                CREATE TABLE IF NOT EXISTS users (
-                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                        username VARCHAR(100) UNIQUE NOT NULL,
-                        password_hash TEXT NOT NULL,
-                        role VARCHAR(20) DEFAULT 'ADMIN',
-                        is_active BOOLEAN DEFAULT TRUE,
-                        created_at TIMESTAMP DEFAULT now()
-                );
-                """,
-                # Legacy compatibility: older DBs may have public.users with missing columns.
-                "ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR(100);",
-                "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;",
-                "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;",
-                # Backfill username from legacy `name` if present.
-                """
-                DO $$
-                BEGIN
-                    IF EXISTS (
-                        SELECT 1 FROM information_schema.columns
-                        WHERE table_schema='public' AND table_name='users' AND column_name='name'
-                    ) THEN
-                        EXECUTE 'UPDATE users SET username = COALESCE(username, name::text) WHERE username IS NULL';
-                    END IF;
-                END $$;
-                """,
-                "CREATE UNIQUE INDEX IF NOT EXISTS ux_users_username ON users (username);",
-        ]
+DEFAULT_TENANT_SLUG = "default"
 
-        for s in statements:
-                conn.execute(text(s))
+
+def _ensure_users_schema(conn) -> None:
+    # Keep this idempotent: safe across reruns.
+    # This script is tenant-aware and compatible with strict per-tenant mode.
+    statements = [
+        "CREATE EXTENSION IF NOT EXISTS pgcrypto;",
+        """
+        CREATE TABLE IF NOT EXISTS tenants (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                slug TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT now()
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS users (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                tenant_id UUID NOT NULL,
+                username VARCHAR(100) NOT NULL,
+                password_hash TEXT NOT NULL,
+                role VARCHAR(20) DEFAULT 'ADMIN',
+                is_active BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT now()
+        );
+        """,
+        # Legacy compatibility: older DBs may have public.users with missing columns.
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS tenant_id UUID;",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR(100);",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;",
+        # Backfill username from legacy `name` if present.
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='users' AND column_name='name'
+            ) THEN
+                EXECUTE 'UPDATE users SET username = COALESCE(username, name::text) WHERE username IS NULL';
+            END IF;
+        END $$;
+        """,
+        # Per-tenant case-insensitive uniqueness (no citext dependency).
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_users_tenant_username_ci ON users (tenant_id, lower(username));",
+    ]
+
+    for s in statements:
+        conn.execute(text(s))
+
+
+def _ensure_default_tenant(conn) -> str:
+    row = conn.execute(
+        text("select id from tenants where lower(slug) = lower(:s) limit 1"),
+        {"s": DEFAULT_TENANT_SLUG},
+    ).first()
+    if row is not None:
+        return str(row[0])
+
+    row2 = conn.execute(
+        text("insert into tenants (slug, name) values (:slug, :name) returning id"),
+        {"slug": DEFAULT_TENANT_SLUG, "name": "Default College"},
+    ).first()
+    if row2 is None:
+        raise SystemExit("Failed to create default tenant")
+    return str(row2[0])
 
 
 def _has_name_column(conn) -> bool:
@@ -91,10 +123,10 @@ def _has_name_column(conn) -> bool:
     )
 
 
-def _user_exists_case_insensitive(conn, username: str) -> bool:
+def _user_exists_case_insensitive(conn, *, tenant_id: str, username: str) -> bool:
     row = conn.execute(
-        text("select 1 from users where lower(username) = lower(:u) limit 1"),
-        {"u": username},
+        text("select 1 from users where tenant_id = :t and lower(username) = lower(:u) limit 1"),
+        {"t": tenant_id, "u": username},
     ).first()
     return row is not None
 
@@ -112,10 +144,11 @@ def main() -> None:
 
     with ENGINE.begin() as conn:
         _ensure_users_schema(conn)
+        tenant_id = _ensure_default_tenant(conn)
         has_name = _has_name_column(conn)
 
         for username, password in ADMINS:
-            if _user_exists_case_insensitive(conn, username):
+            if _user_exists_case_insensitive(conn, tenant_id=tenant_id, username=username):
                 continue
 
             password_hash = hash_password(password)
@@ -124,12 +157,13 @@ def main() -> None:
                 conn.execute(
                     text(
                         """
-                        insert into users (name, username, password_hash, role, is_active)
-                        values (:name, :username, :password_hash, 'ADMIN', true)
-                        on conflict (username) do nothing
+                        insert into users (tenant_id, name, username, password_hash, role, is_active)
+                        values (:tenant_id, :name, :username, :password_hash, 'ADMIN', true)
+                        on conflict do nothing
                         """.strip()
                     ),
                     {
+                        "tenant_id": tenant_id,
                         "name": username,
                         "username": username,
                         "password_hash": password_hash,
@@ -139,12 +173,13 @@ def main() -> None:
                 conn.execute(
                     text(
                         """
-                        insert into users (username, password_hash, role, is_active)
-                        values (:username, :password_hash, 'ADMIN', true)
-                        on conflict (username) do nothing
+                        insert into users (tenant_id, username, password_hash, role, is_active)
+                        values (:tenant_id, :username, :password_hash, 'ADMIN', true)
+                        on conflict do nothing
                         """.strip()
                     ),
                     {
+                        "tenant_id": tenant_id,
                         "username": username,
                         "password_hash": password_hash,
                     },

@@ -39,11 +39,20 @@ export function Electives() {
   async function refresh() {
     setLoading(true)
     try {
+      const pc = programCode.trim()
+      if (!pc) {
+        setOptions([])
+        setAssignments([])
+        setSectionCodes([])
+        setSelectionBySection({})
+        setBulkSubjectCode('')
+        return
+      }
       const [sections, subjects, trackRows, current] = await Promise.all([
-        listSections({ program_code: programCode, academic_year_number: academicYearNumber }),
-        listSubjects({ program_code: programCode, academic_year_number: academicYearNumber }),
-        listTrackSubjects({ program_code: programCode, academic_year_number: academicYearNumber }),
-        listSectionElectives({ program_code: programCode, academic_year_number: academicYearNumber }),
+        listSections({ program_code: pc, academic_year_number: academicYearNumber }),
+        listSubjects({ program_code: pc, academic_year_number: academicYearNumber }),
+        listTrackSubjects({ program_code: pc, academic_year_number: academicYearNumber }),
+        listSectionElectives({ program_code: pc, academic_year_number: academicYearNumber }),
       ])
 
       const subjectById = new Map(subjects.map((s) => [s.id, s] as const))
@@ -101,7 +110,12 @@ export function Electives() {
 
   async function onSaveSection(section_code: string, subject_code: string) {
     try {
-      await setSectionElective({ program_code: programCode, academic_year_number: academicYearNumber, section_code, subject_code })
+      const pc = programCode.trim()
+      if (!pc) {
+        showToast('Select a program first', 3000)
+        return
+      }
+      await setSectionElective({ program_code: pc, academic_year_number: academicYearNumber, section_code, subject_code })
       showToast(`Saved elective for ${section_code}`)
       await refresh()
     } catch (e: any) {
@@ -110,6 +124,11 @@ export function Electives() {
   }
 
   async function onBulkSet() {
+    const pc = programCode.trim()
+    if (!pc) {
+      showToast('Select a program first', 3000)
+      return
+    }
     if (!bulkSubjectCode) {
       showToast('Choose an elective subject first')
       return
@@ -117,7 +136,7 @@ export function Electives() {
     if (!confirm(`Set ${bulkSubjectCode} as elective for all CORE sections?`)) return
     try {
       await bulkSetCoreElective({
-        program_code: programCode,
+        program_code: pc,
         academic_year_number: academicYearNumber,
         subject_code: bulkSubjectCode,
         replace_existing: bulkReplace,

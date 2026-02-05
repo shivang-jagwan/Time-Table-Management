@@ -35,9 +35,15 @@ export function Curriculum() {
   async function refresh() {
     setLoading(true)
     try {
+      const pc = programCode.trim()
+      if (!pc) {
+        setSubjects([])
+        setRows([])
+        return
+      }
       const [subs, ts] = await Promise.all([
-        listSubjects({ program_code: programCode, academic_year_number: academicYearNumber }),
-        listTrackSubjects({ program_code: programCode, academic_year_number: academicYearNumber }),
+        listSubjects({ program_code: pc, academic_year_number: academicYearNumber }),
+        listTrackSubjects({ program_code: pc, academic_year_number: academicYearNumber }),
       ])
       setSubjects(subs)
       setRows(ts)
@@ -57,10 +63,15 @@ export function Curriculum() {
   }, [programCode, academicYearNumber])
 
   async function onAdd() {
+    const pc = programCode.trim()
+    if (!pc) {
+      showToast('Select a program first', 3000)
+      return
+    }
     setLoading(true)
     try {
       await createTrackSubject({
-        program_code: programCode,
+        program_code: pc,
         academic_year_number: academicYearNumber,
         track: form.track,
         subject_code: form.subject_code,
