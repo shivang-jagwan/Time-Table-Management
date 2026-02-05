@@ -40,8 +40,17 @@ def create_program(
     db.add(program)
     try:
         db.commit()
-    except IntegrityError:
+    except IntegrityError as exc:
         db.rollback()
+
+        # If DB is in strict per-tenant mode (tenant_id NOT NULL) but the app is running
+        # without a resolved tenant context, Postgres raises NOT NULL violation (23502).
+        # Returning a duplicate-code error here is misleading.
+        pgcode = getattr(getattr(exc, "orig", None), "pgcode", None)
+        msg = str(getattr(exc, "orig", exc) or "")
+        if pgcode == "23502" or "null value in column \"tenant_id\"" in msg.lower():
+            raise HTTPException(status_code=500, detail="TENANT_CONTEXT_MISSING")
+
         raise HTTPException(status_code=409, detail="PROGRAM_CODE_ALREADY_EXISTS")
     db.refresh(program)
     return program

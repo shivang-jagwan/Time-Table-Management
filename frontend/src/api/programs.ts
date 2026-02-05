@@ -1,8 +1,10 @@
 import { apiFetch } from './client'
 
 export type Program = {
+  id: string
   code: string
   name: string
+  created_at?: string
 }
 
 export type ProgramCreate = {
@@ -21,8 +23,8 @@ export async function createProgram(payload: ProgramCreate): Promise<Program> {
   })
 }
 
-export async function deleteProgram(code: string): Promise<{ ok: true }> {
-  return apiFetch<{ ok: true }>(`/api/programs/${encodeURIComponent(code)}`,
-    { method: 'DELETE' },
-  )
+export async function deleteProgram(programId: string): Promise<{ ok: true }> {
+  return apiFetch<{ ok: true }>(`/api/programs/${encodeURIComponent(programId)}`, {
+    method: 'DELETE',
+  })
 }

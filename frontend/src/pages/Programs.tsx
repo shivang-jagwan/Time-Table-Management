@@ -92,7 +92,7 @@ export function Programs() {
   async function onDelete(p: Program) {
     if (!confirm(`Delete program ${p.code}?`)) return
     try {
-      await deleteProgram(p.code)
+      await deleteProgram(p.id)
       showToast('Program deleted')
       await refresh()
     } catch (e: any) {
