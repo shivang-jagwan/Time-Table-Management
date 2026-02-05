@@ -7,6 +7,7 @@ from typing import Any, Iterable
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from api.tenant import where_tenant
 from models.combined_subject_group import CombinedSubjectGroup
 from models.combined_subject_section import CombinedSubjectSection
 from models.elective_block import ElectiveBlock
@@ -42,10 +43,12 @@ class ValidationConflict:
 
 
 def persist_conflicts(db: Session, *, run: TimetableRun, conflicts: Iterable[ValidationConflict]) -> None:
+    tenant_id = getattr(run, "tenant_id", None)
     for c in conflicts:
         payload = c.metadata or {}
         db.add(
             TimetableConflict(
+                tenant_id=tenant_id,
                 run_id=run.id,
                 severity=c.severity,
                 conflict_type=c.conflict_type,
@@ -70,6 +73,7 @@ def validate_prereqs(
     sections: list,
 ) -> list[ValidationConflict]:
     conflicts: list[ValidationConflict] = []
+    tenant_id = getattr(run, "tenant_id", None)
 
     # Global validation:
     # - If academic_year_id is provided: solve is scoped to one academic year.
@@ -81,13 +85,15 @@ def validate_prereqs(
     section_ids = [s.id for s in sections]
     mapped_subject_ids_by_section = defaultdict(list)
     if section_ids:
-        for sec_id, subj_id in db.execute(
-            select(SectionSubject.section_id, SectionSubject.subject_id).where(SectionSubject.section_id.in_(section_ids))
-        ).all():
+        q_sec_subj = select(SectionSubject.section_id, SectionSubject.subject_id).where(
+            SectionSubject.section_id.in_(section_ids)
+        )
+        q_sec_subj = where_tenant(q_sec_subj, SectionSubject, tenant_id)
+        for sec_id, subj_id in db.execute(q_sec_subj).all():
             mapped_subject_ids_by_section[sec_id].append(subj_id)
 
     # Time slots are required.
-    if db.execute(select(TimeSlot.id).limit(1)).first() is None:
+    if db.execute(where_tenant(select(TimeSlot.id).limit(1), TimeSlot, tenant_id)).first() is None:
         conflicts.append(
             ValidationConflict(
                 conflict_type="MISSING_TIME_SLOTS",
@@ -97,21 +103,23 @@ def validate_prereqs(
 
     # Section time windows must exist for all active days and use valid slot indices.
     # Active days = days that have at least one time slot.
-    slot_rows = db.execute(select(TimeSlot.day_of_week, TimeSlot.slot_index, TimeSlot.id)).all()
+    slot_rows = db.execute(
+        where_tenant(select(TimeSlot.day_of_week, TimeSlot.slot_index, TimeSlot.id), TimeSlot, tenant_id)
+    ).all()
     active_days: list[int] = sorted({int(d) for d, _i, _id in slot_rows})
     slot_indices_by_day: dict[int, set[int]] = defaultdict(set)
     slot_id_to_day_index: dict[Any, tuple[int, int]] = {}
+    slot_id_by_day_index: dict[tuple[int, int], Any] = {}
     for d, i, sid in slot_rows:
         slot_indices_by_day[int(d)].add(int(i))
         slot_id_to_day_index[sid] = (int(d), int(i))
+        slot_id_by_day_index[(int(d), int(i))] = sid
 
     windows = []
     if section_ids:
-        windows = (
-            db.execute(select(SectionTimeWindow).where(SectionTimeWindow.section_id.in_(section_ids)))
-            .scalars()
-            .all()
-        )
+        q_windows = select(SectionTimeWindow).where(SectionTimeWindow.section_id.in_(section_ids))
+        q_windows = where_tenant(q_windows, SectionTimeWindow, tenant_id)
+        windows = db.execute(q_windows).scalars().all()
     windows_by_section_day: dict[tuple[Any, int], SectionTimeWindow] = {}
     duplicate_window_days: set[tuple[Any, int]] = set()
     for w in windows:
@@ -185,17 +193,15 @@ def validate_prereqs(
                 )
 
     # Break compatibility: any breaks defined for this run must fall inside the section window.
-    if section_ids and active_days:
-        breaks = (
-            db.execute(
-                select(SectionBreak)
-                .where(SectionBreak.run_id == run.id)
-                .where(SectionBreak.section_id.in_(section_ids))
-            )
-            .scalars()
-            .all()
-        )
+    # Also used later to ensure fixed/special locks do not overlap breaks.
+    break_slot_ids_by_section: dict[Any, set[Any]] = defaultdict(set)
+    if section_ids:
+        q_breaks = select(SectionBreak).where(SectionBreak.run_id == run.id).where(SectionBreak.section_id.in_(section_ids))
+        q_breaks = where_tenant(q_breaks, SectionBreak, tenant_id)
+        breaks = db.execute(q_breaks).scalars().all()
         for b in breaks:
+            break_slot_ids_by_section[b.section_id].add(b.slot_id)
+
             day_idx = slot_id_to_day_index.get(b.slot_id)
             if day_idx is None:
                 conflicts.append(
@@ -237,7 +243,8 @@ def validate_prereqs(
                 )
 
     # Rooms are required.
-    if db.execute(select(Room.id).limit(1)).first() is None:
+    q_room_any = where_tenant(select(Room.id).limit(1), Room, tenant_id)
+    if db.execute(q_room_any).first() is None:
         conflicts.append(
             ValidationConflict(
                 conflict_type="MISSING_ROOMS",
@@ -247,7 +254,13 @@ def validate_prereqs(
 
     # Non-special rooms are required for auto-assigned room solving.
     if (
-        db.execute(select(Room.id).where(Room.is_active.is_(True)).where(Room.is_special.is_(False)).limit(1)).first()
+        db.execute(
+            where_tenant(
+                select(Room.id).where(Room.is_active.is_(True)).where(Room.is_special.is_(False)).limit(1),
+                Room,
+                tenant_id,
+            )
+        ).first()
         is None
     ):
         conflicts.append(
@@ -267,11 +280,15 @@ def validate_prereqs(
         effective_year_id = academic_year_id if academic_year_id is not None else section.academic_year_id
         has_any_track = (
             db.execute(
-                select(TrackSubject.id)
-                .where(TrackSubject.program_id == program_id)
-                .where(TrackSubject.academic_year_id == effective_year_id)
-                .where(TrackSubject.track == section.track)
-                .limit(1)
+                where_tenant(
+                    select(TrackSubject.id)
+                    .where(TrackSubject.program_id == program_id)
+                    .where(TrackSubject.academic_year_id == effective_year_id)
+                    .where(TrackSubject.track == section.track)
+                    .limit(1),
+                    TrackSubject,
+                    tenant_id,
+                )
             ).first()
             is not None
         )
@@ -294,17 +311,27 @@ def validate_prereqs(
         effective_year_id = academic_year_id if academic_year_id is not None else section.academic_year_id
         elective_subject_ids = (
             db.execute(
-                select(TrackSubject.subject_id)
-                .where(TrackSubject.program_id == program_id)
-                .where(TrackSubject.academic_year_id == effective_year_id)
-                .where(TrackSubject.track == section.track)
-                .where(TrackSubject.is_elective.is_(True))
+                where_tenant(
+                    select(TrackSubject.subject_id)
+                    .where(TrackSubject.program_id == program_id)
+                    .where(TrackSubject.academic_year_id == effective_year_id)
+                    .where(TrackSubject.track == section.track)
+                    .where(TrackSubject.is_elective.is_(True)),
+                    TrackSubject,
+                    tenant_id,
+                )
             )
             .scalars()
             .all()
         )
         selection = (
-            db.execute(select(SectionElective).where(SectionElective.section_id == section.id))
+            db.execute(
+                where_tenant(
+                    select(SectionElective).where(SectionElective.section_id == section.id),
+                    SectionElective,
+                    tenant_id,
+                )
+            )
             .scalars()
             .first()
         )
@@ -359,8 +386,12 @@ def validate_prereqs(
         # Elective blocks mapped to sections in this solve.
         section_blocks_rows = (
             db.execute(
-                select(SectionElectiveBlock.section_id, SectionElectiveBlock.block_id)
-                .where(SectionElectiveBlock.section_id.in_(section_ids))
+                where_tenant(
+                    select(SectionElectiveBlock.section_id, SectionElectiveBlock.block_id)
+                    .where(SectionElectiveBlock.section_id.in_(section_ids)),
+                    SectionElectiveBlock,
+                    tenant_id,
+                )
             )
             .all()
         )
@@ -372,22 +403,25 @@ def validate_prereqs(
         blocks_by_id: dict[Any, ElectiveBlock] = {}
         if block_ids:
             block_rows = (
-                db.execute(select(ElectiveBlock).where(ElectiveBlock.id.in_(block_ids))).scalars().all()
+                db.execute(where_tenant(select(ElectiveBlock).where(ElectiveBlock.id.in_(block_ids)), ElectiveBlock, tenant_id))
+                .scalars()
+                .all()
             )
             blocks_by_id = {b.id: b for b in block_rows}
 
         block_subject_rows = []
         if block_ids:
-            block_subject_rows = (
-                db.execute(
+            block_subject_rows = db.execute(
+                where_tenant(
                     select(
                         ElectiveBlockSubject.block_id,
                         ElectiveBlockSubject.subject_id,
                         ElectiveBlockSubject.teacher_id,
-                    ).where(ElectiveBlockSubject.block_id.in_(block_ids))
+                    ).where(ElectiveBlockSubject.block_id.in_(block_ids)),
+                    ElectiveBlockSubject,
+                    tenant_id,
                 )
-                .all()
-            )
+            ).all()
         block_subjects_by_block: dict[Any, list[tuple[Any, Any]]] = defaultdict(list)  # block_id -> [(subject_id, teacher_id)]
         for bid, subj_id, teacher_id in block_subject_rows:
             block_subjects_by_block[bid].append((subj_id, teacher_id))
@@ -397,7 +431,7 @@ def validate_prereqs(
 
         # Track rows by (academic_year_id, track)
         track_rows_all = (
-            db.execute(select(TrackSubject).where(TrackSubject.program_id == program_id))
+            db.execute(where_tenant(select(TrackSubject).where(TrackSubject.program_id == program_id), TrackSubject, tenant_id))
             .scalars()
             .all()
         )
@@ -407,7 +441,13 @@ def validate_prereqs(
 
         elective_by_section = {}
         elective_rows = (
-            db.execute(select(SectionElective).where(SectionElective.section_id.in_(section_ids)))
+            db.execute(
+                where_tenant(
+                    select(SectionElective).where(SectionElective.section_id.in_(section_ids)),
+                    SectionElective,
+                    tenant_id,
+                )
+            )
             .scalars()
             .all()
         )
@@ -440,9 +480,13 @@ def validate_prereqs(
         # Load active assignments for the sections in this solve.
         assignment_rows = (
             db.execute(
-                select(TeacherSubjectSection.section_id, TeacherSubjectSection.subject_id, TeacherSubjectSection.teacher_id)
-                .where(TeacherSubjectSection.section_id.in_(section_ids))
-                .where(TeacherSubjectSection.is_active.is_(True))
+                where_tenant(
+                    select(TeacherSubjectSection.section_id, TeacherSubjectSection.subject_id, TeacherSubjectSection.teacher_id)
+                    .where(TeacherSubjectSection.section_id.in_(section_ids))
+                    .where(TeacherSubjectSection.is_active.is_(True)),
+                    TeacherSubjectSection,
+                    tenant_id,
+                )
             )
             .all()
         )
@@ -461,7 +505,9 @@ def validate_prereqs(
             subj_rows = []
             if all_block_subject_ids:
                 subj_rows = (
-                    db.execute(select(Subject).where(Subject.id.in_(all_block_subject_ids))).scalars().all()
+                    db.execute(where_tenant(select(Subject).where(Subject.id.in_(all_block_subject_ids)), Subject, tenant_id))
+                    .scalars()
+                    .all()
                 )
             subj_by_id = {s.id: s for s in subj_rows}
 
@@ -627,10 +673,10 @@ def validate_prereqs(
         teacher_ids_all = sorted({tid for teachers in teachers_by_section_subject.values() for tid in teachers})
         if subj_ids_all and teacher_ids_all:
             subject_rows = (
-                db.execute(select(Subject).where(Subject.id.in_(subj_ids_all))).scalars().all()
+                db.execute(where_tenant(select(Subject).where(Subject.id.in_(subj_ids_all)), Subject, tenant_id)).scalars().all()
             )
             teacher_rows = (
-                db.execute(select(Teacher).where(Teacher.id.in_(teacher_ids_all))).scalars().all()
+                db.execute(where_tenant(select(Teacher).where(Teacher.id.in_(teacher_ids_all)), Teacher, tenant_id)).scalars().all()
             )
             subj_by_id = {s.id: s for s in subject_rows}
             teacher_by_id = {t.id: t for t in teacher_rows}
@@ -682,12 +728,23 @@ def validate_prereqs(
 
     # Fixed timetable entries (hard locks) validation.
     if section_ids:
+        # Track locked occupied slot indices per (section, day) for the new
+        # "max 3 empty slots between classes" hard constraint.
+        # We only use this for a safe infeasibility pre-check: when two locked
+        # events are far apart AND there is literally no allowed slot between
+        # them (window/breaks), the gap is unavoidable.
+        locked_indices_by_section_day: dict[tuple[Any, int], set[int]] = defaultdict(set)
+
         fixed_section_slot_pairs: set[tuple[Any, Any]] = set()
         fixed_rows: list[FixedTimetableEntry] = (
             db.execute(
-                select(FixedTimetableEntry)
-                .where(FixedTimetableEntry.section_id.in_(section_ids))
-                .where(FixedTimetableEntry.is_active.is_(True))
+                where_tenant(
+                    select(FixedTimetableEntry)
+                    .where(FixedTimetableEntry.section_id.in_(section_ids))
+                    .where(FixedTimetableEntry.is_active.is_(True)),
+                    FixedTimetableEntry,
+                    tenant_id,
+                )
             )
             .scalars()
             .all()
@@ -702,18 +759,18 @@ def validate_prereqs(
             fixed_room_ids = {r.room_id for r in fixed_rows}
 
             fixed_subjects = (
-                db.execute(select(Subject).where(Subject.id.in_(list(fixed_subject_ids))))
+                db.execute(where_tenant(select(Subject).where(Subject.id.in_(list(fixed_subject_ids))), Subject, tenant_id))
                 .scalars()
                 .all()
             )
             fixed_teachers = (
-                db.execute(select(Teacher).where(Teacher.id.in_(list(fixed_teacher_ids))))
+                db.execute(where_tenant(select(Teacher).where(Teacher.id.in_(list(fixed_teacher_ids))), Teacher, tenant_id))
                 .scalars()
                 .all()
             )
 
             fixed_rooms = (
-                db.execute(select(Room).where(Room.id.in_(list(fixed_room_ids))))
+                db.execute(where_tenant(select(Room).where(Room.id.in_(list(fixed_room_ids))), Room, tenant_id))
                 .scalars()
                 .all()
             )
@@ -726,7 +783,7 @@ def validate_prereqs(
             allowed_subject_ids_by_section: dict[Any, set[Any]] = {}
             # Track rows by (academic_year_id, track)
             track_rows_all = (
-                db.execute(select(TrackSubject).where(TrackSubject.program_id == program_id))
+                db.execute(where_tenant(select(TrackSubject).where(TrackSubject.program_id == program_id), TrackSubject, tenant_id))
                 .scalars()
                 .all()
             )
@@ -736,7 +793,13 @@ def validate_prereqs(
 
             elective_by_section = {}
             elective_rows = (
-                db.execute(select(SectionElective).where(SectionElective.section_id.in_(section_ids)))
+                db.execute(
+                    where_tenant(
+                        select(SectionElective).where(SectionElective.section_id.in_(section_ids)),
+                        SectionElective,
+                        tenant_id,
+                    )
+                )
                 .scalars()
                 .all()
             )
@@ -763,13 +826,17 @@ def validate_prereqs(
             # Assignment lookup for fixed entries: (section, subject) -> teacher_id
             assign_rows = (
                 db.execute(
-                    select(
-                        TeacherSubjectSection.section_id,
-                        TeacherSubjectSection.subject_id,
-                        TeacherSubjectSection.teacher_id,
+                    where_tenant(
+                        select(
+                            TeacherSubjectSection.section_id,
+                            TeacherSubjectSection.subject_id,
+                            TeacherSubjectSection.teacher_id,
+                        )
+                        .where(TeacherSubjectSection.section_id.in_(section_ids))
+                        .where(TeacherSubjectSection.is_active.is_(True)),
+                        TeacherSubjectSection,
+                        tenant_id,
                     )
-                    .where(TeacherSubjectSection.section_id.in_(section_ids))
-                    .where(TeacherSubjectSection.is_active.is_(True))
                 )
                 .all()
             )
@@ -793,6 +860,20 @@ def validate_prereqs(
             fixed_teacher_slot_seen: dict[tuple[Any, Any], Any] = {}  # (teacher_id, slot_id) -> section_id
 
             for fe in fixed_rows:
+                # Fixed entry must not overlap section breaks.
+                if fe.slot_id in break_slot_ids_by_section.get(fe.section_id, set()):
+                    conflicts.append(
+                        ValidationConflict(
+                            conflict_type="FIXED_ON_SECTION_BREAK",
+                            message="Fixed entry overlaps a section break; remove the break or move the fixed entry.",
+                            section_id=fe.section_id,
+                            teacher_id=fe.teacher_id,
+                            subject_id=fe.subject_id,
+                            room_id=fe.room_id,
+                            slot_id=fe.slot_id,
+                        )
+                    )
+
                 subj = fixed_subject_by_id.get(fe.subject_id)
                 teacher = fixed_teacher_by_id.get(fe.teacher_id)
                 room = fixed_room_by_id.get(fe.room_id)
@@ -863,6 +944,9 @@ def validate_prereqs(
                     continue
 
                 d, si = day_idx
+
+                # Mark locked occupancy for gap feasibility checks.
+                locked_indices_by_section_day[(fe.section_id, int(d))].add(int(si))
                 w = windows_by_section_day.get((fe.section_id, int(d)))
                 if w is None or si < int(w.start_slot_index) or si > int(w.end_slot_index):
                     conflicts.append(
@@ -955,6 +1039,10 @@ def validate_prereqs(
                     block = int(getattr(subj, "lab_block_size_slots", 1) or 1)
                     if block < 1:
                         block = 1
+                    # Mark the entire LAB block as occupied.
+                    for j in range(block):
+                        if (int(d), int(si) + int(j)) in slot_id_by_day_index:
+                            locked_indices_by_section_day[(fe.section_id, int(d))].add(int(si) + int(j))
                     end_idx = int(si) + block - 1
                     if w is None or end_idx > int(w.end_slot_index):
                         conflicts.append(
@@ -985,6 +1073,22 @@ def validate_prereqs(
                                 )
                                 break
 
+                            # LAB block must not overlap breaks.
+                            covered_slot_id = slot_id_by_day_index.get((int(d), int(si) + int(j)))
+                            if covered_slot_id is not None and covered_slot_id in break_slot_ids_by_section.get(fe.section_id, set()):
+                                conflicts.append(
+                                    ValidationConflict(
+                                        conflict_type="FIXED_LAB_OVERLAPS_BREAK",
+                                        message="Fixed lab block overlaps a section break; move the fixed lab or adjust breaks.",
+                                        section_id=fe.section_id,
+                                        teacher_id=fe.teacher_id,
+                                        subject_id=fe.subject_id,
+                                        slot_id=fe.slot_id,
+                                        metadata={"break_slot_id": str(covered_slot_id), "day_of_week": int(d), "slot_index": int(si) + int(j)},
+                                    )
+                                )
+                                break
+
                 # Fixed teacher overlap -> guaranteed infeasible.
                 key = (fe.teacher_id, fe.slot_id)
                 other_section = fixed_teacher_slot_seen.get(key)
@@ -1005,9 +1109,13 @@ def validate_prereqs(
     if section_ids:
         special_rows: list[SpecialAllotment] = (
             db.execute(
-                select(SpecialAllotment)
-                .where(SpecialAllotment.section_id.in_(section_ids))
-                .where(SpecialAllotment.is_active.is_(True))
+                where_tenant(
+                    select(SpecialAllotment)
+                    .where(SpecialAllotment.section_id.in_(section_ids))
+                    .where(SpecialAllotment.is_active.is_(True)),
+                    SpecialAllotment,
+                    tenant_id,
+                )
             )
             .scalars()
             .all()
@@ -1019,18 +1127,18 @@ def validate_prereqs(
             special_room_ids = {r.room_id for r in special_rows if r.room_id is not None}
 
             special_subjects = (
-                db.execute(select(Subject).where(Subject.id.in_(list(special_subject_ids))))
+                db.execute(where_tenant(select(Subject).where(Subject.id.in_(list(special_subject_ids))), Subject, tenant_id))
                 .scalars()
                 .all()
             )
             special_teachers = (
-                db.execute(select(Teacher).where(Teacher.id.in_(list(special_teacher_ids))))
+                db.execute(where_tenant(select(Teacher).where(Teacher.id.in_(list(special_teacher_ids))), Teacher, tenant_id))
                 .scalars()
                 .all()
             )
 
             special_rooms = (
-                db.execute(select(Room).where(Room.id.in_(list(special_room_ids))))
+                db.execute(where_tenant(select(Room).where(Room.id.in_(list(special_room_ids))), Room, tenant_id))
                 .scalars()
                 .all()
             )
@@ -1043,7 +1151,7 @@ def validate_prereqs(
             allowed_subject_ids_by_section: dict[Any, set[Any]] = {}
 
             track_rows_all = (
-                db.execute(select(TrackSubject).where(TrackSubject.program_id == program_id))
+                db.execute(where_tenant(select(TrackSubject).where(TrackSubject.program_id == program_id), TrackSubject, tenant_id))
                 .scalars()
                 .all()
             )
@@ -1053,7 +1161,7 @@ def validate_prereqs(
 
             elective_by_section = {}
             elective_rows = (
-                db.execute(select(SectionElective).where(SectionElective.section_id.in_(section_ids)))
+                db.execute(where_tenant(select(SectionElective).where(SectionElective.section_id.in_(section_ids)), SectionElective, tenant_id))
                 .scalars()
                 .all()
             )
@@ -1080,13 +1188,17 @@ def validate_prereqs(
             # Assignment lookup: (section, subject) -> teacher_id
             assign_rows = (
                 db.execute(
-                    select(
-                        TeacherSubjectSection.section_id,
-                        TeacherSubjectSection.subject_id,
-                        TeacherSubjectSection.teacher_id,
+                    where_tenant(
+                        select(
+                            TeacherSubjectSection.section_id,
+                            TeacherSubjectSection.subject_id,
+                            TeacherSubjectSection.teacher_id,
+                        )
+                        .where(TeacherSubjectSection.section_id.in_(section_ids))
+                        .where(TeacherSubjectSection.is_active.is_(True)),
+                        TeacherSubjectSection,
+                        tenant_id,
                     )
-                    .where(TeacherSubjectSection.section_id.in_(section_ids))
-                    .where(TeacherSubjectSection.is_active.is_(True))
                 )
                 .all()
             )
@@ -1103,6 +1215,20 @@ def validate_prereqs(
             special_room_slot_seen: dict[tuple[Any, Any], Any] = {}
 
             for sa in special_rows:
+                # Special allotment must not overlap section breaks.
+                if sa.slot_id in break_slot_ids_by_section.get(sa.section_id, set()):
+                    conflicts.append(
+                        ValidationConflict(
+                            conflict_type="SPECIAL_ON_SECTION_BREAK",
+                            message="Special allotment overlaps a section break; remove the break or move the special allotment.",
+                            section_id=sa.section_id,
+                            teacher_id=sa.teacher_id,
+                            subject_id=sa.subject_id,
+                            room_id=sa.room_id,
+                            slot_id=sa.slot_id,
+                        )
+                    )
+
                 subj = special_subject_by_id.get(sa.subject_id)
                 teacher = special_teacher_by_id.get(sa.teacher_id)
                 if sa.room_id is None:
@@ -1132,6 +1258,31 @@ def validate_prereqs(
                         )
                     )
                     continue
+
+                # For LAB special allotments, the entire block must not overlap breaks.
+                if subj is not None and str(subj.subject_type) == "LAB":
+                    di = slot_id_to_day_index.get(sa.slot_id)
+                    if di is not None:
+                        d, si = int(di[0]), int(di[1])
+                        block = int(getattr(subj, "lab_block_size_slots", 1) or 1)
+                        if block < 1:
+                            block = 1
+                        for j in range(block):
+                            covered_slot_id = slot_id_by_day_index.get((int(d), int(si) + int(j)))
+                            if covered_slot_id is not None and covered_slot_id in break_slot_ids_by_section.get(sa.section_id, set()):
+                                conflicts.append(
+                                    ValidationConflict(
+                                        conflict_type="SPECIAL_LAB_OVERLAPS_BREAK",
+                                        message="Special lab block overlaps a section break; move the special allotment or adjust breaks.",
+                                        section_id=sa.section_id,
+                                        teacher_id=sa.teacher_id,
+                                        subject_id=sa.subject_id,
+                                        room_id=sa.room_id,
+                                        slot_id=sa.slot_id,
+                                        metadata={"break_slot_id": str(covered_slot_id), "day_of_week": int(d), "slot_index": int(si) + int(j)},
+                                    )
+                                )
+                                break
 
                 if not bool(getattr(room, "is_special", False)):
                     conflicts.append(
@@ -1187,6 +1338,9 @@ def validate_prereqs(
                     continue
 
                 d, si = day_idx
+
+                # Mark locked occupancy for gap feasibility checks.
+                locked_indices_by_section_day[(sa.section_id, int(d))].add(int(si))
                 w = windows_by_section_day.get((sa.section_id, int(d)))
                 if w is None or si < int(w.start_slot_index) or si > int(w.end_slot_index):
                     conflicts.append(
@@ -1277,6 +1431,10 @@ def validate_prereqs(
                     block = int(getattr(subj, "lab_block_size_slots", 1) or 1)
                     if block < 1:
                         block = 1
+                    # Mark the entire LAB block as occupied.
+                    for j in range(block):
+                        if (int(d), int(si) + int(j)) in slot_id_by_day_index:
+                            locked_indices_by_section_day[(sa.section_id, int(d))].add(int(si) + int(j))
                     end_idx = int(si) + block - 1
                     if w is None or end_idx > int(w.end_slot_index):
                         conflicts.append(
@@ -1351,6 +1509,67 @@ def validate_prereqs(
                 else:
                     special_room_slot_seen[rkey] = sa.section_id
 
+    # ------------------------------------------------------------------
+    # Pre-solve feasibility check for the new section max-gap constraint.
+    # ------------------------------------------------------------------
+    # We only flag cases that are guaranteed infeasible:
+    # If there are two locked occupied slots with >3 empty slots between them,
+    # AND there is no allowed slot_index between them (due to window/breaks),
+    # then the solver cannot insert any class to break the gap.
+    if section_ids:
+        MAX_EMPTY_GAP_SLOTS = 3
+        min_dist = MAX_EMPTY_GAP_SLOTS + 2  # distance >= 5 implies 4+ empty slots between
+        for section in sections:
+            for d in active_days:
+                w = windows_by_section_day.get((section.id, int(d)))
+                if w is None:
+                    continue
+                window_len = int(w.end_slot_index) - int(w.start_slot_index) + 1
+                if window_len < (MAX_EMPTY_GAP_SLOTS + 3):
+                    continue
+
+                # Compute allowed indices inside the section window excluding breaks.
+                allowed = set(range(int(w.start_slot_index), int(w.end_slot_index) + 1))
+                for bid in break_slot_ids_by_section.get(section.id, set()):
+                    di = slot_id_to_day_index.get(bid)
+                    if di is None:
+                        continue
+                    bd, bsi = int(di[0]), int(di[1])
+                    if bd == int(d):
+                        allowed.discard(int(bsi))
+
+                occ = sorted(locked_indices_by_section_day.get((section.id, int(d)), set()))
+                if len(occ) < 2:
+                    continue
+
+                for i in range(0, len(occ)):
+                    for j in range(i + 1, len(occ)):
+                        if int(occ[j]) - int(occ[i]) < min_dist:
+                            continue
+                        has_insertable = False
+                        for k in range(int(occ[i]) + 1, int(occ[j])):
+                            if k in allowed:
+                                has_insertable = True
+                                break
+                        if not has_insertable:
+                            conflicts.append(
+                                ValidationConflict(
+                                    conflict_type="UNAVOIDABLE_SECTION_GAP_EXCEEDS_3_EMPTY_SLOTS",
+                                    message="Locked classes create an unavoidable gap > 3 empty slots; adjust windows/breaks or move locks.",
+                                    section_id=section.id,
+                                    metadata={
+                                        "day_of_week": int(d),
+                                        "locked_slot_index_a": int(occ[i]),
+                                        "locked_slot_index_b": int(occ[j]),
+                                        "max_empty_gap": int(MAX_EMPTY_GAP_SLOTS),
+                                    },
+                                )
+                            )
+                            break
+                    else:
+                        continue
+                    break
+
     # Teacher capacity validation (strict mode helper): ensure total required weekly load can be covered.
     # We estimate load in *slots* per week: LAB counts as lab_block_size_slots per session.
     # This prevents wasting solver time when eligibility is too sparse.
@@ -1403,10 +1622,14 @@ def validate_prereqs(
         effective_year_id = academic_year_id if academic_year_id is not None else section.academic_year_id
         track_rows = (
             db.execute(
-                select(TrackSubject)
-                .where(TrackSubject.program_id == program_id)
-                .where(TrackSubject.academic_year_id == effective_year_id)
-                .where(TrackSubject.track == section.track)
+                where_tenant(
+                    select(TrackSubject)
+                    .where(TrackSubject.program_id == program_id)
+                    .where(TrackSubject.academic_year_id == effective_year_id)
+                    .where(TrackSubject.track == section.track),
+                    TrackSubject,
+                    tenant_id,
+                )
             )
             .scalars()
             .all()
@@ -1416,7 +1639,13 @@ def validate_prereqs(
         chosen_elective_id = None
         if elective_subject_ids:
             sel = (
-                db.execute(select(SectionElective).where(SectionElective.section_id == section.id))
+                db.execute(
+                    where_tenant(
+                        select(SectionElective).where(SectionElective.section_id == section.id),
+                        SectionElective,
+                        tenant_id,
+                    )
+                )
                 .scalars()
                 .first()
             )
@@ -1496,10 +1725,14 @@ def validate_prereqs(
             effective_year_id = academic_year_id if academic_year_id is not None else section.academic_year_id
             track_rows = (
                 db.execute(
-                    select(TrackSubject)
-                    .where(TrackSubject.program_id == program_id)
-                    .where(TrackSubject.academic_year_id == effective_year_id)
-                    .where(TrackSubject.track == section.track)
+                    where_tenant(
+                        select(TrackSubject)
+                        .where(TrackSubject.program_id == program_id)
+                        .where(TrackSubject.academic_year_id == effective_year_id)
+                        .where(TrackSubject.track == section.track),
+                        TrackSubject,
+                        tenant_id,
+                    )
                 )
                 .scalars()
                 .all()
@@ -1510,7 +1743,13 @@ def validate_prereqs(
             chosen_elective_id = None
             if elective_rows and str(section.track) == "CORE":
                 sel = (
-                    db.execute(select(SectionElective).where(SectionElective.section_id == section.id))
+                    db.execute(
+                        where_tenant(
+                            select(SectionElective).where(SectionElective.section_id == section.id),
+                            SectionElective,
+                            tenant_id,
+                        )
+                    )
                     .scalars()
                     .first()
                 )
@@ -1556,11 +1795,18 @@ def validate_prereqs(
         q_combined = q_combined.where(CombinedSubjectGroup.academic_year_id.in_(solve_year_ids)).where(
             Subject.academic_year_id.in_(solve_year_ids)
         )
+    q_combined = where_tenant(q_combined, CombinedSubjectGroup, tenant_id)
     combined_rows = db.execute(q_combined).all()
 
     if combined_rows:
         has_lt = (
-            db.execute(select(Room.id).where(Room.is_active.is_(True)).where(Room.room_type == "LT").limit(1)).first()
+            db.execute(
+                where_tenant(
+                    select(Room.id).where(Room.is_active.is_(True)).where(Room.room_type == "LT").limit(1),
+                    Room,
+                    tenant_id,
+                )
+            ).first()
             is not None
         )
         if not has_lt:
@@ -1585,8 +1831,11 @@ def validate_prereqs(
     # Preload track rows and elective selections to check subject existence and sessions/week.
     track_rows_all = (
         db.execute(
-            select(TrackSubject)
-            .where(TrackSubject.program_id == program_id)
+            where_tenant(
+                select(TrackSubject).where(TrackSubject.program_id == program_id),
+                TrackSubject,
+                tenant_id,
+            )
         )
         .scalars()
         .all()
@@ -1597,7 +1846,9 @@ def validate_prereqs(
 
     electives_by_section_id = {}
     if section_ids:
-        for e in db.execute(select(SectionElective).where(SectionElective.section_id.in_(section_ids))).scalars().all():
+        q_e = select(SectionElective).where(SectionElective.section_id.in_(section_ids))
+        q_e = where_tenant(q_e, SectionElective, tenant_id)
+        for e in db.execute(q_e).scalars().all():
             electives_by_section_id[e.section_id] = e
 
     def required_sessions_for_section_subject(section, subj_id):

@@ -27,12 +27,17 @@ class SolveTimetableRequest(GenerateTimetableRequest):
     max_time_seconds: float = Field(default=60.0, gt=0)
     relax_teacher_load_limits: bool = False
     require_optimal: bool = True
+    # New: debug capacity tables and smart relaxation mode
+    debug_capacity_mode: bool = False
+    smart_relaxation: bool = False
 
 
 class SolveGlobalTimetableRequest(GenerateGlobalTimetableRequest):
     max_time_seconds: float = Field(default=300.0, gt=0)
     relax_teacher_load_limits: bool = False
     require_optimal: bool = True
+    debug_capacity_mode: bool = False
+    smart_relaxation: bool = False
 
 
 class SolverConflict(BaseModel):
@@ -71,6 +76,8 @@ class SolveTimetableResponse(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     soft_conflicts: list[SolverConflict] = Field(default_factory=list)
     solver_stats: dict[str, Any] = Field(default_factory=dict)
+    # New: minimal relaxation suggestions when infeasible due to capacity
+    minimal_relaxation: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class RunSummary(BaseModel):

@@ -36,6 +36,43 @@ ADMINS: list[tuple[str, str]] = [
 ]
 
 
+def _ensure_users_schema(conn) -> None:
+        # Keep this idempotent: safe across reruns.
+        statements = [
+                "CREATE EXTENSION IF NOT EXISTS pgcrypto;",
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        username VARCHAR(100) UNIQUE NOT NULL,
+                        password_hash TEXT NOT NULL,
+                        role VARCHAR(20) DEFAULT 'ADMIN',
+                        is_active BOOLEAN DEFAULT TRUE,
+                        created_at TIMESTAMP DEFAULT now()
+                );
+                """,
+                # Legacy compatibility: older DBs may have public.users with missing columns.
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR(100);",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;",
+                # Backfill username from legacy `name` if present.
+                """
+                DO $$
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema='public' AND table_name='users' AND column_name='name'
+                    ) THEN
+                        EXECUTE 'UPDATE users SET username = COALESCE(username, name::text) WHERE username IS NULL';
+                    END IF;
+                END $$;
+                """,
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_users_username ON users (username);",
+        ]
+
+        for s in statements:
+                conn.execute(text(s))
+
+
 def _has_name_column(conn) -> bool:
     return (
         conn.execute(
@@ -74,6 +111,7 @@ def main() -> None:
         return
 
     with ENGINE.begin() as conn:
+        _ensure_users_schema(conn)
         has_name = _has_name_column(conn)
 
         for username, password in ADMINS:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import Boolean, Column, DateTime, String, Text
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, String, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.sql import func
 
@@ -13,7 +13,13 @@ class User(Base):
     __tablename__ = "users"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    username = Column(String(100), nullable=False, unique=True)
+    tenant_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    username = Column(String(100), nullable=False)
     password_hash = Column(Text, nullable=False)
     role = Column(String(20), nullable=False, default="ADMIN")
     is_active = Column(Boolean, nullable=False, default=True)

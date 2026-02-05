@@ -260,7 +260,23 @@ def run_infeasibility_analysis(data: dict[str, Any]) -> list[dict[str, Any]]:
                 assigned_tid = tid
             elif assigned_tid != tid:
                 assigned_tid = None
-
+        # If we have a consistent teacher across the combined group, attribute once.
+        if assigned_tid is None:
+            continue
+        sessions_per_week = int(getattr(subj, "sessions_per_week", 0) or 0)
+        if sessions_per_week <= 0:
+            continue
+        teacher_required_slots[assigned_tid] += int(sessions_per_week)
+        teacher_contrib[assigned_tid].append(
+            {
+                "source": "COMBINED_GROUP",
+                "group_id": str(gid),
+                "subject_code": getattr(subj, "code", None),
+                "sections": [getattr(section_by_id.get(sid), "code", str(sid)) for sid in sec_ids],
+                "slots": int(sessions_per_week),
+            }
+        )
+        counted_combined_groups.add(gid)
     # ------------------------
     # A0) Locked sessions exceed demand
     # ------------------------
@@ -398,25 +414,7 @@ def run_infeasibility_analysis(data: dict[str, Any]) -> list[dict[str, Any]]:
                             ),
                         )
                     )
-                break
-        if assigned_tid is None:
-            continue
-
-        sessions_per_week = int(getattr(subj, "sessions_per_week", 0) or 0)
-        if sessions_per_week <= 0:
-            continue
-
-        teacher_required_slots[assigned_tid] += int(sessions_per_week)
-        teacher_contrib[assigned_tid].append(
-            {
-                "source": "COMBINED_GROUP",
-                "group_id": str(gid),
-                "subject_code": getattr(subj, "code", None),
-                "sections": [getattr(section_by_id.get(sid), "code", str(sid)) for sid in sec_ids],
-                "slots": int(sessions_per_week),
-            }
-        )
-        counted_combined_groups.add(gid)
+                
 
     # Per-section subjects (excluding combined theory which is counted above).
     for sec_id, reqs in section_required.items():
@@ -425,13 +423,15 @@ def run_infeasibility_analysis(data: dict[str, Any]) -> list[dict[str, Any]]:
             subj = subject_by_id.get(subj_id)
             if subj is None:
                 continue
+            # Skip THEORY subjects that are part of a combined group to avoid double-counting.
+            skip_section_subject = False
             if str(getattr(subj, "subject_type", "THEORY")) == "THEORY":
-                # Skip if part of a combined group (it will be counted per group above).
                 for gid, g_subj in group_subject.items():
                     if g_subj == subj_id and sec_id in group_sections.get(gid, []):
+                        skip_section_subject = True
                         break
-                else:
-                    pass
+            if skip_section_subject:
+                continue
             tid = assigned_teacher_by_section_subject.get((sec_id, subj_id))
             if tid is None:
                 continue

@@ -7,9 +7,12 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import OperationalError
+from sqlalchemy import event
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy import inspect
 
 from core.config import settings
+from core.tenancy import get_current_tenant_id
 
 
 class DatabaseUnavailableError(RuntimeError):
@@ -96,6 +99,46 @@ def get_engine() -> Engine:
 
 ENGINE = get_engine()
 SessionLocal = sessionmaker(bind=ENGINE, autoflush=False, autocommit=False)
+
+
+@event.listens_for(Session, "before_flush")
+def _inject_tenant_id(session: Session, flush_context, instances) -> None:
+    # Enforce tenant_id assignment at the ORM layer so request bodies cannot spoof tenant_id.
+    # DB-level constraints still apply (see migrations).
+    mode = (settings.tenant_mode or "shared").strip().lower()
+    ctx_tenant_id = get_current_tenant_id()
+
+    for obj in session.new:
+        if not hasattr(obj, "tenant_id"):
+            continue
+
+        obj_tenant_id = getattr(obj, "tenant_id", None)
+        if obj_tenant_id is None:
+            # In strict modes, tenant_id must be resolved from auth context.
+            if mode != "shared" and ctx_tenant_id is None:
+                raise ValueError("tenant_id missing for new row (no tenant context)")
+            setattr(obj, "tenant_id", ctx_tenant_id)
+            continue
+
+        # If caller attempted to set tenant_id explicitly, ensure it matches the request tenant.
+        if mode != "shared" and ctx_tenant_id is not None and str(obj_tenant_id) != str(ctx_tenant_id):
+            raise ValueError("tenant_id spoofing attempt detected")
+
+    for obj in session.dirty:
+        if not hasattr(obj, "tenant_id"):
+            continue
+
+        state = inspect(obj)
+        if "tenant_id" not in state.attrs:
+            continue
+
+        hist = state.attrs.tenant_id.history
+        if not hist.has_changes():
+            continue
+
+        new_tenant_id = getattr(obj, "tenant_id", None)
+        if mode != "shared" and ctx_tenant_id is not None and str(new_tenant_id) != str(ctx_tenant_id):
+            raise ValueError("tenant_id change/spoofing attempt detected")
 
 
 def get_db():

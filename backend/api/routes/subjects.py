@@ -7,7 +7,8 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from api.deps import require_admin
+from api.deps import get_tenant_id, require_admin
+from api.tenant import get_by_id, where_tenant
 from core.db import get_db
 from models.academic_year import AcademicYear
 from models.program import Program
@@ -60,15 +61,19 @@ def _validate_subject_constraints(
         )
 
 
-def _get_program(db: Session, program_code: str) -> Program:
-    program = db.execute(select(Program).where(Program.code == program_code)).scalar_one_or_none()
+def _get_program(db: Session, program_code: str, *, tenant_id: uuid.UUID | None) -> Program:
+    q = select(Program).where(Program.code == program_code)
+    q = where_tenant(q, Program, tenant_id)
+    program = db.execute(q).scalar_one_or_none()
     if program is None:
         raise HTTPException(status_code=404, detail="PROGRAM_NOT_FOUND")
     return program
 
 
-def _get_academic_year(db: Session, year_number: int) -> AcademicYear:
-    ay = db.execute(select(AcademicYear).where(AcademicYear.year_number == int(year_number))).scalar_one_or_none()
+def _get_academic_year(db: Session, year_number: int, *, tenant_id: uuid.UUID | None) -> AcademicYear:
+    q = select(AcademicYear).where(AcademicYear.year_number == int(year_number))
+    q = where_tenant(q, AcademicYear, tenant_id)
+    ay = db.execute(q).scalar_one_or_none()
     if ay is None:
         raise HTTPException(status_code=404, detail="ACADEMIC_YEAR_NOT_FOUND")
     return ay
@@ -80,15 +85,16 @@ def list_subjects(
     academic_year_number: int | None = Query(default=None, ge=1, le=4),
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> list[SubjectOut]:
-    q = select(Subject).order_by(Subject.code.asc())
+    q = where_tenant(select(Subject), Subject, tenant_id).order_by(Subject.code.asc())
 
     if program_code is not None:
-        program = _get_program(db, program_code)
+        program = _get_program(db, program_code, tenant_id=tenant_id)
         q = q.where(Subject.program_id == program.id)
 
     if academic_year_number is not None:
-        ay = _get_academic_year(db, int(academic_year_number))
+        ay = _get_academic_year(db, int(academic_year_number), tenant_id=tenant_id)
         q = q.where(Subject.academic_year_id == ay.id)
 
     return db.execute(q).scalars().all()
@@ -99,9 +105,10 @@ def create_subject(
     payload: SubjectCreate,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> SubjectOut:
-    program = _get_program(db, payload.program_code)
-    ay = _get_academic_year(db, int(payload.academic_year_number))
+    program = _get_program(db, payload.program_code, tenant_id=tenant_id)
+    ay = _get_academic_year(db, int(payload.academic_year_number), tenant_id=tenant_id)
 
     _validate_subject_constraints(
         subject_type=payload.subject_type,
@@ -111,6 +118,7 @@ def create_subject(
     )
 
     subject = Subject(
+        tenant_id=tenant_id,
         program_id=program.id,
         academic_year_id=ay.id,
         code=payload.code,
@@ -137,8 +145,9 @@ def update_subject(
     payload: SubjectUpdate,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> SubjectOut:
-    subject = db.get(Subject, subject_id)
+    subject = get_by_id(db, Subject, subject_id, tenant_id)
     if subject is None:
         raise HTTPException(status_code=404, detail="SUBJECT_NOT_FOUND")
 
@@ -174,8 +183,9 @@ def put_subject(
     payload: SubjectPut,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> SubjectOut:
-    subject = db.get(Subject, subject_id)
+    subject = get_by_id(db, Subject, subject_id, tenant_id)
     if subject is None:
         raise HTTPException(status_code=404, detail="SUBJECT_NOT_FOUND")
 
@@ -208,8 +218,9 @@ def delete_subject(
     subject_id: uuid.UUID,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> dict:
-    subject = db.get(Subject, subject_id)
+    subject = get_by_id(db, Subject, subject_id, tenant_id)
     if subject is None:
         raise HTTPException(status_code=404, detail="SUBJECT_NOT_FOUND")
     db.delete(subject)

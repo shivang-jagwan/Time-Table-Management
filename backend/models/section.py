@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, Integer, Text
+from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, Integer, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import ENUM, UUID
 from sqlalchemy.sql import func
 
@@ -23,6 +23,7 @@ class Section(Base):
     __tablename__ = "sections"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), nullable=False, index=True)
     program_id = Column(UUID(as_uuid=True), nullable=False)
     academic_year_id = Column(UUID(as_uuid=True), nullable=False)
     code = Column(Text, nullable=False)
@@ -34,4 +35,5 @@ class Section(Base):
 
     __table_args__ = (
         CheckConstraint("strength >= 0", name="ck_sections_strength"),
+        UniqueConstraint("tenant_id", "code", name="uq_sections_tenant_code"),
     )

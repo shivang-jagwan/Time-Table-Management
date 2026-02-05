@@ -9,7 +9,8 @@ from sqlalchemy import delete, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from api.deps import require_admin
+from api.deps import get_tenant_id, require_admin
+from api.tenant import where_tenant
 from core.db import get_db
 from models.academic_year import AcademicYear
 from models.combined_subject_group import CombinedSubjectGroup
@@ -63,35 +64,49 @@ from schemas.admin import (
 router = APIRouter()
 
 
-def _get_academic_year(db: Session, year_number: int) -> AcademicYear:
-    year = db.execute(select(AcademicYear).where(AcademicYear.year_number == int(year_number))).scalars().first()
+def _get_academic_year(db: Session, year_number: int, *, tenant_id: uuid.UUID | None) -> AcademicYear:
+    q = select(AcademicYear).where(AcademicYear.year_number == int(year_number))
+    q = where_tenant(q, AcademicYear, tenant_id)
+    year = db.execute(q).scalars().first()
     if year is None:
         raise HTTPException(status_code=404, detail="ACADEMIC_YEAR_NOT_FOUND")
     return year
 
 
-def _get_or_create_academic_year(db: Session, year_number: int, *, activate: bool = True) -> AcademicYear:
-    year = db.execute(select(AcademicYear).where(AcademicYear.year_number == int(year_number))).scalars().first()
+def _get_or_create_academic_year(
+    db: Session,
+    year_number: int,
+    *,
+    tenant_id: uuid.UUID | None,
+    activate: bool = True,
+) -> AcademicYear:
+    q = select(AcademicYear).where(AcademicYear.year_number == int(year_number))
+    q = where_tenant(q, AcademicYear, tenant_id)
+    year = db.execute(q).scalars().first()
     if year is not None:
         if activate and not year.is_active:
             year.is_active = True
         return year
 
-    year = AcademicYear(year_number=int(year_number), is_active=bool(activate))
+    year = AcademicYear(year_number=int(year_number), is_active=bool(activate), **({"tenant_id": tenant_id} if tenant_id is not None else {}))
     db.add(year)
     try:
         db.flush()
     except IntegrityError:
         db.rollback()
         # Best-effort retry in case another request created it.
-        year = db.execute(select(AcademicYear).where(AcademicYear.year_number == int(year_number))).scalars().first()
+        q2 = select(AcademicYear).where(AcademicYear.year_number == int(year_number))
+        q2 = where_tenant(q2, AcademicYear, tenant_id)
+        year = db.execute(q2).scalars().first()
         if year is None:
             raise
     return year
 
 
-def _get_program(db: Session, program_code: str) -> Program:
-    program = db.execute(select(Program).where(Program.code == program_code)).scalar_one_or_none()
+def _get_program(db: Session, program_code: str, *, tenant_id: uuid.UUID | None) -> Program:
+    q = select(Program).where(Program.code == program_code)
+    q = where_tenant(q, Program, tenant_id)
+    program = db.execute(q).scalar_one_or_none()
     if program is None:
         raise HTTPException(status_code=404, detail="PROGRAM_NOT_FOUND")
     return program
@@ -100,8 +115,10 @@ def _get_program(db: Session, program_code: str) -> Program:
 @router.get("/academic-years", response_model=list[AcademicYearOut])
 def list_academic_years(
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> list[AcademicYearOut]:
-    return db.execute(select(AcademicYear).order_by(AcademicYear.year_number.asc())).scalars().all()
+    q = where_tenant(select(AcademicYear), AcademicYear, tenant_id).order_by(AcademicYear.year_number.asc())
+    return db.execute(q).scalars().all()
 
 
 @router.post("/academic-years/ensure", response_model=AdminActionResult)
@@ -109,6 +126,7 @@ def ensure_academic_years(
     payload: EnsureAcademicYearsRequest,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> AdminActionResult:
     created = 0
     updated = 0
@@ -117,8 +135,11 @@ def ensure_academic_years(
         if int(n) < 1 or int(n) > 4:
             raise HTTPException(status_code=422, detail="INVALID_ACADEMIC_YEAR")
 
-        before = db.execute(select(AcademicYear).where(AcademicYear.year_number == int(n))).scalars().first()
-        year = _get_or_create_academic_year(db, int(n), activate=payload.activate)
+        q_before = select(AcademicYear).where(AcademicYear.year_number == int(n))
+        q_before = where_tenant(q_before, AcademicYear, tenant_id)
+        before = db.execute(q_before).scalars().first()
+
+        year = _get_or_create_academic_year(db, int(n), tenant_id=tenant_id, activate=payload.activate)
         if before is None:
             created += 1
         elif payload.activate and not before.is_active and year.is_active:
@@ -133,13 +154,14 @@ def map_program_data_to_year(
     payload: MapProgramDataToYearRequest,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> MapProgramDataToYearResponse:
-    program = _get_program(db, payload.program_code.strip())
+    program = _get_program(db, payload.program_code.strip(), tenant_id=tenant_id)
     if payload.from_academic_year_number == payload.to_academic_year_number:
         raise HTTPException(status_code=422, detail="FROM_YEAR_EQUALS_TO_YEAR")
 
-    from_year = _get_or_create_academic_year(db, int(payload.from_academic_year_number), activate=True)
-    to_year = _get_or_create_academic_year(db, int(payload.to_academic_year_number), activate=True)
+    from_year = _get_or_create_academic_year(db, int(payload.from_academic_year_number), tenant_id=tenant_id, activate=True)
+    to_year = _get_or_create_academic_year(db, int(payload.to_academic_year_number), tenant_id=tenant_id, activate=True)
 
     deleted: dict[str, int] = {}
     updated_counts: dict[str, int] = {}
@@ -332,6 +354,7 @@ def generate_time_slots(
     payload: GenerateTimeSlotsRequest,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
     start_dt = _parse_hhmm(payload.start_time)
     end_dt = _parse_hhmm(payload.end_time)
@@ -341,14 +364,18 @@ def generate_time_slots(
     deleted = 0
     if payload.replace_existing:
         # time_slots are referenced by timetable_entries.slot_id (FK). Deleting would break existing runs.
-        if db.execute(text("select 1 from timetable_entries limit 1")).first() is not None:
+        q_in_use = where_tenant(select(TimetableEntry.id).limit(1), TimetableEntry, tenant_id)
+        if db.execute(q_in_use).first() is not None:
             raise HTTPException(status_code=409, detail="TIME_SLOTS_IN_USE")
         try:
-            deleted = db.execute(delete(TimeSlot)).rowcount or 0
+            stmt_del = where_tenant(delete(TimeSlot), TimeSlot, tenant_id)
+            deleted = db.execute(stmt_del).rowcount or 0
         except IntegrityError:
             raise HTTPException(status_code=409, detail="TIME_SLOTS_IN_USE")
 
-    existing = db.execute(select(TimeSlot).where(TimeSlot.day_of_week.in_(payload.days))).scalars().all()
+    q_existing = select(TimeSlot).where(TimeSlot.day_of_week.in_(payload.days))
+    q_existing = where_tenant(q_existing, TimeSlot, tenant_id)
+    existing = db.execute(q_existing).scalars().all()
     existing_map = {(r.day_of_week, r.slot_index): r for r in existing}
 
     created = 0
@@ -363,6 +390,7 @@ def generate_time_slots(
             if row is None:
                 db.add(
                     TimeSlot(
+                        **({"tenant_id": tenant_id} if tenant_id is not None else {}),
                         day_of_week=day,
                         slot_index=slot_index,
                         start_time=current.time(),
@@ -387,18 +415,22 @@ def clear_timetables(
     payload: ClearTimetablesRequest,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
     if payload.confirm.strip().upper() != "DELETE":
         raise HTTPException(status_code=422, detail="CONFIRM_DELETE_REQUIRED")
 
     year_id = None
     if payload.academic_year_number is not None:
-        year = db.execute(select(AcademicYear).where(AcademicYear.year_number == payload.academic_year_number)).scalars().first()
+        q_year = select(AcademicYear).where(AcademicYear.year_number == payload.academic_year_number)
+        q_year = where_tenant(q_year, AcademicYear, tenant_id)
+        year = db.execute(q_year).scalars().first()
         if year is None:
             raise HTTPException(status_code=404, detail="ACADEMIC_YEAR_NOT_FOUND")
         year_id = year.id
 
     stmt = delete(TimetableRun)
+    stmt = where_tenant(stmt, TimetableRun, tenant_id)
     if year_id is not None:
         stmt = stmt.where(TimetableRun.academic_year_id == year_id)
 
@@ -412,11 +444,14 @@ def delete_timetable_run(
     payload: DeleteTimetableRunRequest,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
     if payload.confirm.strip().upper() != "DELETE":
         raise HTTPException(status_code=422, detail="CONFIRM_DELETE_REQUIRED")
 
-    deleted = db.execute(delete(TimetableRun).where(TimetableRun.id == payload.run_id)).rowcount or 0
+    stmt = delete(TimetableRun).where(TimetableRun.id == payload.run_id)
+    stmt = where_tenant(stmt, TimetableRun, tenant_id)
+    deleted = db.execute(stmt).rowcount or 0
     if deleted == 0:
         raise HTTPException(status_code=404, detail="RUN_NOT_FOUND")
 
@@ -429,16 +464,21 @@ def set_default_section_windows(
     payload: SetDefaultSectionWindowsRequest,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
-    program = _get_program(db, payload.program_code)
-    year = _get_academic_year(db, int(payload.academic_year_number))
+    program = _get_program(db, payload.program_code, tenant_id=tenant_id)
+    year = _get_academic_year(db, int(payload.academic_year_number), tenant_id=tenant_id)
 
     sections = (
         db.execute(
-            select(Section)
-            .where(Section.program_id == program.id)
-            .where(Section.academic_year_id == year.id)
-            .where(Section.is_active.is_(True))
+            where_tenant(
+                select(Section)
+                .where(Section.program_id == program.id)
+                .where(Section.academic_year_id == year.id)
+                .where(Section.is_active.is_(True)),
+                Section,
+                tenant_id,
+            )
         )
         .scalars()
         .all()
@@ -449,24 +489,21 @@ def set_default_section_windows(
     deleted = 0
     section_ids = [s.id for s in sections]
     if payload.replace_existing and section_ids:
-        deleted = (
-            db.execute(
-                delete(SectionTimeWindow)
-                .where(SectionTimeWindow.section_id.in_(section_ids))
-                .where(SectionTimeWindow.day_of_week.in_(payload.days))
-            ).rowcount
-            or 0
-        )
-
-    existing = (
-        db.execute(
-            select(SectionTimeWindow)
+        stmt = (
+            delete(SectionTimeWindow)
             .where(SectionTimeWindow.section_id.in_(section_ids))
             .where(SectionTimeWindow.day_of_week.in_(payload.days))
         )
-        .scalars()
-        .all()
+        stmt = where_tenant(stmt, SectionTimeWindow, tenant_id)
+        deleted = db.execute(stmt).rowcount or 0
+
+    q_existing = (
+        select(SectionTimeWindow)
+        .where(SectionTimeWindow.section_id.in_(section_ids))
+        .where(SectionTimeWindow.day_of_week.in_(payload.days))
     )
+    q_existing = where_tenant(q_existing, SectionTimeWindow, tenant_id)
+    existing = db.execute(q_existing).scalars().all()
     existing_map = {(r.section_id, r.day_of_week): r for r in existing}
 
     created = 0
@@ -478,6 +515,7 @@ def set_default_section_windows(
             if row is None:
                 db.add(
                     SectionTimeWindow(
+                        tenant_id=tenant_id,
                         section_id=section.id,
                         day_of_week=day,
                         start_slot_index=payload.start_slot_index,
@@ -500,17 +538,22 @@ def list_section_electives(
     academic_year_number: int = Query(ge=1, le=4),
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> list[SectionElectiveOut]:
-    program = _get_program(db, program_code)
-    year = _get_academic_year(db, int(academic_year_number))
+    program = _get_program(db, program_code, tenant_id=tenant_id)
+    year = _get_academic_year(db, int(academic_year_number), tenant_id=tenant_id)
 
     sections = (
         db.execute(
-            select(Section)
-            .where(Section.program_id == program.id)
-            .where(Section.academic_year_id == year.id)
-            .where(Section.is_active.is_(True))
-            .order_by(Section.code.asc())
+            where_tenant(
+                select(Section)
+                .where(Section.program_id == program.id)
+                .where(Section.academic_year_id == year.id)
+                .where(Section.is_active.is_(True))
+                .order_by(Section.code.asc()),
+                Section,
+                tenant_id,
+            )
         )
         .scalars()
         .all()
@@ -520,14 +563,26 @@ def list_section_electives(
 
     section_ids = [s.id for s in sections]
     electives = (
-        db.execute(select(SectionElective).where(SectionElective.section_id.in_(section_ids))).scalars().all()
+        db.execute(
+            where_tenant(
+                select(SectionElective).where(SectionElective.section_id.in_(section_ids)),
+                SectionElective,
+                tenant_id,
+            )
+        )
+        .scalars()
+        .all()
     )
     elective_by_section = {e.section_id: e.subject_id for e in electives}
 
     subject_ids = [sid for sid in elective_by_section.values() if sid is not None]
     subjects = []
     if subject_ids:
-        subjects = db.execute(select(Subject).where(Subject.id.in_(subject_ids))).scalars().all()
+        subjects = (
+            db.execute(where_tenant(select(Subject).where(Subject.id.in_(subject_ids)), Subject, tenant_id))
+            .scalars()
+            .all()
+        )
     subject_by_id = {s.id: s for s in subjects}
 
     out: list[SectionElectiveOut] = []
@@ -549,16 +604,21 @@ def set_section_elective(
     payload: SetSectionElectiveRequest,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
-    program = _get_program(db, payload.program_code)
-    year = _get_academic_year(db, int(payload.academic_year_number))
+    program = _get_program(db, payload.program_code, tenant_id=tenant_id)
+    year = _get_academic_year(db, int(payload.academic_year_number), tenant_id=tenant_id)
 
     section = (
         db.execute(
-            select(Section)
-            .where(Section.program_id == program.id)
-            .where(Section.academic_year_id == year.id)
-            .where(Section.code == payload.section_code)
+            where_tenant(
+                select(Section)
+                .where(Section.program_id == program.id)
+                .where(Section.academic_year_id == year.id)
+                .where(Section.code == payload.section_code),
+                Section,
+                tenant_id,
+            )
         )
         .scalars()
         .first()
@@ -568,11 +628,15 @@ def set_section_elective(
 
     subject = (
         db.execute(
-            select(Subject)
-            .where(Subject.program_id == program.id)
-            .where(Subject.academic_year_id == year.id)
-            .where(Subject.code == payload.subject_code)
-            .where(Subject.is_active.is_(True))
+            where_tenant(
+                select(Subject)
+                .where(Subject.program_id == program.id)
+                .where(Subject.academic_year_id == year.id)
+                .where(Subject.code == payload.subject_code)
+                .where(Subject.is_active.is_(True)),
+                Subject,
+                tenant_id,
+            )
         )
         .scalars()
         .first()
@@ -580,9 +644,25 @@ def set_section_elective(
     if subject is None:
         raise HTTPException(status_code=404, detail="SUBJECT_NOT_FOUND")
 
-    row = db.execute(select(SectionElective).where(SectionElective.section_id == section.id)).scalars().first()
+    row = (
+        db.execute(
+            where_tenant(
+                select(SectionElective).where(SectionElective.section_id == section.id),
+                SectionElective,
+                tenant_id,
+            )
+        )
+        .scalars()
+        .first()
+    )
     if row is None:
-        db.add(SectionElective(section_id=section.id, subject_id=subject.id))
+        db.add(
+            SectionElective(
+                **({"tenant_id": tenant_id} if tenant_id is not None else {}),
+                section_id=section.id,
+                subject_id=subject.id,
+            )
+        )
         created = 1
         updated = 0
     else:
@@ -599,17 +679,22 @@ def bulk_set_core_elective(
     payload: BulkSetCoreElectiveRequest,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
-    program = _get_program(db, payload.program_code)
-    year = _get_academic_year(db, int(payload.academic_year_number))
+    program = _get_program(db, payload.program_code, tenant_id=tenant_id)
+    year = _get_academic_year(db, int(payload.academic_year_number), tenant_id=tenant_id)
 
     subject = (
         db.execute(
-            select(Subject)
-            .where(Subject.program_id == program.id)
-            .where(Subject.academic_year_id == year.id)
-            .where(Subject.code == payload.subject_code)
-            .where(Subject.is_active.is_(True))
+            where_tenant(
+                select(Subject)
+                .where(Subject.program_id == program.id)
+                .where(Subject.academic_year_id == year.id)
+                .where(Subject.code == payload.subject_code)
+                .where(Subject.is_active.is_(True)),
+                Subject,
+                tenant_id,
+            )
         )
         .scalars()
         .first()
@@ -619,11 +704,15 @@ def bulk_set_core_elective(
 
     sections = (
         db.execute(
-            select(Section)
-            .where(Section.program_id == program.id)
-            .where(Section.academic_year_id == year.id)
-            .where(Section.track == "CORE")
-            .where(Section.is_active.is_(True))
+            where_tenant(
+                select(Section)
+                .where(Section.program_id == program.id)
+                .where(Section.academic_year_id == year.id)
+                .where(Section.track == "CORE")
+                .where(Section.is_active.is_(True)),
+                Section,
+                tenant_id,
+            )
         )
         .scalars()
         .all()
@@ -632,7 +721,13 @@ def bulk_set_core_elective(
         raise HTTPException(status_code=404, detail="NO_ACTIVE_CORE_SECTIONS")
 
     existing = (
-        db.execute(select(SectionElective).where(SectionElective.section_id.in_([s.id for s in sections])))
+        db.execute(
+            where_tenant(
+                select(SectionElective).where(SectionElective.section_id.in_([s.id for s in sections])),
+                SectionElective,
+                tenant_id,
+            )
+        )
         .scalars()
         .all()
     )
@@ -643,7 +738,13 @@ def bulk_set_core_elective(
     for section in sections:
         row = existing_map.get(section.id)
         if row is None:
-            db.add(SectionElective(section_id=section.id, subject_id=subject.id))
+            db.add(
+                SectionElective(
+                    **({"tenant_id": tenant_id} if tenant_id is not None else {}),
+                    section_id=section.id,
+                    subject_id=subject.id,
+                )
+            )
             created += 1
         else:
             if payload.replace_existing and row.subject_id != subject.id:
@@ -675,6 +776,7 @@ def list_teacher_subject_sections(
     section_id: uuid.UUID | None = Query(default=None),
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
     q = (
         select(TeacherSubjectSection, Teacher, Subject, Section)
@@ -686,6 +788,7 @@ def list_teacher_subject_sections(
         .where(Subject.is_active.is_(True))
         .where(Section.is_active.is_(True))
     )
+    q = where_tenant(q, TeacherSubjectSection, tenant_id)
     if teacher_id is not None:
         q = q.where(TeacherSubjectSection.teacher_id == teacher_id)
     if subject_id is not None:
@@ -731,35 +834,36 @@ def set_teacher_subject_sections(
     payload: SetTeacherSubjectSectionsRequest,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
-    teacher = db.execute(select(Teacher).where(Teacher.id == payload.teacher_id)).scalars().first()
+    teacher = db.execute(where_tenant(select(Teacher).where(Teacher.id == payload.teacher_id), Teacher, tenant_id)).scalars().first()
     if teacher is None:
         raise HTTPException(status_code=404, detail="TEACHER_NOT_FOUND")
 
-    subject = db.execute(select(Subject).where(Subject.id == payload.subject_id)).scalars().first()
+    subject = db.execute(where_tenant(select(Subject).where(Subject.id == payload.subject_id), Subject, tenant_id)).scalars().first()
     if subject is None:
         raise HTTPException(status_code=404, detail="SUBJECT_NOT_FOUND")
 
     section_ids = list(payload.section_ids or [])
     if section_ids:
-        existing_section_ids = set(db.execute(select(Section.id).where(Section.id.in_(section_ids))).scalars().all())
+        q_sections = where_tenant(select(Section.id).where(Section.id.in_(section_ids)), Section, tenant_id)
+        existing_section_ids = set(db.execute(q_sections).scalars().all())
         invalid = [sid for sid in section_ids if sid not in existing_section_ids]
         if invalid:
             raise HTTPException(status_code=422, detail="SECTION_NOT_FOUND")
 
     if section_ids:
-        conflict_rows = (
-            db.execute(
-                select(TeacherSubjectSection, Teacher, Section)
-                .join(Teacher, Teacher.id == TeacherSubjectSection.teacher_id)
-                .join(Section, Section.id == TeacherSubjectSection.section_id)
-                .where(TeacherSubjectSection.subject_id == subject.id)
-                .where(TeacherSubjectSection.section_id.in_(section_ids))
-                .where(TeacherSubjectSection.teacher_id != teacher.id)
-                .where(TeacherSubjectSection.is_active.is_(True))
-            )
-            .all()
+        q_conflicts = (
+            select(TeacherSubjectSection, Teacher, Section)
+            .join(Teacher, Teacher.id == TeacherSubjectSection.teacher_id)
+            .join(Section, Section.id == TeacherSubjectSection.section_id)
+            .where(TeacherSubjectSection.subject_id == subject.id)
+            .where(TeacherSubjectSection.section_id.in_(section_ids))
+            .where(TeacherSubjectSection.teacher_id != teacher.id)
+            .where(TeacherSubjectSection.is_active.is_(True))
         )
+        q_conflicts = where_tenant(q_conflicts, TeacherSubjectSection, tenant_id)
+        conflict_rows = db.execute(q_conflicts).all()
         if conflict_rows:
             conflicts = [
                 {
@@ -781,12 +885,14 @@ def set_teacher_subject_sections(
 
     existing_rows: list[TeacherSubjectSection] = (
         db.execute(
-            select(TeacherSubjectSection)
-            .where(TeacherSubjectSection.teacher_id == teacher.id)
-            .where(TeacherSubjectSection.subject_id == subject.id)
-        )
-        .scalars()
-        .all()
+            where_tenant(
+                select(TeacherSubjectSection)
+                .where(TeacherSubjectSection.teacher_id == teacher.id)
+                .where(TeacherSubjectSection.subject_id == subject.id),
+                TeacherSubjectSection,
+                tenant_id,
+            )
+        ).scalars().all()
     )
     by_section = {r.section_id: r for r in existing_rows}
 
@@ -804,6 +910,7 @@ def set_teacher_subject_sections(
         if row is None:
             db.add(
                 TeacherSubjectSection(
+                    tenant_id=tenant_id,
                     teacher_id=teacher.id,
                     subject_id=subject.id,
                     section_id=sid,
@@ -832,18 +939,23 @@ def list_combined_subject_groups(
     subject_code: str | None = Query(default=None),
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
-    program = _get_program(db, program_code)
-    year = _get_academic_year(db, academic_year_number)
+    program = _get_program(db, program_code, tenant_id=tenant_id)
+    year = _get_academic_year(db, int(academic_year_number), tenant_id=tenant_id)
 
     subj_filter_id = None
     if subject_code is not None:
         subject = (
             db.execute(
-                select(Subject)
-                .where(Subject.program_id == program.id)
-                .where(Subject.academic_year_id == year.id)
-                .where(Subject.code == subject_code)
+                where_tenant(
+                    select(Subject)
+                    .where(Subject.program_id == program.id)
+                    .where(Subject.academic_year_id == year.id)
+                    .where(Subject.code == subject_code),
+                    Subject,
+                    tenant_id,
+                )
             )
             .scalars()
             .first()
@@ -858,6 +970,7 @@ def list_combined_subject_groups(
         .where(CombinedSubjectGroup.academic_year_id == year.id)
         .where(Subject.program_id == program.id)
     )
+    q = where_tenant(q, CombinedSubjectGroup, tenant_id)
     if subj_filter_id is not None:
         q = q.where(CombinedSubjectGroup.subject_id == subj_filter_id)
 
@@ -866,15 +979,14 @@ def list_combined_subject_groups(
         return []
 
     group_ids = [g.id for g, _subj in groups]
-    sec_rows = (
-        db.execute(
-            select(CombinedSubjectSection.combined_group_id, Section)
-            .join(Section, Section.id == CombinedSubjectSection.section_id)
-            .where(CombinedSubjectSection.combined_group_id.in_(group_ids))
-            .order_by(Section.code.asc())
-        )
-        .all()
+    sec_q = (
+        select(CombinedSubjectSection.combined_group_id, Section)
+        .join(Section, Section.id == CombinedSubjectSection.section_id)
+        .where(CombinedSubjectSection.combined_group_id.in_(group_ids))
+        .order_by(Section.code.asc())
     )
+    sec_q = where_tenant(sec_q, CombinedSubjectSection, tenant_id)
+    sec_rows = db.execute(sec_q).all()
 
     sections_by_group: dict[uuid.UUID, list[CombinedSubjectGroupSectionOut]] = {}
     for gid, sec in sec_rows:
@@ -903,9 +1015,10 @@ def create_combined_subject_group(
     payload: CreateCombinedSubjectGroupRequest,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
-    program = _get_program(db, payload.program_code)
-    year = _get_academic_year(db, payload.academic_year_number)
+    program = _get_program(db, payload.program_code, tenant_id=tenant_id)
+    year = _get_academic_year(db, int(payload.academic_year_number), tenant_id=tenant_id)
 
     section_codes = [c.strip() for c in (payload.section_codes or []) if str(c).strip()]
     section_codes = sorted(list(dict.fromkeys(section_codes)))
@@ -914,11 +1027,15 @@ def create_combined_subject_group(
 
     subject = (
         db.execute(
-            select(Subject)
-            .where(Subject.program_id == program.id)
-            .where(Subject.academic_year_id == year.id)
-            .where(Subject.code == payload.subject_code)
-            .where(Subject.is_active.is_(True))
+            where_tenant(
+                select(Subject)
+                .where(Subject.program_id == program.id)
+                .where(Subject.academic_year_id == year.id)
+                .where(Subject.code == payload.subject_code)
+                .where(Subject.is_active.is_(True)),
+                Subject,
+                tenant_id,
+            )
         )
         .scalars()
         .first()
@@ -928,12 +1045,16 @@ def create_combined_subject_group(
 
     sections = (
         db.execute(
-            select(Section)
-            .where(Section.program_id == program.id)
-            .where(Section.academic_year_id == year.id)
-            .where(Section.code.in_(section_codes))
-            .where(Section.is_active.is_(True))
-            .order_by(Section.code.asc())
+            where_tenant(
+                select(Section)
+                .where(Section.program_id == program.id)
+                .where(Section.academic_year_id == year.id)
+                .where(Section.code.in_(section_codes))
+                .where(Section.is_active.is_(True))
+                .order_by(Section.code.asc()),
+                Section,
+                tenant_id,
+            )
         )
         .scalars()
         .all()
@@ -941,12 +1062,12 @@ def create_combined_subject_group(
     if len(sections) != len(section_codes):
         raise HTTPException(status_code=422, detail="SECTION_NOT_FOUND")
 
-    group = CombinedSubjectGroup(academic_year_id=year.id, subject_id=subject.id)
+    group = CombinedSubjectGroup(tenant_id=tenant_id, academic_year_id=year.id, subject_id=subject.id)
     db.add(group)
     db.flush()
 
     for sec in sections:
-        db.add(CombinedSubjectSection(combined_group_id=group.id, section_id=sec.id))
+        db.add(CombinedSubjectSection(tenant_id=tenant_id, combined_group_id=group.id, section_id=sec.id))
 
     try:
         db.commit()
@@ -974,9 +1095,15 @@ def delete_combined_subject_group(
     group_id: uuid.UUID,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
-    deleted_links = db.execute(delete(CombinedSubjectSection).where(CombinedSubjectSection.combined_group_id == group_id)).rowcount or 0
-    deleted_groups = db.execute(delete(CombinedSubjectGroup).where(CombinedSubjectGroup.id == group_id)).rowcount or 0
+    stmt_links = delete(CombinedSubjectSection).where(CombinedSubjectSection.combined_group_id == group_id)
+    stmt_links = where_tenant(stmt_links, CombinedSubjectSection, tenant_id)
+    deleted_links = db.execute(stmt_links).rowcount or 0
+
+    stmt_groups = delete(CombinedSubjectGroup).where(CombinedSubjectGroup.id == group_id)
+    stmt_groups = where_tenant(stmt_groups, CombinedSubjectGroup, tenant_id)
+    deleted_groups = db.execute(stmt_groups).rowcount or 0
     if deleted_groups == 0:
         raise HTTPException(status_code=404, detail="GROUP_NOT_FOUND")
 
@@ -985,26 +1112,26 @@ def delete_combined_subject_group(
 
 
 def _build_elective_block_out(db: Session, *, block: ElectiveBlock, academic_year_number: int) -> ElectiveBlockOut:
-    subj_rows = (
-        db.execute(
-            select(ElectiveBlockSubject, Subject, Teacher)
-            .join(Subject, Subject.id == ElectiveBlockSubject.subject_id)
-            .join(Teacher, Teacher.id == ElectiveBlockSubject.teacher_id)
-            .where(ElectiveBlockSubject.block_id == block.id)
-            .order_by(Subject.code.asc())
-        )
-        .all()
-    )
+    tenant_id = getattr(block, "tenant_id", None)
 
-    section_rows = (
-        db.execute(
-            select(SectionElectiveBlock, Section)
-            .join(Section, Section.id == SectionElectiveBlock.section_id)
-            .where(SectionElectiveBlock.block_id == block.id)
-            .order_by(Section.code.asc())
-        )
-        .all()
+    subj_q = (
+        select(ElectiveBlockSubject, Subject, Teacher)
+        .join(Subject, Subject.id == ElectiveBlockSubject.subject_id)
+        .join(Teacher, Teacher.id == ElectiveBlockSubject.teacher_id)
+        .where(ElectiveBlockSubject.block_id == block.id)
+        .order_by(Subject.code.asc())
     )
+    subj_q = where_tenant(subj_q, ElectiveBlockSubject, tenant_id)
+    subj_rows = db.execute(subj_q).all()
+
+    section_q = (
+        select(SectionElectiveBlock, Section)
+        .join(Section, Section.id == SectionElectiveBlock.section_id)
+        .where(SectionElectiveBlock.block_id == block.id)
+        .order_by(Section.code.asc())
+    )
+    section_q = where_tenant(section_q, SectionElectiveBlock, tenant_id)
+    section_rows = db.execute(section_q).all()
 
     return ElectiveBlockOut(
         id=block.id,
@@ -1038,19 +1165,20 @@ def list_elective_blocks(
     academic_year_number: int = Query(ge=1, le=4),
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
-    program = _get_program(db, program_code)
-    year = _get_academic_year(db, int(academic_year_number))
+    program = _get_program(db, program_code, tenant_id=tenant_id)
+    year = _get_academic_year(db, int(academic_year_number), tenant_id=tenant_id)
 
+    q = (
+        select(ElectiveBlock)
+        .where(ElectiveBlock.program_id == program.id)
+        .where(ElectiveBlock.academic_year_id == year.id)
+        .order_by(ElectiveBlock.created_at.desc())
+    )
+    q = where_tenant(q, ElectiveBlock, tenant_id)
     blocks = (
-        db.execute(
-            select(ElectiveBlock)
-            .where(ElectiveBlock.program_id == program.id)
-            .where(ElectiveBlock.academic_year_id == year.id)
-            .order_by(ElectiveBlock.created_at.desc())
-        )
-        .scalars()
-        .all()
+        db.execute(q).scalars().all()
     )
     return [_build_elective_block_out(db, block=b, academic_year_number=academic_year_number) for b in blocks]
 
@@ -1060,11 +1188,13 @@ def create_elective_block(
     payload: CreateElectiveBlockRequest,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
-    program = _get_program(db, payload.program_code)
-    year = _get_academic_year(db, int(payload.academic_year_number))
+    program = _get_program(db, payload.program_code, tenant_id=tenant_id)
+    year = _get_academic_year(db, int(payload.academic_year_number), tenant_id=tenant_id)
 
     block = ElectiveBlock(
+        tenant_id=tenant_id,
         program_id=program.id,
         academic_year_id=year.id,
         name=payload.name.strip(),
@@ -1087,8 +1217,10 @@ def get_elective_block(
     academic_year_number: int = Query(ge=1, le=4),
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
-    block = db.execute(select(ElectiveBlock).where(ElectiveBlock.id == block_id)).scalar_one_or_none()
+    q = where_tenant(select(ElectiveBlock).where(ElectiveBlock.id == block_id), ElectiveBlock, tenant_id)
+    block = db.execute(q).scalar_one_or_none()
     if block is None:
         raise HTTPException(status_code=404, detail="ELECTIVE_BLOCK_NOT_FOUND")
     return _build_elective_block_out(db, block=block, academic_year_number=academic_year_number)
@@ -1101,8 +1233,10 @@ def update_elective_block(
     academic_year_number: int = Query(ge=1, le=4),
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
-    block = db.execute(select(ElectiveBlock).where(ElectiveBlock.id == block_id)).scalar_one_or_none()
+    q = where_tenant(select(ElectiveBlock).where(ElectiveBlock.id == block_id), ElectiveBlock, tenant_id)
+    block = db.execute(q).scalar_one_or_none()
     if block is None:
         raise HTTPException(status_code=404, detail="ELECTIVE_BLOCK_NOT_FOUND")
 
@@ -1127,8 +1261,11 @@ def delete_elective_block(
     block_id: uuid.UUID,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
-    deleted = db.execute(delete(ElectiveBlock).where(ElectiveBlock.id == block_id)).rowcount or 0
+    stmt = delete(ElectiveBlock).where(ElectiveBlock.id == block_id)
+    stmt = where_tenant(stmt, ElectiveBlock, tenant_id)
+    deleted = db.execute(stmt).rowcount or 0
     db.commit()
     if deleted <= 0:
         raise HTTPException(status_code=404, detail="ELECTIVE_BLOCK_NOT_FOUND")
@@ -1141,12 +1278,15 @@ def upsert_elective_block_subject(
     payload: UpsertElectiveBlockSubjectRequest,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
-    block = db.execute(select(ElectiveBlock).where(ElectiveBlock.id == block_id)).scalar_one_or_none()
+    q_block = where_tenant(select(ElectiveBlock).where(ElectiveBlock.id == block_id), ElectiveBlock, tenant_id)
+    block = db.execute(q_block).scalar_one_or_none()
     if block is None:
         raise HTTPException(status_code=404, detail="ELECTIVE_BLOCK_NOT_FOUND")
 
-    subj = db.execute(select(Subject).where(Subject.id == payload.subject_id)).scalar_one_or_none()
+    q_subj = where_tenant(select(Subject).where(Subject.id == payload.subject_id), Subject, tenant_id)
+    subj = db.execute(q_subj).scalar_one_or_none()
     if subj is None:
         raise HTTPException(status_code=404, detail="SUBJECT_NOT_FOUND")
     if (
@@ -1157,48 +1297,58 @@ def upsert_elective_block_subject(
     if str(subj.subject_type) != "THEORY":
         raise HTTPException(status_code=422, detail="ELECTIVE_BLOCK_SUBJECT_MUST_BE_THEORY")
 
-    teacher = db.execute(select(Teacher).where(Teacher.id == payload.teacher_id)).scalar_one_or_none()
+    q_teacher = where_tenant(select(Teacher).where(Teacher.id == payload.teacher_id), Teacher, tenant_id)
+    teacher = db.execute(q_teacher).scalar_one_or_none()
     if teacher is None:
         raise HTTPException(status_code=404, detail="TEACHER_NOT_FOUND")
     if not bool(teacher.is_active):
         raise HTTPException(status_code=422, detail="TEACHER_INACTIVE")
 
-    dup = (
-        db.execute(
-            select(ElectiveBlockSubject.id)
-            .where(ElectiveBlockSubject.block_id == block_id)
-            .where(ElectiveBlockSubject.teacher_id == payload.teacher_id)
-            .where(ElectiveBlockSubject.subject_id != payload.subject_id)
-            .limit(1)
-        ).first()
+    q_dup = (
+        select(ElectiveBlockSubject.id)
+        .where(ElectiveBlockSubject.block_id == block_id)
+        .where(ElectiveBlockSubject.teacher_id == payload.teacher_id)
+        .where(ElectiveBlockSubject.subject_id != payload.subject_id)
+        .limit(1)
     )
+    q_dup = where_tenant(q_dup, ElectiveBlockSubject, tenant_id)
+    dup = db.execute(q_dup).first()
     if dup is not None:
         raise HTTPException(status_code=409, detail="DUPLICATE_TEACHER_IN_BLOCK")
 
     # If block already mapped to sections, require eligibility for all.
-    section_ids = [sid for (sid,) in db.execute(select(SectionElectiveBlock.section_id).where(SectionElectiveBlock.block_id == block_id)).all()]
+    q_sec_ids = select(SectionElectiveBlock.section_id).where(SectionElectiveBlock.block_id == block_id)
+    q_sec_ids = where_tenant(q_sec_ids, SectionElectiveBlock, tenant_id)
+    section_ids = [sid for (sid,) in db.execute(q_sec_ids).all()]
     if section_ids:
-        eligible_rows = db.execute(
+        eligible_q = (
             select(TeacherSubjectSection.section_id)
             .where(TeacherSubjectSection.teacher_id == payload.teacher_id)
             .where(TeacherSubjectSection.subject_id == payload.subject_id)
             .where(TeacherSubjectSection.section_id.in_(section_ids))
-        ).all()
+        )
+        eligible_q = where_tenant(eligible_q, TeacherSubjectSection, tenant_id)
+        eligible_rows = db.execute(eligible_q).all()
         eligible = {sid for (sid,) in eligible_rows}
         if any(sid not in eligible for sid in section_ids):
             raise HTTPException(status_code=422, detail="TEACHER_NOT_ELIGIBLE_FOR_ALL_SECTIONS")
 
-    existing = (
-        db.execute(
-            select(ElectiveBlockSubject)
-            .where(ElectiveBlockSubject.block_id == block_id)
-            .where(ElectiveBlockSubject.subject_id == payload.subject_id)
-        )
-        .scalars()
-        .first()
+    q_existing = (
+        select(ElectiveBlockSubject)
+        .where(ElectiveBlockSubject.block_id == block_id)
+        .where(ElectiveBlockSubject.subject_id == payload.subject_id)
     )
+    q_existing = where_tenant(q_existing, ElectiveBlockSubject, tenant_id)
+    existing = db.execute(q_existing).scalars().first()
     if existing is None:
-        db.add(ElectiveBlockSubject(block_id=block_id, subject_id=payload.subject_id, teacher_id=payload.teacher_id))
+        db.add(
+            ElectiveBlockSubject(
+                tenant_id=tenant_id,
+                block_id=block_id,
+                subject_id=payload.subject_id,
+                teacher_id=payload.teacher_id,
+            )
+        )
         try:
             db.commit()
         except IntegrityError:
@@ -1221,15 +1371,15 @@ def delete_elective_block_subject(
     subject_id: uuid.UUID,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
-    deleted = (
-        db.execute(
-            delete(ElectiveBlockSubject)
-            .where(ElectiveBlockSubject.block_id == block_id)
-            .where(ElectiveBlockSubject.subject_id == subject_id)
-        ).rowcount
-        or 0
+    stmt = (
+        delete(ElectiveBlockSubject)
+        .where(ElectiveBlockSubject.block_id == block_id)
+        .where(ElectiveBlockSubject.subject_id == subject_id)
     )
+    stmt = where_tenant(stmt, ElectiveBlockSubject, tenant_id)
+    deleted = db.execute(stmt).rowcount or 0
     db.commit()
     return AdminActionResult(ok=True, created=0, updated=0, deleted=int(deleted))
 
@@ -1240,13 +1390,19 @@ def set_elective_block_sections(
     payload: SetElectiveBlockSectionsRequest,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
-    block = db.execute(select(ElectiveBlock).where(ElectiveBlock.id == block_id)).scalar_one_or_none()
+    q_block = where_tenant(select(ElectiveBlock).where(ElectiveBlock.id == block_id), ElectiveBlock, tenant_id)
+    block = db.execute(q_block).scalar_one_or_none()
     if block is None:
         raise HTTPException(status_code=404, detail="ELECTIVE_BLOCK_NOT_FOUND")
 
     if payload.section_ids:
-        sections = db.execute(select(Section).where(Section.id.in_(payload.section_ids))).scalars().all()
+        sections = (
+            db.execute(where_tenant(select(Section).where(Section.id.in_(payload.section_ids)), Section, tenant_id))
+            .scalars()
+            .all()
+        )
         found = {s.id for s in sections}
         if len(found) != len(set(payload.section_ids)):
             raise HTTPException(status_code=404, detail="SECTION_NOT_FOUND")
@@ -1258,21 +1414,27 @@ def set_elective_block_sections(
                 raise HTTPException(status_code=422, detail="SECTION_OUT_OF_SCOPE")
 
     # Eligibility check for all current assignments across all target sections.
-    assignments = db.execute(select(ElectiveBlockSubject).where(ElectiveBlockSubject.block_id == block_id)).scalars().all()
+    q_assign = select(ElectiveBlockSubject).where(ElectiveBlockSubject.block_id == block_id)
+    q_assign = where_tenant(q_assign, ElectiveBlockSubject, tenant_id)
+    assignments = db.execute(q_assign).scalars().all()
     for a in assignments:
         if not payload.section_ids:
             continue
-        eligible_rows = db.execute(
+        eligible_q = (
             select(TeacherSubjectSection.section_id)
             .where(TeacherSubjectSection.teacher_id == a.teacher_id)
             .where(TeacherSubjectSection.subject_id == a.subject_id)
             .where(TeacherSubjectSection.section_id.in_(payload.section_ids))
-        ).all()
+        )
+        eligible_q = where_tenant(eligible_q, TeacherSubjectSection, tenant_id)
+        eligible_rows = db.execute(eligible_q).all()
         eligible = {sid for (sid,) in eligible_rows}
         if any(sid not in eligible for sid in payload.section_ids):
             raise HTTPException(status_code=422, detail="TEACHER_NOT_ELIGIBLE_FOR_ALL_SECTIONS")
 
-    current_rows = db.execute(select(SectionElectiveBlock.section_id).where(SectionElectiveBlock.block_id == block_id)).all()
+    q_current = select(SectionElectiveBlock.section_id).where(SectionElectiveBlock.block_id == block_id)
+    q_current = where_tenant(q_current, SectionElectiveBlock, tenant_id)
+    current_rows = db.execute(q_current).all()
     current_ids = {sid for (sid,) in current_rows}
     desired_ids = set(payload.section_ids)
 
@@ -1281,18 +1443,17 @@ def set_elective_block_sections(
 
     deleted = 0
     if to_remove:
-        deleted = (
-            db.execute(
-                delete(SectionElectiveBlock)
-                .where(SectionElectiveBlock.block_id == block_id)
-                .where(SectionElectiveBlock.section_id.in_(to_remove))
-            ).rowcount
-            or 0
+        stmt = (
+            delete(SectionElectiveBlock)
+            .where(SectionElectiveBlock.block_id == block_id)
+            .where(SectionElectiveBlock.section_id.in_(to_remove))
         )
+        stmt = where_tenant(stmt, SectionElectiveBlock, tenant_id)
+        deleted = db.execute(stmt).rowcount or 0
 
     created = 0
     for sid in to_add:
-        db.add(SectionElectiveBlock(section_id=sid, block_id=block_id))
+        db.add(SectionElectiveBlock(tenant_id=tenant_id, section_id=sid, block_id=block_id))
         created += 1
 
     db.commit()

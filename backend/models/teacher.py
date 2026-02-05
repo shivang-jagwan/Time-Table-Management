@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, Integer, String, Text
+from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.sql import func
 
@@ -13,7 +13,8 @@ class Teacher(Base):
     __tablename__ = "teachers"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    code = Column(Text, nullable=False, unique=True)
+    tenant_id = Column(UUID(as_uuid=True), nullable=False, index=True)
+    code = Column(Text, nullable=False)
     full_name = Column(Text, nullable=False)
 
     weekly_off_day = Column(Integer, nullable=True)
@@ -29,6 +30,7 @@ class Teacher(Base):
             "weekly_off_day is null or (weekly_off_day >= 0 and weekly_off_day <= 5)",
             name="ck_teachers_weekly_off_day_range",
         ),
+        UniqueConstraint("tenant_id", "code", name="uq_teachers_tenant_code"),
         CheckConstraint("max_per_day >= 0", name="ck_teachers_max_per_day"),
         CheckConstraint("max_per_week >= 0", name="ck_teachers_max_per_week"),
         CheckConstraint("max_continuous >= 1", name="ck_teachers_max_continuous"),

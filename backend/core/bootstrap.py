@@ -17,9 +17,18 @@ def _ensure_users_schema(conn) -> None:
     statements = [
         "CREATE EXTENSION IF NOT EXISTS pgcrypto;",
         """
+        CREATE TABLE IF NOT EXISTS tenants (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            slug VARCHAR(100) UNIQUE NOT NULL,
+            name VARCHAR(200) NOT NULL,
+            created_at TIMESTAMP DEFAULT now()
+        );
+        """,
+        """
         CREATE TABLE IF NOT EXISTS users (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            username VARCHAR(100) UNIQUE NOT NULL,
+            tenant_id UUID NULL,
+            username VARCHAR(100) NOT NULL,
             password_hash TEXT NOT NULL,
             role VARCHAR(20) DEFAULT 'ADMIN',
             is_active BOOLEAN DEFAULT TRUE,
@@ -27,6 +36,7 @@ def _ensure_users_schema(conn) -> None:
         );
         """,
         # Legacy compatibility: some DBs already have public.users with older columns.
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS tenant_id UUID;",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR(100);",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;",
@@ -42,8 +52,28 @@ def _ensure_users_schema(conn) -> None:
           END IF;
         END $$;
         """,
-        # Ensure we have a unique index for ON CONFLICT.
-        "CREATE UNIQUE INDEX IF NOT EXISTS ux_users_username ON users (username);",
+                # If an old bootstrap created a global-unique username index, drop it.
+                "DROP INDEX IF EXISTS ux_users_username;",
+                # Ensure we have tenant-aware uniqueness.
+                "CREATE INDEX IF NOT EXISTS ix_users_tenant_id ON users (tenant_id);",
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_users_username_shared ON users (lower(username)) WHERE tenant_id IS NULL;",
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_users_username_tenant ON users (tenant_id, lower(username)) WHERE tenant_id IS NOT NULL;",
+                # Best-effort FK (Postgres doesn't support IF NOT EXISTS for constraints).
+                """
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1
+                        FROM pg_constraint
+                        WHERE conname = 'fk_users_tenant_id'
+                    ) THEN
+                        ALTER TABLE users
+                        ADD CONSTRAINT fk_users_tenant_id
+                        FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+                        ON DELETE CASCADE;
+                    END IF;
+                END $$;
+                """,
     ]
 
     for s in statements:
@@ -56,10 +86,41 @@ def _seed_admin_if_configured(conn) -> None:
     if not username or not password:
         return
 
-    existing = conn.execute(
-        text("select 1 from users where lower(username) = lower(:u) limit 1"),
-        {"u": username},
-    ).first()
+    tenant_id = None
+    if settings.tenant_mode == "per_tenant":
+        # Ensure the default tenant exists.
+        row = conn.execute(
+            text("select id from tenants where slug = :s limit 1"),
+            {"s": "default"},
+        ).first()
+        if row is None:
+            row = conn.execute(
+                text(
+                    """
+                    insert into tenants (slug, name)
+                    values (:slug, :name)
+                    returning id
+                    """.strip()
+                ),
+                {"slug": "default", "name": "Default College"},
+            ).first()
+        tenant_id = row[0] if row is not None else None
+
+        existing = conn.execute(
+                text(
+                        """
+                        select 1
+                        from users
+                        where lower(username) = lower(:u)
+                            and (
+                                (:tid is null and tenant_id is null)
+                                or tenant_id = :tid
+                            )
+                        limit 1
+                        """.strip()
+                ),
+                {"u": username, "tid": tenant_id},
+        ).first()
     if existing is not None:
         return
 
@@ -81,35 +142,29 @@ def _seed_admin_if_configured(conn) -> None:
         is not None
     )
 
+    cols = ["username", "password_hash", "role", "is_active"]
+    vals = [":username", ":password_hash", "'ADMIN'", "true"]
+    params = {"username": username, "password_hash": password_hash}
+
+    if tenant_id is not None:
+        cols.insert(0, "tenant_id")
+        vals.insert(0, ":tenant_id")
+        params["tenant_id"] = tenant_id
+
     if has_name:
-        conn.execute(
-            text(
-                """
-                insert into users (name, username, password_hash, role, is_active)
-                values (:name, :username, :password_hash, 'ADMIN', true)
-                on conflict (username) do nothing
-                """.strip()
-            ),
-            {
-                "name": username,
-                "username": username,
-                "password_hash": password_hash,
-            },
-        )
-    else:
-        conn.execute(
-            text(
-                """
-                insert into users (username, password_hash, role, is_active)
-                values (:username, :password_hash, 'ADMIN', true)
-                on conflict (username) do nothing
-                """.strip()
-            ),
-            {
-                "username": username,
-                "password_hash": password_hash,
-            },
-        )
+        cols.insert(0, "name")
+        vals.insert(0, ":name")
+        params["name"] = username
+
+    conn.execute(
+        text(
+            f"""
+            insert into users ({', '.join(cols)})
+            values ({', '.join(vals)})
+            """.strip()
+        ),
+        params,
+    )
 
     logger.warning(
         "Seeded initial admin user from env (username=%r). Change the password after first login.",

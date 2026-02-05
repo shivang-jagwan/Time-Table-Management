@@ -3,11 +3,13 @@ from __future__ import annotations
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, select
+from sqlalchemy import func, select, cast
+from sqlalchemy.types import String
 from sqlalchemy.exc import OperationalError as SAOperationalError
 from sqlalchemy.orm import Session
 
-from api.deps import require_admin
+from api.deps import get_tenant_id, require_admin
+from api.tenant import get_by_id, where_tenant
 from core.config import settings
 from core.db import (
     DatabaseUnavailableError,
@@ -63,42 +65,43 @@ from schemas.solver import (
 from schemas.subject import SubjectOut
 from services.solver_validation import validate_prereqs
 from solver.cp_sat_solver import solve_program_global, solve_program_year
+from solver.capacity_analyzer import build_capacity_data, analyze_capacity
 
 
 router = APIRouter()
 
 
-def _required_subject_ids_for_section(db: Session, *, program_id: uuid.UUID, section: Section) -> list[uuid.UUID]:
+def _required_subject_ids_for_section(
+    db: Session,
+    *,
+    program_id: uuid.UUID,
+    section: Section,
+    tenant_id: uuid.UUID | None,
+) -> list[uuid.UUID]:
     # Explicit mapping overrides any curriculum inference.
-    mapped = (
-        db.execute(select(SectionSubject.subject_id).where(SectionSubject.section_id == section.id))
-        .scalars()
-        .all()
-    )
+    q_mapped = select(SectionSubject.subject_id).where(SectionSubject.section_id == section.id)
+    q_mapped = where_tenant(q_mapped, SectionSubject, tenant_id)
+    mapped = db.execute(q_mapped).scalars().all()
     if mapped:
         return list(mapped)
 
     # Track curriculum (+ elective selection)
-    track_rows = (
-        db.execute(
-            select(TrackSubject)
-            .where(TrackSubject.program_id == program_id)
-            .where(TrackSubject.academic_year_id == section.academic_year_id)
-            .where(TrackSubject.track == section.track)
-        )
-        .scalars()
-        .all()
+    q_track = (
+        select(TrackSubject)
+        .where(TrackSubject.program_id == program_id)
+        .where(TrackSubject.academic_year_id == section.academic_year_id)
+        .where(TrackSubject.track == section.track)
     )
+    q_track = where_tenant(q_track, TrackSubject, tenant_id)
+    track_rows = db.execute(q_track).scalars().all()
     mandatory = [r for r in track_rows if not r.is_elective]
     elective_options = [r for r in track_rows if r.is_elective]
 
     subject_ids: list[uuid.UUID] = [r.subject_id for r in mandatory]
     if elective_options:
-        sel = (
-            db.execute(select(SectionElective).where(SectionElective.section_id == section.id))
-            .scalars()
-            .first()
-        )
+        q_sel = select(SectionElective).where(SectionElective.section_id == section.id)
+        q_sel = where_tenant(q_sel, SectionElective, tenant_id)
+        sel = db.execute(q_sel).scalars().first()
         if sel is not None:
             subject_ids.append(sel.subject_id)
     return subject_ids
@@ -112,6 +115,7 @@ def _validate_fixed_entry_refs(
     teacher: Teacher,
     room: Room,
     slot: TimeSlot,
+    tenant_id: uuid.UUID | None,
     allow_special_room: bool = False,
 ) -> None:
     if subject.program_id != section.program_id:
@@ -128,15 +132,13 @@ def _validate_fixed_entry_refs(
         raise HTTPException(status_code=400, detail="ROOM_IS_SPECIAL")
 
     # Section must be working at this slot (time window).
-    w = (
-        db.execute(
-            select(SectionTimeWindow)
-            .where(SectionTimeWindow.section_id == section.id)
-            .where(SectionTimeWindow.day_of_week == int(slot.day_of_week))
-        )
-        .scalars()
-        .first()
+    q_w = (
+        select(SectionTimeWindow)
+        .where(SectionTimeWindow.section_id == section.id)
+        .where(SectionTimeWindow.day_of_week == int(slot.day_of_week))
     )
+    q_w = where_tenant(q_w, SectionTimeWindow, tenant_id)
+    w = db.execute(q_w).scalars().first()
     if w is None:
         raise HTTPException(status_code=400, detail="SLOT_OUTSIDE_SECTION_WINDOW")
     if int(slot.slot_index) < int(w.start_slot_index) or int(slot.slot_index) > int(w.end_slot_index):
@@ -149,12 +151,16 @@ def _validate_fixed_entry_refs(
     # Strict assignment: teacher must be assigned to (section, subject).
     assigned = (
         db.execute(
-            select(TeacherSubjectSection.id)
-            .where(TeacherSubjectSection.teacher_id == teacher.id)
-            .where(TeacherSubjectSection.subject_id == subject.id)
-            .where(TeacherSubjectSection.section_id == section.id)
-            .where(TeacherSubjectSection.is_active.is_(True))
-            .limit(1)
+            where_tenant(
+                select(TeacherSubjectSection.id)
+                .where(TeacherSubjectSection.teacher_id == teacher.id)
+                .where(TeacherSubjectSection.subject_id == subject.id)
+                .where(TeacherSubjectSection.section_id == section.id)
+                .where(TeacherSubjectSection.is_active.is_(True))
+                .limit(1),
+                TeacherSubjectSection,
+                tenant_id,
+            )
         ).first()
         is not None
     )
@@ -177,10 +183,14 @@ def _validate_fixed_entry_refs(
             si = int(slot.slot_index) + j
             exists = (
                 db.execute(
-                    select(TimeSlot.id)
-                    .where(TimeSlot.day_of_week == int(slot.day_of_week))
-                    .where(TimeSlot.slot_index == int(si))
-                    .limit(1)
+                    where_tenant(
+                        select(TimeSlot.id)
+                        .where(TimeSlot.day_of_week == int(slot.day_of_week))
+                        .where(TimeSlot.slot_index == int(si))
+                        .limit(1),
+                        TimeSlot,
+                        tenant_id,
+                    )
                 ).first()
                 is not None
             )
@@ -196,6 +206,7 @@ def _validate_special_allotment_refs(
     teacher: Teacher,
     room: Room,
     slot: TimeSlot,
+    tenant_id: uuid.UUID | None,
     existing_id: uuid.UUID | None = None,
 ) -> None:
     # Basic reference and feasibility checks are identical to fixed entries.
@@ -206,6 +217,7 @@ def _validate_special_allotment_refs(
         teacher=teacher,
         room=room,
         slot=slot,
+        tenant_id=tenant_id,
         allow_special_room=True,
     )
 
@@ -215,11 +227,19 @@ def _validate_special_allotment_refs(
     # Not supported: special locks for elective blocks (would need to lock the entire block).
     in_block = (
         db.execute(
-            select(SectionElectiveBlock.id)
-            .join(ElectiveBlockSubject, ElectiveBlockSubject.block_id == SectionElectiveBlock.block_id)
-            .where(SectionElectiveBlock.section_id == section.id)
-            .where(ElectiveBlockSubject.subject_id == subject.id)
-            .limit(1)
+            where_tenant(
+                where_tenant(
+                    select(SectionElectiveBlock.id)
+                    .join(ElectiveBlockSubject, ElectiveBlockSubject.block_id == SectionElectiveBlock.block_id)
+                    .where(SectionElectiveBlock.section_id == section.id)
+                    .where(ElectiveBlockSubject.subject_id == subject.id)
+                    .limit(1),
+                    SectionElectiveBlock,
+                    tenant_id,
+                ),
+                ElectiveBlockSubject,
+                tenant_id,
+            )
         ).first()
         is not None
     )
@@ -229,11 +249,19 @@ def _validate_special_allotment_refs(
     # Not supported: special locks for combined-class subjects.
     in_combined = (
         db.execute(
-            select(CombinedSubjectGroup.id)
-            .join(CombinedSubjectSection, CombinedSubjectSection.combined_group_id == CombinedSubjectGroup.id)
-            .where(CombinedSubjectGroup.subject_id == subject.id)
-            .where(CombinedSubjectSection.section_id == section.id)
-            .limit(1)
+            where_tenant(
+                where_tenant(
+                    select(CombinedSubjectGroup.id)
+                    .join(CombinedSubjectSection, CombinedSubjectSection.combined_group_id == CombinedSubjectGroup.id)
+                    .where(CombinedSubjectGroup.subject_id == subject.id)
+                    .where(CombinedSubjectSection.section_id == section.id)
+                    .limit(1),
+                    CombinedSubjectGroup,
+                    tenant_id,
+                ),
+                CombinedSubjectSection,
+                tenant_id,
+            )
         ).first()
         is not None
     )
@@ -243,11 +271,15 @@ def _validate_special_allotment_refs(
     # Disallow placing a special allotment where a fixed entry already exists.
     fixed_exists = (
         db.execute(
-            select(FixedTimetableEntry.id)
-            .where(FixedTimetableEntry.section_id == section.id)
-            .where(FixedTimetableEntry.slot_id == slot.id)
-            .where(FixedTimetableEntry.is_active.is_(True))
-            .limit(1)
+            where_tenant(
+                select(FixedTimetableEntry.id)
+                .where(FixedTimetableEntry.section_id == section.id)
+                .where(FixedTimetableEntry.slot_id == slot.id)
+                .where(FixedTimetableEntry.is_active.is_(True))
+                .limit(1),
+                FixedTimetableEntry,
+                tenant_id,
+            )
         ).first()
         is not None
     )
@@ -261,6 +293,7 @@ def _validate_special_allotment_refs(
         .where(SpecialAllotment.slot_id == slot.id)
         .where(SpecialAllotment.is_active.is_(True))
     )
+    q_teacher = where_tenant(q_teacher, SpecialAllotment, tenant_id)
     if existing_id is not None:
         q_teacher = q_teacher.where(SpecialAllotment.id != existing_id)
     if db.execute(q_teacher.limit(1)).first() is not None:
@@ -272,6 +305,7 @@ def _validate_special_allotment_refs(
         .where(SpecialAllotment.slot_id == slot.id)
         .where(SpecialAllotment.is_active.is_(True))
     )
+    q_room = where_tenant(q_room, SpecialAllotment, tenant_id)
     if existing_id is not None:
         q_room = q_room.where(SpecialAllotment.id != existing_id)
     if db.execute(q_room.limit(1)).first() is not None:
@@ -283,20 +317,19 @@ def list_required_subjects_for_section(
     section_id: uuid.UUID,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
-    section = db.get(Section, section_id)
+    section = get_by_id(db, Section, section_id, tenant_id)
     if section is None:
         raise HTTPException(status_code=404, detail="SECTION_NOT_FOUND")
 
-    subject_ids = _required_subject_ids_for_section(db, program_id=section.program_id, section=section)
+    subject_ids = _required_subject_ids_for_section(db, program_id=section.program_id, section=section, tenant_id=tenant_id)
     if not subject_ids:
         return []
 
-    subjects = (
-        db.execute(select(Subject).where(Subject.id.in_(subject_ids)).order_by(Subject.code.asc()))
-        .scalars()
-        .all()
-    )
+    q = select(Subject).where(Subject.id.in_(subject_ids))
+    q = where_tenant(q, Subject, tenant_id).order_by(Subject.code.asc())
+    subjects = db.execute(q).scalars().all()
     return subjects
 
 
@@ -306,21 +339,26 @@ def get_assigned_teacher(
     subject_id: uuid.UUID,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
     """Return the strictly assigned teacher for a section+subject (if any)."""
-    row = (
-        db.execute(
-            select(Teacher)
-            .join(TeacherSubjectSection, TeacherSubjectSection.teacher_id == Teacher.id)
-            .where(TeacherSubjectSection.section_id == section_id)
-            .where(TeacherSubjectSection.subject_id == subject_id)
-            .where(TeacherSubjectSection.is_active.is_(True))
-            .where(Teacher.is_active.is_(True))
-            .limit(1)
-        )
-        .scalars()
-        .first()
+    if get_by_id(db, Section, section_id, tenant_id) is None:
+        raise HTTPException(status_code=404, detail="SECTION_NOT_FOUND")
+    if get_by_id(db, Subject, subject_id, tenant_id) is None:
+        raise HTTPException(status_code=404, detail="SUBJECT_NOT_FOUND")
+
+    q = (
+        select(Teacher)
+        .join(TeacherSubjectSection, TeacherSubjectSection.teacher_id == Teacher.id)
+        .where(TeacherSubjectSection.section_id == section_id)
+        .where(TeacherSubjectSection.subject_id == subject_id)
+        .where(TeacherSubjectSection.is_active.is_(True))
+        .where(Teacher.is_active.is_(True))
+        .limit(1)
     )
+    q = where_tenant(q, TeacherSubjectSection, tenant_id)
+    q = where_tenant(q, Teacher, tenant_id)
+    row = db.execute(q).scalars().first()
     if row is None:
         raise HTTPException(status_code=404, detail="TEACHER_ASSIGNMENT_NOT_FOUND")
     return {
@@ -337,8 +375,9 @@ def list_fixed_entries(
     include_inactive: bool = Query(default=False),
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
-    section = db.get(Section, section_id)
+    section = get_by_id(db, Section, section_id, tenant_id)
     if section is None:
         raise HTTPException(status_code=404, detail="SECTION_NOT_FOUND")
 
@@ -351,6 +390,11 @@ def list_fixed_entries(
         .join(TimeSlot, TimeSlot.id == FixedTimetableEntry.slot_id)
         .where(FixedTimetableEntry.section_id == section_id)
     )
+    q = where_tenant(q, FixedTimetableEntry, tenant_id)
+    if tenant_id is None:
+        q = q.where(Section.tenant_id.is_(None), Subject.tenant_id.is_(None), Teacher.tenant_id.is_(None), Room.tenant_id.is_(None))
+    else:
+        q = q.where(Section.tenant_id == tenant_id, Subject.tenant_id == tenant_id, Teacher.tenant_id == tenant_id, Room.tenant_id == tenant_id)
     if not include_inactive:
         q = q.where(FixedTimetableEntry.is_active.is_(True))
     q = q.order_by(TimeSlot.day_of_week.asc(), TimeSlot.slot_index.asc())
@@ -392,56 +436,76 @@ def upsert_fixed_entry(
     payload: UpsertFixedTimetableEntryRequest,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
-    section = db.get(Section, payload.section_id)
+    section = get_by_id(db, Section, payload.section_id, tenant_id)
     if section is None:
         raise HTTPException(status_code=404, detail="SECTION_NOT_FOUND")
-    subject = db.get(Subject, payload.subject_id)
+    subject = get_by_id(db, Subject, payload.subject_id, tenant_id)
     if subject is None:
         raise HTTPException(status_code=404, detail="SUBJECT_NOT_FOUND")
-    teacher = db.get(Teacher, payload.teacher_id)
+    teacher = get_by_id(db, Teacher, payload.teacher_id, tenant_id)
     if teacher is None:
         raise HTTPException(status_code=404, detail="TEACHER_NOT_FOUND")
-    room = db.get(Room, payload.room_id)
+    room = get_by_id(db, Room, payload.room_id, tenant_id)
     if room is None:
         raise HTTPException(status_code=404, detail="ROOM_NOT_FOUND")
-    slot = db.get(TimeSlot, payload.slot_id)
+    slot = get_by_id(db, TimeSlot, payload.slot_id, tenant_id)
     if slot is None:
         raise HTTPException(status_code=404, detail="SLOT_NOT_FOUND")
 
-    allowed_subject_ids = set(_required_subject_ids_for_section(db, program_id=section.program_id, section=section))
+    allowed_subject_ids = set(
+        _required_subject_ids_for_section(db, program_id=section.program_id, section=section, tenant_id=tenant_id)
+    )
     if allowed_subject_ids and subject.id not in allowed_subject_ids:
         raise HTTPException(status_code=400, detail="SUBJECT_NOT_ALLOWED_FOR_SECTION")
 
     # Prevent a fixed entry from being placed where a special allotment already exists.
     special_exists = (
         db.execute(
-            select(SpecialAllotment.id)
-            .where(SpecialAllotment.section_id == payload.section_id)
-            .where(SpecialAllotment.slot_id == payload.slot_id)
-            .where(SpecialAllotment.is_active.is_(True))
-            .limit(1)
+            where_tenant(
+                select(SpecialAllotment.id)
+                .where(SpecialAllotment.section_id == payload.section_id)
+                .where(SpecialAllotment.slot_id == payload.slot_id)
+                .where(SpecialAllotment.is_active.is_(True))
+                .limit(1),
+                SpecialAllotment,
+                tenant_id,
+            )
         ).first()
         is not None
     )
     if special_exists:
         raise HTTPException(status_code=400, detail="SLOT_HAS_SPECIAL_ALLOTMENT")
 
-    _validate_fixed_entry_refs(db, section=section, subject=subject, teacher=teacher, room=room, slot=slot)
+    _validate_fixed_entry_refs(
+        db,
+        section=section,
+        subject=subject,
+        teacher=teacher,
+        room=room,
+        slot=slot,
+        tenant_id=tenant_id,
+    )
 
     # Upsert by (section, slot)
     existing = (
         db.execute(
-            select(FixedTimetableEntry)
-            .where(FixedTimetableEntry.section_id == payload.section_id)
-            .where(FixedTimetableEntry.slot_id == payload.slot_id)
-            .where(FixedTimetableEntry.is_active.is_(True))
+            where_tenant(
+                select(FixedTimetableEntry)
+                .where(FixedTimetableEntry.section_id == payload.section_id)
+                .where(FixedTimetableEntry.slot_id == payload.slot_id)
+                .where(FixedTimetableEntry.is_active.is_(True)),
+                FixedTimetableEntry,
+                tenant_id,
+            )
         )
         .scalars()
         .first()
     )
     if existing is None:
         existing = FixedTimetableEntry(
+            tenant_id=tenant_id,
             section_id=payload.section_id,
             subject_id=payload.subject_id,
             teacher_id=payload.teacher_id,
@@ -460,13 +524,17 @@ def upsert_fixed_entry(
     # Re-read via join for output.
     row = (
         db.execute(
-            select(FixedTimetableEntry, Section, Subject, Teacher, Room, TimeSlot)
-            .join(Section, Section.id == FixedTimetableEntry.section_id)
-            .join(Subject, Subject.id == FixedTimetableEntry.subject_id)
-            .join(Teacher, Teacher.id == FixedTimetableEntry.teacher_id)
-            .join(Room, Room.id == FixedTimetableEntry.room_id)
-            .join(TimeSlot, TimeSlot.id == FixedTimetableEntry.slot_id)
-            .where(FixedTimetableEntry.id == existing.id)
+            where_tenant(
+                select(FixedTimetableEntry, Section, Subject, Teacher, Room, TimeSlot)
+                .join(Section, Section.id == FixedTimetableEntry.section_id)
+                .join(Subject, Subject.id == FixedTimetableEntry.subject_id)
+                .join(Teacher, Teacher.id == FixedTimetableEntry.teacher_id)
+                .join(Room, Room.id == FixedTimetableEntry.room_id)
+                .join(TimeSlot, TimeSlot.id == FixedTimetableEntry.slot_id)
+                .where(FixedTimetableEntry.id == existing.id),
+                FixedTimetableEntry,
+                tenant_id,
+            )
         )
         .first()
     )
@@ -504,8 +572,9 @@ def delete_fixed_entry(
     entry_id: uuid.UUID,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
-    row = db.get(FixedTimetableEntry, entry_id)
+    row = get_by_id(db, FixedTimetableEntry, entry_id, tenant_id)
     if row is None:
         raise HTTPException(status_code=404, detail="FIXED_ENTRY_NOT_FOUND")
     row.is_active = False
@@ -519,8 +588,9 @@ def list_special_allotments(
     include_inactive: bool = Query(default=False),
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
-    section = db.get(Section, section_id)
+    section = get_by_id(db, Section, section_id, tenant_id)
     if section is None:
         raise HTTPException(status_code=404, detail="SECTION_NOT_FOUND")
 
@@ -533,6 +603,7 @@ def list_special_allotments(
         .join(TimeSlot, TimeSlot.id == SpecialAllotment.slot_id)
         .where(SpecialAllotment.section_id == section_id)
     )
+    q = where_tenant(q, SpecialAllotment, tenant_id)
     if not include_inactive:
         q = q.where(SpecialAllotment.is_active.is_(True))
     q = q.order_by(TimeSlot.day_of_week.asc(), TimeSlot.slot_index.asc())
@@ -575,36 +646,43 @@ def upsert_special_allotment(
     payload: UpsertSpecialAllotmentRequest,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
-    section = db.get(Section, payload.section_id)
+    section = get_by_id(db, Section, payload.section_id, tenant_id)
     if section is None:
         raise HTTPException(status_code=404, detail="SECTION_NOT_FOUND")
-    subject = db.get(Subject, payload.subject_id)
+    subject = get_by_id(db, Subject, payload.subject_id, tenant_id)
     if subject is None:
         raise HTTPException(status_code=404, detail="SUBJECT_NOT_FOUND")
-    teacher = db.get(Teacher, payload.teacher_id)
+    teacher = get_by_id(db, Teacher, payload.teacher_id, tenant_id)
     if teacher is None:
         raise HTTPException(status_code=404, detail="TEACHER_NOT_FOUND")
-    room = db.get(Room, payload.room_id)
+    room = get_by_id(db, Room, payload.room_id, tenant_id)
     if room is None:
         raise HTTPException(status_code=404, detail="ROOM_NOT_FOUND")
     if not bool(getattr(room, "is_special", False)):
         raise HTTPException(status_code=400, detail="SPECIAL_ALLOTMENT_ROOM_NOT_SPECIAL")
-    slot = db.get(TimeSlot, payload.slot_id)
+    slot = get_by_id(db, TimeSlot, payload.slot_id, tenant_id)
     if slot is None:
         raise HTTPException(status_code=404, detail="SLOT_NOT_FOUND")
 
-    allowed_subject_ids = set(_required_subject_ids_for_section(db, program_id=section.program_id, section=section))
+    allowed_subject_ids = set(
+        _required_subject_ids_for_section(db, program_id=section.program_id, section=section, tenant_id=tenant_id)
+    )
     if allowed_subject_ids and subject.id not in allowed_subject_ids:
         raise HTTPException(status_code=400, detail="SUBJECT_NOT_ALLOWED_FOR_SECTION")
 
     # Upsert by (section, slot)
     existing = (
         db.execute(
-            select(SpecialAllotment)
-            .where(SpecialAllotment.section_id == payload.section_id)
-            .where(SpecialAllotment.slot_id == payload.slot_id)
-            .where(SpecialAllotment.is_active.is_(True))
+            where_tenant(
+                select(SpecialAllotment)
+                .where(SpecialAllotment.section_id == payload.section_id)
+                .where(SpecialAllotment.slot_id == payload.slot_id)
+                .where(SpecialAllotment.is_active.is_(True)),
+                SpecialAllotment,
+                tenant_id,
+            )
         )
         .scalars()
         .first()
@@ -617,11 +695,13 @@ def upsert_special_allotment(
         teacher=teacher,
         room=room,
         slot=slot,
+        tenant_id=tenant_id,
         existing_id=existing.id if existing is not None else None,
     )
 
     if existing is None:
         existing = SpecialAllotment(
+            tenant_id=tenant_id,
             section_id=payload.section_id,
             subject_id=payload.subject_id,
             teacher_id=payload.teacher_id,
@@ -641,13 +721,17 @@ def upsert_special_allotment(
 
     row = (
         db.execute(
-            select(SpecialAllotment, Section, Subject, Teacher, Room, TimeSlot)
-            .join(Section, Section.id == SpecialAllotment.section_id)
-            .join(Subject, Subject.id == SpecialAllotment.subject_id)
-            .join(Teacher, Teacher.id == SpecialAllotment.teacher_id)
-            .join(Room, Room.id == SpecialAllotment.room_id)
-            .join(TimeSlot, TimeSlot.id == SpecialAllotment.slot_id)
-            .where(SpecialAllotment.id == existing.id)
+            where_tenant(
+                select(SpecialAllotment, Section, Subject, Teacher, Room, TimeSlot)
+                .join(Section, Section.id == SpecialAllotment.section_id)
+                .join(Subject, Subject.id == SpecialAllotment.subject_id)
+                .join(Teacher, Teacher.id == SpecialAllotment.teacher_id)
+                .join(Room, Room.id == SpecialAllotment.room_id)
+                .join(TimeSlot, TimeSlot.id == SpecialAllotment.slot_id)
+                .where(SpecialAllotment.id == existing.id),
+                SpecialAllotment,
+                tenant_id,
+            )
         )
         .first()
     )
@@ -686,8 +770,9 @@ def delete_special_allotment(
     entry_id: uuid.UUID,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
-    row = db.get(SpecialAllotment, entry_id)
+    row = get_by_id(db, SpecialAllotment, entry_id, tenant_id)
     if row is None:
         raise HTTPException(status_code=404, detail="SPECIAL_ALLOTMENT_NOT_FOUND")
     row.is_active = False
@@ -695,8 +780,10 @@ def delete_special_allotment(
     return {"ok": True}
 
 
-def _get_academic_year(db: Session, year_number: int) -> AcademicYear:
-    ay = db.execute(select(AcademicYear).where(AcademicYear.year_number == int(year_number))).scalar_one_or_none()
+def _get_academic_year(db: Session, year_number: int, *, tenant_id: uuid.UUID | None) -> AcademicYear:
+    q = select(AcademicYear).where(AcademicYear.year_number == int(year_number))
+    q = where_tenant(q, AcademicYear, tenant_id)
+    ay = db.execute(q).scalar_one_or_none()
     if ay is None:
         raise HTTPException(status_code=404, detail="ACADEMIC_YEAR_NOT_FOUND")
     return ay
@@ -706,9 +793,10 @@ def _get_academic_year(db: Session, year_number: int) -> AcademicYear:
 def list_time_slots(
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
     slots = (
-        db.execute(select(TimeSlot).order_by(TimeSlot.day_of_week.asc(), TimeSlot.slot_index.asc()))
+        db.execute(where_tenant(select(TimeSlot), TimeSlot, tenant_id).order_by(TimeSlot.day_of_week.asc(), TimeSlot.slot_index.asc()))
         .scalars()
         .all()
     )
@@ -733,12 +821,10 @@ def list_runs(
     limit: int = Query(default=50, ge=1, le=200),
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
-    rows = (
-        db.execute(select(TimetableRun).order_by(TimetableRun.created_at.desc()).limit(limit))
-        .scalars()
-        .all()
-    )
+    q_runs = where_tenant(select(TimetableRun), TimetableRun, tenant_id).order_by(TimetableRun.created_at.desc()).limit(limit)
+    rows = db.execute(q_runs).scalars().all()
 
     runs: list[RunSummary] = []
     for r in rows:
@@ -767,18 +853,25 @@ def get_run(
     run_id: uuid.UUID,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
-    run = db.execute(select(TimetableRun).where(TimetableRun.id == run_id)).scalar_one_or_none()
+    run = get_by_id(db, TimetableRun, run_id, tenant_id)
     if run is None:
         raise HTTPException(status_code=404, detail="RUN_NOT_FOUND")
 
-    conflicts_total = (
-        db.execute(select(func.count(TimetableConflict.id)).where(TimetableConflict.run_id == run_id)).scalar_one()
-        or 0
+    q_conflicts_total = where_tenant(
+        select(func.count(TimetableConflict.id)).where(TimetableConflict.run_id == run_id),
+        TimetableConflict,
+        tenant_id,
     )
-    entries_total = (
-        db.execute(select(func.count(TimetableEntry.id)).where(TimetableEntry.run_id == run_id)).scalar_one() or 0
+    conflicts_total = db.execute(q_conflicts_total).scalar_one() or 0
+
+    q_entries_total = where_tenant(
+        select(func.count(TimetableEntry.id)).where(TimetableEntry.run_id == run_id),
+        TimetableEntry,
+        tenant_id,
     )
+    entries_total = db.execute(q_entries_total).scalar_one() or 0
 
     return RunDetail(
         id=run.id,
@@ -798,12 +891,13 @@ def list_run_conflicts(
     run_id: uuid.UUID,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
-    run = db.execute(select(TimetableRun.id).where(TimetableRun.id == run_id)).first()
+    run = get_by_id(db, TimetableRun, run_id, tenant_id)
     if run is None:
         raise HTTPException(status_code=404, detail="RUN_NOT_FOUND")
 
-    rows = db.execute(
+    q = (
         select(TimetableConflict, Section, Subject, Teacher, Room, TimeSlot)
         .outerjoin(Section, Section.id == TimetableConflict.section_id)
         .outerjoin(Teacher, Teacher.id == TimetableConflict.teacher_id)
@@ -812,7 +906,9 @@ def list_run_conflicts(
         .outerjoin(TimeSlot, TimeSlot.id == TimetableConflict.slot_id)
         .where(TimetableConflict.run_id == run_id)
         .order_by(TimetableConflict.created_at.asc())
-    ).all()
+    )
+    q = where_tenant(q, TimetableConflict, tenant_id)
+    rows = db.execute(q).all()
 
     return ListRunConflictsResponse(
         run_id=run_id,
@@ -891,8 +987,9 @@ def list_run_entries(
     section_code: str | None = Query(default=None),
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
-    run = db.execute(select(TimetableRun).where(TimetableRun.id == run_id)).scalar_one_or_none()
+    run = get_by_id(db, TimetableRun, run_id, tenant_id)
     if run is None:
         raise HTTPException(status_code=404, detail="RUN_NOT_FOUND")
 
@@ -903,19 +1000,21 @@ def list_run_entries(
         academic_year_number = params.get("academic_year_number")
         if not program_code:
             raise HTTPException(status_code=422, detail="RUN_MISSING_PARAMETERS")
-        program = db.execute(select(Program).where(Program.code == program_code)).scalar_one_or_none()
+        q_program = where_tenant(select(Program).where(Program.code == program_code), Program, tenant_id)
+        program = db.execute(q_program).scalar_one_or_none()
         if program is None:
             raise HTTPException(status_code=422, detail="RUN_PROGRAM_NOT_FOUND")
 
         year_id: uuid.UUID | None = None
         if academic_year_number is not None:
-            year_id = _get_academic_year(db, int(academic_year_number)).id
+            year_id = _get_academic_year(db, int(academic_year_number), tenant_id=tenant_id).id
         elif getattr(run, "academic_year_id", None) is not None:
             year_id = run.academic_year_id
 
         q_section = select(Section).where(Section.program_id == program.id).where(Section.code == section_code)
         if year_id is not None:
             q_section = q_section.where(Section.academic_year_id == year_id)
+        q_section = where_tenant(q_section, Section, tenant_id)
         section = db.execute(q_section.order_by(Section.created_at.desc())).scalars().first()
         if section is None:
             raise HTTPException(status_code=404, detail="SECTION_NOT_FOUND")
@@ -931,6 +1030,7 @@ def list_run_entries(
         .outerjoin(ElectiveBlock, ElectiveBlock.id == TimetableEntry.elective_block_id)
         .where(TimetableEntry.run_id == run_id)
     )
+    q = where_tenant(q, TimetableEntry, tenant_id)
     if section_id_filter is not None:
         q = q.where(TimetableEntry.section_id == section_id_filter)
 
@@ -977,14 +1077,16 @@ def generate_timetable(
     payload: GenerateTimetableRequest,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
     try:
         # Explicit connectivity validation before creating any rows.
         validate_db_connection(db)
 
-        ay = _get_academic_year(db, int(payload.academic_year_number))
+        ay = _get_academic_year(db, int(payload.academic_year_number), tenant_id=tenant_id)
 
         run = TimetableRun(
+            tenant_id=tenant_id,
             academic_year_id=ay.id,
             seed=payload.seed,
             status="CREATED",
@@ -992,12 +1094,13 @@ def generate_timetable(
                 "program_code": payload.program_code,
                 "academic_year_number": payload.academic_year_number,
                 "scope": "ACADEMIC_YEAR",
+                **({"tenant_id": str(tenant_id)} if tenant_id is not None else {}),
             },
         )
         db.add(run)
         db.flush()  # assign run.id
 
-        program = db.execute(select(Program).where(Program.code == payload.program_code)).scalar_one_or_none()
+        program = db.execute(where_tenant(select(Program).where(Program.code == payload.program_code), Program, tenant_id)).scalar_one_or_none()
         if program is None:
             run.status = "VALIDATION_FAILED"
             db.commit()
@@ -1012,17 +1115,14 @@ def generate_timetable(
                 ],
             )
 
-        sections = (
-            db.execute(
-                select(Section)
-                .where(Section.program_id == program.id)
-                .where(Section.academic_year_id == ay.id)
-                .where(Section.is_active.is_(True))
-                .order_by(Section.code)
-            )
-            .scalars()
-            .all()
+        q_sections = (
+            select(Section)
+            .where(Section.program_id == program.id)
+            .where(Section.academic_year_id == ay.id)
+            .where(Section.is_active.is_(True))
         )
+        q_sections = where_tenant(q_sections, Section, tenant_id).order_by(Section.code)
+        sections = db.execute(q_sections).scalars().all()
         if not sections:
             run.status = "VALIDATION_FAILED"
             db.commit()
@@ -1062,8 +1162,8 @@ def generate_timetable(
                         subject_id=c.subject_id,
                         room_id=c.room_id,
                         slot_id=c.slot_id,
-                        details=(c.details_json or c.metadata_json or {}),
-                        metadata=(c.metadata_json or c.details_json or {}),
+                        details=(c.metadata or {}),
+                        metadata=(c.metadata or {}),
                     )
                     for c in conflicts
                 ],
@@ -1085,7 +1185,7 @@ def generate_timetable(
                     subject_id=c.subject_id,
                     room_id=c.room_id,
                     slot_id=c.slot_id,
-                    metadata=(c.metadata_json or c.details_json or {}),
+                    metadata=(c.metadata or {}),
                 )
                 for c in warnings
             ],
@@ -1106,6 +1206,7 @@ def generate_timetable_global(
     payload: GenerateGlobalTimetableRequest,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
     """Program-wide generate endpoint.
 
@@ -1115,18 +1216,21 @@ def generate_timetable_global(
         validate_db_connection(db)
 
         run = TimetableRun(
+            tenant_id=tenant_id,
             academic_year_id=None,
             seed=payload.seed,
             status="CREATED",
             parameters={
                 "program_code": payload.program_code,
                 "scope": "PROGRAM_GLOBAL",
+                **({"tenant_id": str(tenant_id)} if tenant_id is not None else {}),
             },
         )
         db.add(run)
         db.flush()
 
-        program = db.execute(select(Program).where(Program.code == payload.program_code)).scalar_one_or_none()
+        q_program = where_tenant(select(Program).where(Program.code == payload.program_code), Program, tenant_id)
+        program = db.execute(q_program).scalar_one_or_none()
         if program is None:
             run.status = "VALIDATION_FAILED"
             db.commit()
@@ -1141,16 +1245,9 @@ def generate_timetable_global(
                 ],
             )
 
-        sections = (
-            db.execute(
-                select(Section)
-                .where(Section.program_id == program.id)
-                .where(Section.is_active.is_(True))
-                .order_by(Section.code)
-            )
-            .scalars()
-            .all()
-        )
+        q_sections = select(Section).where(Section.program_id == program.id).where(Section.is_active.is_(True))
+        q_sections = where_tenant(q_sections, Section, tenant_id).order_by(Section.code)
+        sections = db.execute(q_sections).scalars().all()
         if not sections:
             run.status = "VALIDATION_FAILED"
             db.commit()
@@ -1195,8 +1292,8 @@ def generate_timetable_global(
                         subject_id=c.subject_id,
                         room_id=c.room_id,
                         slot_id=c.slot_id,
-                        details=(c.details_json or c.metadata_json or {}),
-                        metadata=(c.metadata_json or c.details_json or {}),
+                        details=(c.metadata or {}),
+                        metadata=(c.metadata or {}),
                     )
                     for c in conflicts
                 ],
@@ -1217,7 +1314,7 @@ def generate_timetable_global(
                     subject_id=c.subject_id,
                     room_id=c.room_id,
                     slot_id=c.slot_id,
-                    metadata=(c.metadata_json or c.details_json or {}),
+                    metadata=(c.metadata or {}),
                 )
                 for c in warnings
             ],
@@ -1238,6 +1335,7 @@ def solve_timetable(
     payload: SolveTimetableRequest,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
     try:
         max_time_seconds = float(payload.max_time_seconds)
@@ -1247,9 +1345,10 @@ def solve_timetable(
         # Explicit connectivity validation before creating any rows.
         validate_db_connection(db)
 
-        ay = _get_academic_year(db, int(payload.academic_year_number))
+        ay = _get_academic_year(db, int(payload.academic_year_number), tenant_id=tenant_id)
 
         run = TimetableRun(
+            tenant_id=tenant_id,
             academic_year_id=ay.id,
             seed=payload.seed,
             status="CREATED",
@@ -1260,12 +1359,14 @@ def solve_timetable(
                 "relax_teacher_load_limits": payload.relax_teacher_load_limits,
                 "require_optimal": payload.require_optimal,
                 "scope": "ACADEMIC_YEAR",
+                **({"tenant_id": str(tenant_id)} if tenant_id is not None else {}),
             },
         )
         db.add(run)
         db.flush()
 
-        program = db.execute(select(Program).where(Program.code == payload.program_code)).scalar_one_or_none()
+        q_program = where_tenant(select(Program).where(Program.code == payload.program_code), Program, tenant_id)
+        program = db.execute(q_program).scalar_one_or_none()
         if program is None:
             run.status = "VALIDATION_FAILED"
             db.commit()
@@ -1280,17 +1381,14 @@ def solve_timetable(
                 ],
             )
 
-        sections = (
-            db.execute(
-                select(Section)
-                .where(Section.program_id == program.id)
-                .where(Section.academic_year_id == ay.id)
-                .where(Section.is_active.is_(True))
-                .order_by(Section.code)
-            )
-            .scalars()
-            .all()
+        q_sections = (
+            select(Section)
+            .where(Section.program_id == program.id)
+            .where(Section.academic_year_id == ay.id)
+            .where(Section.is_active.is_(True))
         )
+        q_sections = where_tenant(q_sections, Section, tenant_id).order_by(Section.code)
+        sections = db.execute(q_sections).scalars().all()
         if not sections:
             run.status = "VALIDATION_FAILED"
             db.commit()
@@ -1330,12 +1428,66 @@ def solve_timetable(
                         subject_id=c.subject_id,
                         room_id=c.room_id,
                         slot_id=c.slot_id,
-                        details=(c.details_json or c.metadata_json or {}),
-                        metadata=(c.metadata_json or c.details_json or {}),
+                        details=(c.metadata or {}),
+                        metadata=(c.metadata or {}),
                     )
                     for c in conflicts
                 ],
             )
+
+        # Pre-solve capacity analysis and bottleneck reporting
+        cap_data = build_capacity_data(
+            db,
+            program_id=program.id,
+            academic_year_id=ay.id,
+            sections=sections,
+            tenant_id=tenant_id,
+        )
+        cap = analyze_capacity(cap_data, debug=getattr(payload, "debug_capacity_mode", False))
+        capacity_diagnostics = ([{"type": "CAPACITY_SUMMARY", "data": cap.get("summary", {})}] if cap.get("debug") else [])
+
+        issue_types = {i.get("type") for i in cap.get("issues", [])}
+        only_teacher_overload = bool(issue_types) and issue_types.issubset({"CAPACITY_OVERLOAD"})
+
+        if cap.get("issues") and not payload.relax_teacher_load_limits and not (
+            getattr(payload, "smart_relaxation", False) and only_teacher_overload
+        ):
+            run.status = "VALIDATION_FAILED"
+            db.commit()
+            return SolveTimetableResponse(
+                run_id=run.id,
+                status="FAILED_VALIDATION",
+                reason_summary=f"Capacity analysis found {len(cap['issues'])} blocking shortages",
+                diagnostics=capacity_diagnostics,
+                minimal_relaxation=cap.get("minimal_relaxation", []),
+                conflicts=[
+                    SolverConflict(
+                        severity="ERROR",
+                        conflict_type=i.get("type") or "CAPACITY",
+                        message=f"{i.get('resource')}: required={i.get('required_slots')} available={i.get('available_slots')} shortage={i.get('shortage')}",
+                        details={k: v for k, v in i.items() if k not in {"type", "required_slots", "available_slots", "shortage", "resource"}},
+                        metadata={k: v for k, v in i.items() if k not in {"type"}},
+                    )
+                    for i in cap.get("issues", [])
+                ],
+            )
+
+        # Smart relaxation: auto-relax teacher loads when only teacher capacity issues
+        auto_relaxed = False
+        if getattr(payload, "smart_relaxation", False) and only_teacher_overload:
+            payload.relax_teacher_load_limits = True
+            auto_relaxed = True
+            db.add(
+                TimetableConflict(
+                    tenant_id=tenant_id,
+                    run_id=run.id,
+                    severity="WARN",
+                    conflict_type="SMART_RELAXATION_APPLIED",
+                    message="Auto-relaxed teacher load limits to address capacity shortages.",
+                    metadata_json={"minimal_relaxation": cap.get("minimal_relaxation", [])},
+                )
+            )
+            db.flush()
 
         if payload.relax_teacher_load_limits:
             # Persist an explicit warning so runs are auditable.
@@ -1343,6 +1495,7 @@ def solve_timetable(
 
             db.add(
                 TimetableConflict(
+                    tenant_id=tenant_id,
                     run_id=run.id,
                     severity="WARN",
                     conflict_type="RELAXED_TEACHER_LOAD_LIMITS",
@@ -1366,24 +1519,22 @@ def solve_timetable(
         # Soft conflicts (warnings) created during solve (e.g., room assignment conflicts).
         soft_conflicts: list[TimetableConflict] = []
         if str(result.status) in {"FEASIBLE", "OPTIMAL"}:
-            soft_conflicts = (
-                db.execute(
-                    select(TimetableConflict)
-                    .where(TimetableConflict.run_id == run.id)
-                    .where(func.upper(TimetableConflict.severity) == "WARN")
-                    .order_by(TimetableConflict.created_at.asc())
-                    .limit(200)
-                )
-                .scalars()
-                .all()
+            q_soft = (
+                select(TimetableConflict)
+                .where(TimetableConflict.run_id == run.id)
+                .where(TimetableConflict.severity == "WARN")
+                .order_by(TimetableConflict.created_at.asc())
+                .limit(200)
             )
+            q_soft = where_tenant(q_soft, TimetableConflict, tenant_id)
+            soft_conflicts = db.execute(q_soft).scalars().all()
 
         return SolveTimetableResponse(
             run_id=run.id,
             status=result.status,
             entries_written=result.entries_written,
             reason_summary=getattr(result, "reason_summary", None),
-            diagnostics=getattr(result, "diagnostics", []) or [],
+            diagnostics=(capacity_diagnostics + (getattr(result, "diagnostics", []) or [])),
             objective_score=getattr(result, "objective_score", None),
             improvements_possible=True
             if str(result.status) in {"FEASIBLE", "SUBOPTIMAL"}
@@ -1401,8 +1552,8 @@ def solve_timetable(
                         subject_id=c.subject_id,
                         room_id=c.room_id,
                         slot_id=c.slot_id,
-                        details=(c.details_json or c.metadata_json or {}),
-                        metadata=(c.metadata_json or c.details_json or {}),
+                        details=(c.metadata or {}),
+                        metadata=(c.metadata or {}),
                     )
                     for c in warnings
                 ]
@@ -1456,6 +1607,7 @@ def solve_timetable_global(
     payload: SolveGlobalTimetableRequest,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
     """Program-wide solve endpoint.
 
@@ -1469,6 +1621,7 @@ def solve_timetable_global(
         validate_db_connection(db)
 
         run = TimetableRun(
+            tenant_id=tenant_id,
             academic_year_id=None,
             seed=payload.seed,
             status="CREATED",
@@ -1478,12 +1631,14 @@ def solve_timetable_global(
                 "relax_teacher_load_limits": payload.relax_teacher_load_limits,
                 "require_optimal": payload.require_optimal,
                 "scope": "PROGRAM_GLOBAL",
+                **({"tenant_id": str(tenant_id)} if tenant_id is not None else {}),
             },
         )
         db.add(run)
         db.flush()
 
-        program = db.execute(select(Program).where(Program.code == payload.program_code)).scalar_one_or_none()
+        q_program = where_tenant(select(Program).where(Program.code == payload.program_code), Program, tenant_id)
+        program = db.execute(q_program).scalar_one_or_none()
         if program is None:
             run.status = "VALIDATION_FAILED"
             db.commit()
@@ -1498,16 +1653,9 @@ def solve_timetable_global(
                 ],
             )
 
-        sections = (
-            db.execute(
-                select(Section)
-                .where(Section.program_id == program.id)
-                .where(Section.is_active.is_(True))
-                .order_by(Section.code)
-            )
-            .scalars()
-            .all()
-        )
+        q_sections = select(Section).where(Section.program_id == program.id).where(Section.is_active.is_(True))
+        q_sections = where_tenant(q_sections, Section, tenant_id).order_by(Section.code)
+        sections = db.execute(q_sections).scalars().all()
         if not sections:
             run.status = "VALIDATION_FAILED"
             db.commit()
@@ -1552,16 +1700,71 @@ def solve_timetable_global(
                         subject_id=c.subject_id,
                         room_id=c.room_id,
                         slot_id=c.slot_id,
-                        details=(c.details_json or c.metadata_json or {}),
-                        metadata=(c.metadata_json or c.details_json or {}),
+                        details=(c.metadata or {}),
+                        metadata=(c.metadata or {}),
                     )
                     for c in conflicts
                 ],
             )
 
+        # Pre-solve capacity analysis and bottleneck reporting (global)
+        cap_data = build_capacity_data(
+            db,
+            program_id=program.id,
+            academic_year_id=None,
+            sections=sections,
+            tenant_id=tenant_id,
+        )
+        cap = analyze_capacity(cap_data, debug=getattr(payload, "debug_capacity_mode", False))
+        capacity_diagnostics = ([{"type": "CAPACITY_SUMMARY", "data": cap.get("summary", {})}] if cap.get("debug") else [])
+
+        issue_types = {i.get("type") for i in cap.get("issues", [])}
+        only_teacher_overload = bool(issue_types) and issue_types.issubset({"CAPACITY_OVERLOAD"})
+
+        if cap.get("issues") and not payload.relax_teacher_load_limits and not (
+            getattr(payload, "smart_relaxation", False) and only_teacher_overload
+        ):
+            run.status = "VALIDATION_FAILED"
+            db.commit()
+            return SolveTimetableResponse(
+                run_id=run.id,
+                status="FAILED_VALIDATION",
+                reason_summary=f"Capacity analysis found {len(cap['issues'])} blocking shortages",
+                diagnostics=capacity_diagnostics,
+                minimal_relaxation=cap.get("minimal_relaxation", []),
+                conflicts=[
+                    SolverConflict(
+                        severity="ERROR",
+                        conflict_type=i.get("type") or "CAPACITY",
+                        message=f"{i.get('resource')}: required={i.get('required_slots')} available={i.get('available_slots')} shortage={i.get('shortage')}",
+                        details={k: v for k, v in i.items() if k not in {"type", "required_slots", "available_slots", "shortage", "resource"}},
+                        metadata={k: v for k, v in i.items() if k not in {"type"}},
+                    )
+                    for i in cap.get("issues", [])
+                ],
+            )
+
+        # Smart relaxation: auto-relax teacher loads when only teacher capacity issues
+        auto_relaxed = False
+        if getattr(payload, "smart_relaxation", False) and only_teacher_overload:
+            payload.relax_teacher_load_limits = True
+            auto_relaxed = True
+            db.add(
+                TimetableConflict(
+                    tenant_id=tenant_id,
+                    run_id=run.id,
+                    severity="WARN",
+                    conflict_type="SMART_RELAXATION_APPLIED",
+                    message="Auto-relaxed teacher load limits to address capacity shortages.",
+                    metadata_json={"minimal_relaxation": cap.get("minimal_relaxation", [])},
+                )
+            )
+            db.flush()
+
         if payload.relax_teacher_load_limits:
             db.add(
                 TimetableConflict(
+                    tenant_id=tenant_id,
                     run_id=run.id,
                     severity="WARN",
                     conflict_type="RELAXED_TEACHER_LOAD_LIMITS",
@@ -1583,24 +1786,22 @@ def solve_timetable_global(
 
         soft_conflicts: list[TimetableConflict] = []
         if str(result.status) in {"FEASIBLE", "OPTIMAL"}:
-            soft_conflicts = (
-                db.execute(
-                    select(TimetableConflict)
-                    .where(TimetableConflict.run_id == run.id)
-                    .where(func.upper(TimetableConflict.severity) == "WARN")
-                    .order_by(TimetableConflict.created_at.asc())
-                    .limit(200)
-                )
-                .scalars()
-                .all()
+            q_soft = (
+                select(TimetableConflict)
+                .where(TimetableConflict.run_id == run.id)
+                .where(TimetableConflict.severity == "WARN")
+                .order_by(TimetableConflict.created_at.asc())
+                .limit(200)
             )
+            q_soft = where_tenant(q_soft, TimetableConflict, tenant_id)
+            soft_conflicts = db.execute(q_soft).scalars().all()
 
         return SolveTimetableResponse(
             run_id=run.id,
             status=result.status,
             entries_written=result.entries_written,
             reason_summary=getattr(result, "reason_summary", None),
-            diagnostics=getattr(result, "diagnostics", []) or [],
+            diagnostics=(capacity_diagnostics + (getattr(result, "diagnostics", []) or [])),
             objective_score=getattr(result, "objective_score", None),
             improvements_possible=True if str(result.status) == "FEASIBLE" else (False if str(result.status) == "OPTIMAL" else None),
             warnings=getattr(result, "warnings", []) or [],
@@ -1616,8 +1817,8 @@ def solve_timetable_global(
                         subject_id=c.subject_id,
                         room_id=c.room_id,
                         slot_id=c.slot_id,
-                        details=(c.details_json or c.metadata_json or {}),
-                        metadata=(c.metadata_json or c.details_json or {}),
+                        details=(c.metadata or {}),
+                        metadata=(c.metadata or {}),
                     )
                     for c in warnings
                 ]

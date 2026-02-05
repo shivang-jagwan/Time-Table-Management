@@ -7,7 +7,8 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from api.deps import require_admin
+from api.deps import get_tenant_id, require_admin
+from api.tenant import get_by_id, where_tenant
 from core.db import get_db
 from models.academic_year import AcademicYear
 from models.program import Program
@@ -19,31 +20,40 @@ from schemas.curriculum import TrackSubjectCreate, TrackSubjectOut, TrackSubject
 router = APIRouter()
 
 
-def _get_program(db: Session, program_code: str) -> Program:
-    program = db.execute(select(Program).where(Program.code == program_code)).scalar_one_or_none()
+def _get_program(db: Session, program_code: str, *, tenant_id: uuid.UUID | None) -> Program:
+    q = select(Program).where(Program.code == program_code)
+    q = where_tenant(q, Program, tenant_id)
+    program = db.execute(q).scalar_one_or_none()
     if program is None:
         raise HTTPException(status_code=404, detail="PROGRAM_NOT_FOUND")
     return program
 
 
-def _get_academic_year(db: Session, year_number: int) -> AcademicYear:
-    ay = db.execute(select(AcademicYear).where(AcademicYear.year_number == int(year_number))).scalar_one_or_none()
+def _get_academic_year(db: Session, year_number: int, *, tenant_id: uuid.UUID | None) -> AcademicYear:
+    q = select(AcademicYear).where(AcademicYear.year_number == int(year_number))
+    q = where_tenant(q, AcademicYear, tenant_id)
+    ay = db.execute(q).scalar_one_or_none()
     if ay is None:
         raise HTTPException(status_code=404, detail="ACADEMIC_YEAR_NOT_FOUND")
     return ay
 
 
-def _get_subject(db: Session, program_id: uuid.UUID, academic_year_id: uuid.UUID, subject_code: str) -> Subject:
-    subject = (
-        db.execute(
-            select(Subject)
-            .where(Subject.program_id == program_id)
-            .where(Subject.academic_year_id == academic_year_id)
-            .where(Subject.code == subject_code)
-        )
-        .scalars()
-        .first()
+def _get_subject(
+    db: Session,
+    program_id: uuid.UUID,
+    academic_year_id: uuid.UUID,
+    subject_code: str,
+    *,
+    tenant_id: uuid.UUID | None,
+) -> Subject:
+    q = (
+        select(Subject)
+        .where(Subject.program_id == program_id)
+        .where(Subject.academic_year_id == academic_year_id)
+        .where(Subject.code == subject_code)
     )
+    q = where_tenant(q, Subject, tenant_id)
+    subject = db.execute(q).scalars().first()
     if subject is None:
         raise HTTPException(status_code=404, detail="SUBJECT_NOT_FOUND")
     return subject
@@ -55,19 +65,18 @@ def list_track_subjects(
     academic_year_number: int = Query(ge=1, le=4),
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> list[TrackSubjectOut]:
-    program = _get_program(db, program_code)
-    ay = _get_academic_year(db, int(academic_year_number))
-    rows = (
-        db.execute(
-            select(TrackSubject)
-            .where(TrackSubject.program_id == program.id)
-            .where(TrackSubject.academic_year_id == ay.id)
-            .order_by(TrackSubject.track.asc(), TrackSubject.created_at.asc())
-        )
-        .scalars()
-        .all()
+    program = _get_program(db, program_code, tenant_id=tenant_id)
+    ay = _get_academic_year(db, int(academic_year_number), tenant_id=tenant_id)
+    q = (
+        select(TrackSubject)
+        .where(TrackSubject.program_id == program.id)
+        .where(TrackSubject.academic_year_id == ay.id)
+        .order_by(TrackSubject.track.asc(), TrackSubject.created_at.asc())
     )
+    q = where_tenant(q, TrackSubject, tenant_id)
+    rows = db.execute(q).scalars().all()
     return rows
 
 
@@ -76,12 +85,14 @@ def create_track_subject(
     payload: TrackSubjectCreate,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> TrackSubjectOut:
-    program = _get_program(db, payload.program_code)
-    ay = _get_academic_year(db, int(payload.academic_year_number))
-    subject = _get_subject(db, program.id, ay.id, payload.subject_code)
+    program = _get_program(db, payload.program_code, tenant_id=tenant_id)
+    ay = _get_academic_year(db, int(payload.academic_year_number), tenant_id=tenant_id)
+    subject = _get_subject(db, program.id, ay.id, payload.subject_code, tenant_id=tenant_id)
 
     row = TrackSubject(
+        tenant_id=tenant_id,
         program_id=program.id,
         academic_year_id=ay.id,
         track=payload.track,
@@ -105,8 +116,9 @@ def update_track_subject(
     payload: TrackSubjectUpdate,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> TrackSubjectOut:
-    row = db.get(TrackSubject, track_subject_id)
+    row = get_by_id(db, TrackSubject, track_subject_id, tenant_id)
     if row is None:
         raise HTTPException(status_code=404, detail="TRACK_SUBJECT_NOT_FOUND")
 
@@ -128,8 +140,9 @@ def delete_track_subject(
     track_subject_id: uuid.UUID,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> dict:
-    row = db.get(TrackSubject, track_subject_id)
+    row = get_by_id(db, TrackSubject, track_subject_id, tenant_id)
     if row is None:
         raise HTTPException(status_code=404, detail="TRACK_SUBJECT_NOT_FOUND")
     db.delete(row)

@@ -25,6 +25,7 @@ class TimetableRun(Base):
     __tablename__ = "timetable_runs"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), nullable=False, index=True)
     # Program-wide runs may span multiple academic years; year identity is stored
     # per TimetableEntry. Keep this nullable for program-global solves.
     academic_year_id = Column(UUID(as_uuid=True), nullable=True)

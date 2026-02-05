@@ -23,6 +23,7 @@ class TrackSubject(Base):
     __tablename__ = "track_subjects"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), nullable=False, index=True)
     program_id = Column(UUID(as_uuid=True), nullable=False)
     academic_year_id = Column(UUID(as_uuid=True), nullable=False)
     track = Column(SECTION_TRACK, nullable=False)

@@ -6,6 +6,16 @@ Run a migration SQL file (uses backend/.env DATABASE_URL):
 
 `python migrations/run_sql.py migrations/005_add_section_subjects.sql`
 
+## 2026-02: DEV reset + seed default tenant/user
+
+To wipe local/dev data:
+
+`python migrations/dev_clear_all_data.py --yes --confirm DELETE_ALL_DATA`
+
+Then seed tenant "Default College" (slug: `default`) and user `graphicerahill` / `Graphic@ERA123`:
+
+`python migrations/dev_seed_default_tenant_and_user.py`
+
 ## 2026-01: Academic-year solver upgrade
 
 The solver schedules timetables by academic year (and optionally program-wide across all years).

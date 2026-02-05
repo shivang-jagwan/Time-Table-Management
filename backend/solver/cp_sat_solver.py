@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import uuid
 from collections import defaultdict
+from typing import Any
 
 from ortools.sat.python import cp_model
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
+from api.tenant import where_tenant
 from models.combined_subject_group import CombinedSubjectGroup
 from models.combined_subject_section import CombinedSubjectSection
 from models.room import Room
@@ -15,6 +17,7 @@ from models.section_elective import SectionElective
 from models.elective_block import ElectiveBlock
 from models.elective_block_subject import ElectiveBlockSubject
 from models.section_elective_block import SectionElectiveBlock
+from models.section_break import SectionBreak
 from models.section_time_window import SectionTimeWindow
 from models.section_subject import SectionSubject
 from models.subject import Subject
@@ -112,7 +115,10 @@ def _solve_program(
     enforce_teacher_load_limits: bool,
     require_optimal: bool,
 ) -> SolveResult:
+    tenant_id = getattr(run, "tenant_id", None)
+
     q_sections = select(Section).where(Section.program_id == program_id).where(Section.is_active.is_(True))
+    q_sections = where_tenant(q_sections, Section, tenant_id)
     if academic_year_id is not None:
         q_sections = q_sections.where(Section.academic_year_id == academic_year_id)
     # else: program-wide solve (all academic years).
@@ -121,7 +127,7 @@ def _solve_program(
     section_year_by_id = {s.id: s.academic_year_id for s in sections}
     solve_year_ids = sorted({s.academic_year_id for s in sections})
 
-    slots: list[TimeSlot] = db.execute(select(TimeSlot)).scalars().all()
+    slots: list[TimeSlot] = db.execute(where_tenant(select(TimeSlot), TimeSlot, tenant_id)).scalars().all()
     slot_by_day_index: dict[tuple[int, int], TimeSlot] = {(s.day_of_week, s.slot_index): s for s in slots}
     slot_info = {s.id: (s.day_of_week, s.slot_index) for s in slots}
     slots_by_day = defaultdict(list)
@@ -130,17 +136,16 @@ def _solve_program(
     for d in slots_by_day:
         slots_by_day[d].sort(key=lambda x: x.slot_index)
 
-    windows = (
-        db.execute(select(SectionTimeWindow).where(SectionTimeWindow.section_id.in_([s.id for s in sections])))
-        .scalars()
-        .all()
-    )
+    q_windows = select(SectionTimeWindow).where(SectionTimeWindow.section_id.in_([s.id for s in sections]))
+    q_windows = where_tenant(q_windows, SectionTimeWindow, tenant_id)
+    windows = db.execute(q_windows).scalars().all()
     windows_by_section = defaultdict(list)
     for w in windows:
         windows_by_section[w.section_id].append(w)
 
     # Fetch all active rooms (including special) so we can reason about special-allotment locks.
-    rooms_all: list[Room] = db.execute(select(Room).where(Room.is_active.is_(True))).scalars().all()
+    q_rooms = where_tenant(select(Room).where(Room.is_active.is_(True)), Room, tenant_id)
+    rooms_all: list[Room] = db.execute(q_rooms).scalars().all()
     room_by_id = {r.id: r for r in rooms_all}
 
     # Room pool for auto-assignment: NEVER include special rooms.
@@ -153,27 +158,30 @@ def _solve_program(
     q_subjects = select(Subject).where(Subject.program_id == program_id).where(Subject.is_active.is_(True))
     if solve_year_ids:
         q_subjects = q_subjects.where(Subject.academic_year_id.in_(solve_year_ids))
+    q_subjects = where_tenant(q_subjects, Subject, tenant_id)
     subjects: list[Subject] = db.execute(q_subjects).scalars().all()
     subject_by_id = {s.id: s for s in subjects}
 
-    teachers: list[Teacher] = db.execute(select(Teacher).where(Teacher.is_active.is_(True))).scalars().all()
+    q_teachers = where_tenant(select(Teacher).where(Teacher.is_active.is_(True)), Teacher, tenant_id)
+    teachers: list[Teacher] = db.execute(q_teachers).scalars().all()
     teacher_by_id = {t.id: t for t in teachers}
 
     # Strict teacher assignment: (section_id, subject_id) -> teacher_id
     assigned_teacher_by_section_subject: dict[tuple[str, str], str] = {}
     if sections:
-        rows = (
-            db.execute(
+        rows = db.execute(
+            where_tenant(
                 select(
                     TeacherSubjectSection.section_id,
                     TeacherSubjectSection.subject_id,
                     TeacherSubjectSection.teacher_id,
                 )
                 .where(TeacherSubjectSection.section_id.in_([s.id for s in sections]))
-                .where(TeacherSubjectSection.is_active.is_(True))
+                .where(TeacherSubjectSection.is_active.is_(True)),
+                TeacherSubjectSection,
+                tenant_id,
             )
-            .all()
-        )
+        ).all()
         for sec_id, subj_id, teacher_id in rows:
             # If duplicates exist, validation should have caught it; keep a stable choice.
             assigned_teacher_by_section_subject.setdefault((sec_id, subj_id), teacher_id)
@@ -181,9 +189,13 @@ def _solve_program(
     # Fixed timetable entries (hard locks)
     fixed_entries: list[FixedTimetableEntry] = (
         db.execute(
-            select(FixedTimetableEntry)
-            .where(FixedTimetableEntry.section_id.in_([s.id for s in sections]))
-            .where(FixedTimetableEntry.is_active.is_(True))
+            where_tenant(
+                select(FixedTimetableEntry)
+                .where(FixedTimetableEntry.section_id.in_([s.id for s in sections]))
+                .where(FixedTimetableEntry.is_active.is_(True)),
+                FixedTimetableEntry,
+                tenant_id,
+            )
         )
         .scalars()
         .all()
@@ -192,9 +204,13 @@ def _solve_program(
     # Special allotments (hard locked events) applied pre-solve.
     special_allotments: list[SpecialAllotment] = (
         db.execute(
-            select(SpecialAllotment)
-            .where(SpecialAllotment.section_id.in_([s.id for s in sections]))
-            .where(SpecialAllotment.is_active.is_(True))
+            where_tenant(
+                select(SpecialAllotment)
+                .where(SpecialAllotment.section_id.in_([s.id for s in sections]))
+                .where(SpecialAllotment.is_active.is_(True)),
+                SpecialAllotment,
+                tenant_id,
+            )
         )
         .scalars()
         .all()
@@ -206,8 +222,12 @@ def _solve_program(
     # Explicit section → subject mapping (override)
     section_subject_rows = (
         db.execute(
-            select(SectionSubject.section_id, SectionSubject.subject_id).where(
-                SectionSubject.section_id.in_([s.id for s in sections])
+            where_tenant(
+                select(SectionSubject.section_id, SectionSubject.subject_id).where(
+                    SectionSubject.section_id.in_([s.id for s in sections])
+                ),
+                SectionSubject,
+                tenant_id,
             )
         )
         .all()
@@ -225,10 +245,14 @@ def _solve_program(
 
         track_rows = (
             db.execute(
-                select(TrackSubject)
-                .where(TrackSubject.program_id == program_id)
-                .where(TrackSubject.academic_year_id == section.academic_year_id)
-                .where(TrackSubject.track == section.track)
+                where_tenant(
+                    select(TrackSubject)
+                    .where(TrackSubject.program_id == program_id)
+                    .where(TrackSubject.academic_year_id == section.academic_year_id)
+                    .where(TrackSubject.track == section.track),
+                    TrackSubject,
+                    tenant_id,
+                )
             )
             .scalars()
             .all()
@@ -239,7 +263,13 @@ def _solve_program(
         required = list(mandatory)
         if elective_options:
             sel = (
-                db.execute(select(SectionElective).where(SectionElective.section_id == section.id))
+                db.execute(
+                    where_tenant(
+                        select(SectionElective).where(SectionElective.section_id == section.id),
+                        SectionElective,
+                        tenant_id,
+                    )
+                )
                 .scalars()
                 .first()
             )
@@ -265,8 +295,12 @@ def _solve_program(
     if sections:
         sec_block_rows = (
             db.execute(
-                select(SectionElectiveBlock.section_id, SectionElectiveBlock.block_id)
-                .where(SectionElectiveBlock.section_id.in_([s.id for s in sections]))
+                where_tenant(
+                    select(SectionElectiveBlock.section_id, SectionElectiveBlock.block_id)
+                    .where(SectionElectiveBlock.section_id.in_([s.id for s in sections])),
+                    SectionElectiveBlock,
+                    tenant_id,
+                )
             )
             .all()
         )
@@ -275,11 +309,21 @@ def _solve_program(
             blocks_by_section[sid].append(bid)
 
         if block_ids:
-            blocks = db.execute(select(ElectiveBlock).where(ElectiveBlock.id.in_(block_ids))).scalars().all()
+            blocks = (
+                db.execute(where_tenant(select(ElectiveBlock).where(ElectiveBlock.id.in_(block_ids)), ElectiveBlock, tenant_id))
+                .scalars()
+                .all()
+            )
             elective_block_by_id = {b.id: b for b in blocks}
 
             bsubs = (
-                db.execute(select(ElectiveBlockSubject).where(ElectiveBlockSubject.block_id.in_(block_ids)))
+                db.execute(
+                    where_tenant(
+                        select(ElectiveBlockSubject).where(ElectiveBlockSubject.block_id.in_(block_ids)),
+                        ElectiveBlockSubject,
+                        tenant_id,
+                    )
+                )
                 .scalars()
                 .all()
             )
@@ -294,6 +338,20 @@ def _solve_program(
                 ts = slot_by_day_index.get((w.day_of_week, si))
                 if ts is not None:
                     allowed_slots_by_section[section.id].add(ts.id)
+
+    # Remove run-specific section breaks from the allowed slot pool.
+    # Breaks are stored per run (run_id, section_id, slot_id).
+    if sections:
+        q_breaks = (
+            select(SectionBreak.section_id, SectionBreak.slot_id)
+            .where(SectionBreak.run_id == run.id)
+            .where(SectionBreak.section_id.in_([s.id for s in sections]))
+        )
+        q_breaks = where_tenant(q_breaks, SectionBreak, tenant_id)
+        break_rows = db.execute(q_breaks).all()
+        if break_rows:
+            for sec_id, slot_id in break_rows:
+                allowed_slots_by_section[sec_id].discard(slot_id)
 
     # Precompute allowed slot indices by (section, day) for faster LAB candidate generation.
     allowed_slot_indices_by_section_day = defaultdict(list)  # (sec_id, day) -> [slot_index]
@@ -418,6 +476,9 @@ def _solve_program(
         q_combined = q_combined.where(CombinedSubjectGroup.academic_year_id.in_(solve_year_ids)).where(
             Subject.academic_year_id.in_(solve_year_ids)
         )
+    q_combined = where_tenant(q_combined, CombinedSubjectGroup, tenant_id)
+    q_combined = where_tenant(q_combined, CombinedSubjectSection, tenant_id)
+    q_combined = where_tenant(q_combined, Subject, tenant_id)
     combined_rows = db.execute(q_combined).all()
 
     group_sections = defaultdict(list)  # group_id -> [section_id]
@@ -1015,6 +1076,84 @@ def _solve_program(
             if terms:
                 model.Add(sum(terms) <= 1)
 
+    # =========================================================
+    # Section compactness: max gap between classes per day
+    # =========================================================
+    # Hard constraint:
+    # For a given section and day, between any two scheduled classes
+    # there must not be more than 3 consecutive empty slots.
+    #
+    # Implementation:
+    # Let occ[i] be 1 if the section is occupied in the i-th time slot of the day.
+    # For any i < j with (j - i - 1) > 3, it is forbidden for occ[i] = occ[j] = 1
+    # while all occ[k] = 0 for i < k < j.
+    # Linear form:
+    #   occ[i] + occ[j] - sum(occ[i+1..j-1]) <= 1
+    #
+    # Notes:
+    # - We rely on the existing per-slot constraint sum(terms) <= 1 to ensure
+    #   each occ is a boolean (0/1).
+    # - This applies to theory, labs (all covered slots), combined, fixed, special.
+    MAX_EMPTY_GAP_SLOTS = 3
+    occ_by_section_day: dict[tuple[Any, int], list[tuple[int, cp_model.IntVar]]] = {}
+    internal_gap_terms: list[cp_model.IntVar] = []
+
+    for section in sections:
+        sec_id = section.id
+        for day in range(0, 6):
+            day_slots = slots_by_day.get(day, [])
+            # Need at least 6 slots in a day to have a gap > 3 between two classes.
+            if len(day_slots) < (MAX_EMPTY_GAP_SLOTS + 3):
+                continue
+
+            occ_list: list[tuple[int, cp_model.IntVar]] = []
+            occ_vars: list[cp_model.IntVar] = []
+            for ts in day_slots:
+                terms = section_slot_terms.get((sec_id, ts.id), [])
+                ov = model.NewBoolVar(f"occ_{sec_id}_{day}_{int(ts.slot_index)}")
+                if terms:
+                    model.Add(ov == sum(terms))
+                else:
+                    model.Add(ov == 0)
+                occ_list.append((int(ts.slot_index), ov))
+                occ_vars.append(ov)
+
+            occ_by_section_day[(sec_id, day)] = occ_list
+
+            # Hard max-gap constraint (O(n^2) per day, but n is small (typically 8)).
+            n = len(occ_vars)
+            min_dist = MAX_EMPTY_GAP_SLOTS + 2  # distance >= 5 means 4+ empty slots between.
+            for i in range(0, n):
+                for j in range(i + min_dist, n):
+                    middle = occ_vars[i + 1 : j]
+                    if middle:
+                        model.Add(occ_vars[i] + occ_vars[j] - sum(middle) <= 1)
+                    else:
+                        model.Add(occ_vars[i] + occ_vars[j] <= 1)
+
+            # Soft compactness penalty: count internal empty slots (empty with at least
+            # one occupied slot before and after it in the day).
+            prefix: list[cp_model.IntVar] = []
+            suffix: list[cp_model.IntVar] = []
+            for i in range(0, n):
+                pv = model.NewBoolVar(f"sec_has_before_{sec_id}_{day}_{i}")
+                model.AddMaxEquality(pv, occ_vars[: i + 1])
+                prefix.append(pv)
+            for i in range(0, n):
+                sv = model.NewBoolVar(f"sec_has_after_{sec_id}_{day}_{i}")
+                model.AddMaxEquality(sv, occ_vars[i:])
+                suffix.append(sv)
+
+            for i in range(1, n - 1):
+                gv = model.NewBoolVar(f"sec_gap_{sec_id}_{day}_{i}")
+                # gv == 1 implies: prefix[i-1] == 1, suffix[i+1] == 1, occ[i] == 0
+                model.Add(gv <= prefix[i - 1])
+                model.Add(gv <= suffix[i + 1])
+                model.Add(gv + occ_vars[i] <= 1)
+                # If all conditions hold, gv must be 1.
+                model.Add(gv >= prefix[i - 1] + suffix[i + 1] - occ_vars[i] - 1)
+                internal_gap_terms.append(gv)
+
     # Teacher no overlap
     for (_teacher_id, _slot_id), terms in teacher_slot_terms.items():
         if terms:
@@ -1068,16 +1207,21 @@ def _solve_program(
                 if day_terms:
                     model.Add(sum(day_terms) <= int(teacher.max_per_day))
 
-    # Objective: prefer earlier slots
+    # Objective:
+    # - Primary: prefer earlier slots
+    # - Secondary: minimize internal gaps per section per day
+    PRIMARY_WEIGHT = 1000
     obj_terms = []
     for (_sec, _sid, slot_id), xv in x.items():
         _d, idx = slot_info.get(slot_id, (0, 0))
-        obj_terms.append(xv * (idx + 1))
+        obj_terms.append(xv * (idx + 1) * PRIMARY_WEIGHT)
     for (_sec, _bid, slot_id), zv in z.items():
         _d, idx = slot_info.get(slot_id, (0, 0))
-        obj_terms.append(zv * (idx + 1))
+        obj_terms.append(zv * (idx + 1) * PRIMARY_WEIGHT)
     for (_sec, _sid, _day, start_idx), sv in lab_start.items():
-        obj_terms.append(sv * (start_idx + 1))
+        obj_terms.append(sv * (start_idx + 1) * PRIMARY_WEIGHT)
+    if internal_gap_terms:
+        obj_terms.append(sum(internal_gap_terms))
     if obj_terms:
         model.Minimize(sum(obj_terms))
 
@@ -1143,6 +1287,7 @@ def _solve_program(
             message = "Solver returned an unexpected status."
 
         conflict = TimetableConflict(
+            tenant_id=tenant_id,
             run_id=run.id,
             severity="ERROR",
             conflict_type=conflict_type,
@@ -1163,7 +1308,9 @@ def _solve_program(
             reason_summary=reason_summary,
         )
 
-    db.execute(delete(TimetableEntry).where(TimetableEntry.run_id == run.id))
+    stmt = delete(TimetableEntry).where(TimetableEntry.run_id == run.id)
+    stmt = where_tenant(stmt, TimetableEntry, tenant_id)
+    db.execute(stmt)
     entries_written = 0
 
     objective_score = None
@@ -1233,6 +1380,30 @@ def _solve_program(
         "require_optimal": bool(require_optimal),
     }
 
+    # Section gap metrics (based on the same occ variables used for constraints/objective).
+    try:
+        gap_pairs = 0
+        gap_sum = 0
+        max_gap = 0
+        for (_sec_id, _day), occ_list in occ_by_section_day.items():
+            occupied_indices = [idx for idx, ov in occ_list if int(solver.Value(ov)) == 1]
+            if len(occupied_indices) < 2:
+                continue
+            occupied_indices.sort()
+            for a, b in zip(occupied_indices, occupied_indices[1:]):
+                g = int(b) - int(a) - 1
+                if g < 0:
+                    g = 0
+                gap_sum += g
+                gap_pairs += 1
+                max_gap = max(max_gap, g)
+        solver_stats["section_gap_max_empty_slots"] = int(max_gap)
+        solver_stats["section_gap_avg_empty_slots"] = float(gap_sum / gap_pairs) if gap_pairs else 0.0
+        if internal_gap_terms:
+            solver_stats["section_internal_gap_slots"] = int(sum(int(solver.Value(v)) for v in internal_gap_terms))
+    except Exception:
+        pass
+
     # Greedy room assignment after solver (keeps CP-SAT model tractable).
     used_rooms_by_slot = defaultdict(set)  # slot_id -> set(room_id)
 
@@ -1258,6 +1429,7 @@ def _solve_program(
             conflicting_special_room_slots.add((str(sec_id), str(slot_id)))
             db.add(
                 TimetableConflict(
+                    tenant_id=tenant_id,
                     run_id=run.id,
                     severity="WARN",
                     conflict_type="SPECIAL_ROOM_CONFLICT",
@@ -1278,6 +1450,7 @@ def _solve_program(
             conflicting_fixed_room_slots.add((str(sec_id), str(slot_id)))
             db.add(
                 TimetableConflict(
+                    tenant_id=tenant_id,
                     run_id=run.id,
                     severity="WARN",
                     conflict_type="FIXED_ROOM_CONFLICT",
@@ -1297,6 +1470,7 @@ def _solve_program(
             combined_conflict_id = _room_conflict_group_id(room_id=room_id, slot_id=slot_id)
         db.add(
             TimetableEntry(
+                tenant_id=tenant_id,
                 run_id=run.id,
                 academic_year_id=section_year_by_id.get(sec_id) or run.academic_year_id,
                 section_id=sec_id,
@@ -1316,6 +1490,7 @@ def _solve_program(
             combined_conflict_id = _room_conflict_group_id(room_id=room_id, slot_id=slot_id)
         db.add(
             TimetableEntry(
+                tenant_id=tenant_id,
                 run_id=run.id,
                 academic_year_id=section_year_by_id.get(sec_id) or run.academic_year_id,
                 section_id=sec_id,
@@ -1407,6 +1582,7 @@ def _solve_program(
         if not ok_room:
             db.add(
                 TimetableConflict(
+                    tenant_id=tenant_id,
                     run_id=run.id,
                     severity="WARN",
                     conflict_type="NO_ROOM_AVAILABLE",
@@ -1420,6 +1596,7 @@ def _solve_program(
             )
         db.add(
             TimetableEntry(
+                tenant_id=tenant_id,
                 run_id=run.id,
                 academic_year_id=section_year_by_id.get(sec_id) or run.academic_year_id,
                 section_id=sec_id,
@@ -1455,6 +1632,7 @@ def _solve_program(
             if not ok_room:
                 db.add(
                     TimetableConflict(
+                        tenant_id=tenant_id,
                         run_id=run.id,
                         severity="WARN",
                         conflict_type="NO_LT_ROOM_AVAILABLE",
@@ -1469,6 +1647,7 @@ def _solve_program(
                 )
             db.add(
                 TimetableEntry(
+                    tenant_id=tenant_id,
                     run_id=run.id,
                     academic_year_id=section_year_by_id.get(sec_id) or run.academic_year_id,
                     section_id=sec_id,
@@ -1518,6 +1697,7 @@ def _solve_program(
         if not ok_room:
             db.add(
                 TimetableConflict(
+                    tenant_id=tenant_id,
                     run_id=run.id,
                     severity="WARN",
                     conflict_type="NO_LT_ROOM_AVAILABLE",
@@ -1533,6 +1713,7 @@ def _solve_program(
         for sec_id in group_sections.get(group_id, []):
             db.add(
                 TimetableEntry(
+                    tenant_id=tenant_id,
                     run_id=run.id,
                     academic_year_id=section_year_by_id.get(sec_id) or run.academic_year_id,
                     section_id=sec_id,
@@ -1587,6 +1768,7 @@ def _solve_program(
             if not ok_room:
                 db.add(
                     TimetableConflict(
+                        tenant_id=tenant_id,
                         run_id=run.id,
                         severity="WARN",
                         conflict_type="NO_ROOM_AVAILABLE",
@@ -1600,6 +1782,7 @@ def _solve_program(
                 )
             db.add(
                 TimetableEntry(
+                    tenant_id=tenant_id,
                     run_id=run.id,
                     academic_year_id=section_year_by_id.get(sec_id) or run.academic_year_id,
                     section_id=sec_id,
@@ -1622,6 +1805,7 @@ def _solve_program(
         warnings.append("A feasible timetable was found, but optimality was not proven (SUBOPTIMAL).")
         db.add(
             TimetableConflict(
+                tenant_id=tenant_id,
                 run_id=run.id,
                 severity="WARN",
                 conflict_type="SUBOPTIMAL",

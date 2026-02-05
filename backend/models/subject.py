@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, Integer, Text
+from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, Integer, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import ENUM, UUID
 from sqlalchemy.sql import func
 
@@ -21,6 +21,7 @@ class Subject(Base):
     __tablename__ = "subjects"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), nullable=False, index=True)
     program_id = Column(UUID(as_uuid=True), nullable=False)
     academic_year_id = Column(UUID(as_uuid=True), nullable=False)
     code = Column(Text, nullable=False)
@@ -34,6 +35,7 @@ class Subject(Base):
 
     __table_args__ = (
         CheckConstraint("sessions_per_week >= 0", name="ck_subjects_sessions_per_week"),
+        UniqueConstraint("tenant_id", "code", name="uq_subjects_tenant_code"),
         CheckConstraint("max_per_day >= 0", name="ck_subjects_max_per_day"),
         CheckConstraint("lab_block_size_slots >= 1", name="ck_subjects_lab_block_size"),
     )

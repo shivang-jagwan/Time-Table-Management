@@ -13,6 +13,7 @@ from api.deps import get_current_user
 from core.config import settings
 from core.db import get_db
 from core.security import create_access_token, hash_password, verify_password
+from models.tenant import Tenant
 from models.user import User
 from schemas.auth import LoginRequest, LoginResponse, MeResponse, SignupRequest, SignupResponse
 
@@ -46,6 +47,25 @@ def _enforce_login_rate_limit(request: Request, username: str) -> None:
         raise HTTPException(status_code=429, detail="RATE_LIMITED")
 
 
+def _resolve_tenant_id_for_auth(db: Session, tenant_hint: str | None) -> str | None:
+    mode = (settings.tenant_mode or "shared").strip().lower()
+    if mode != "per_tenant":
+        return None
+
+    hint = (tenant_hint or "").strip()
+    if not hint:
+        hint = "default"
+
+    q = select(Tenant.id).where(func.lower(Tenant.slug) == func.lower(hint))
+    row = db.execute(q).first()
+    if row is None:
+        q2 = select(Tenant.id).where(func.lower(Tenant.name) == func.lower(hint))
+        row = db.execute(q2).first()
+    if row is None:
+        raise HTTPException(status_code=401, detail="INVALID_TENANT")
+    return str(row[0])
+
+
 @router.post("/login", response_model=LoginResponse)
 def login(
     payload: LoginRequest,
@@ -56,13 +76,15 @@ def login(
     username = str(payload.username or "").strip()
     _enforce_login_rate_limit(request, username)
 
+    tenant_id_for_auth = _resolve_tenant_id_for_auth(db, payload.tenant)
+
     ip = request.client.host if request.client else "unknown"
 
     # Be forgiving about casing/whitespace on input.
-    user = (
-        db.execute(select(User).where(func.lower(User.username) == func.lower(username)))
-        .scalar_one_or_none()
-    )
+    q_user = select(User).where(func.lower(User.username) == func.lower(username))
+    if tenant_id_for_auth is not None:
+        q_user = q_user.where(User.tenant_id == tenant_id_for_auth)
+    user = db.execute(q_user).scalar_one_or_none()
     if user is None:
         logger.warning(
             "Login failed (unknown user) ip=%s username=%r username_len=%d",
@@ -106,7 +128,21 @@ def login(
         )
         raise HTTPException(status_code=401, detail="INVALID_CREDENTIALS")
 
-    token = create_access_token(user_id=str(user.id), username=user.username, role=user.role)
+    mode = (settings.tenant_mode or "shared").strip().lower()
+    token_tenant_id: str | None
+    if mode == "per_tenant":
+        token_tenant_id = str(getattr(user, "tenant_id", None) or "") or None
+    elif mode == "per_user":
+        token_tenant_id = str(getattr(user, "tenant_id", None) or user.id)
+    else:
+        token_tenant_id = None
+
+    token = create_access_token(
+        user_id=str(user.id),
+        username=user.username,
+        role=user.role,
+        tenant_id=token_tenant_id,
+    )
 
     secure_cookie = settings.environment.lower() == "production"
     samesite = (settings.cookie_samesite or "lax").lower().strip()
@@ -122,7 +158,7 @@ def login(
         path="/",
     )
 
-    return LoginResponse(ok=True)
+    return LoginResponse(ok=True, access_token=token)
 
 
 @router.post("/signup", response_model=SignupResponse)
@@ -139,16 +175,18 @@ def signup(
     username = str(payload.username or "").strip()
     _enforce_login_rate_limit(request, username)
 
+    tenant_id_for_auth = _resolve_tenant_id_for_auth(db, payload.tenant)
+
     if not username:
         raise HTTPException(status_code=422, detail="INVALID_USERNAME")
 
     ip = request.client.host if request.client else "unknown"
 
     # Enforce case-insensitive uniqueness to avoid multiple rows that would break login.
-    existing = (
-        db.execute(select(User.id).where(func.lower(User.username) == func.lower(username)))
-        .scalar_one_or_none()
-    )
+    q_existing = select(User.id).where(func.lower(User.username) == func.lower(username))
+    if tenant_id_for_auth is not None:
+        q_existing = q_existing.where(User.tenant_id == tenant_id_for_auth)
+    existing = db.execute(q_existing).scalar_one_or_none()
     if existing is not None:
         logger.warning("Signup rejected (username taken) ip=%s username=%r", ip, username)
         raise HTTPException(status_code=409, detail="USERNAME_TAKEN")
@@ -180,8 +218,8 @@ def signup(
             row = db.execute(
                 text(
                     """
-                    insert into users (name, username, password_hash, role, is_active)
-                    values (:name, :username, :password_hash, :role, true)
+                    insert into users (name, username, password_hash, role, is_active, tenant_id)
+                    values (:name, :username, :password_hash, :role, true, :tenant_id)
                     returning id, username, role
                     """.strip()
                 ),
@@ -190,14 +228,15 @@ def signup(
                     "username": username,
                     "password_hash": password_hash,
                     "role": role,
+                    "tenant_id": tenant_id_for_auth,
                 },
             ).first()
         else:
             row = db.execute(
                 text(
                     """
-                    insert into users (username, password_hash, role, is_active)
-                    values (:username, :password_hash, :role, true)
+                    insert into users (username, password_hash, role, is_active, tenant_id)
+                    values (:username, :password_hash, :role, true, :tenant_id)
                     returning id, username, role
                     """.strip()
                 ),
@@ -205,6 +244,7 @@ def signup(
                     "username": username,
                     "password_hash": password_hash,
                     "role": role,
+                    "tenant_id": tenant_id_for_auth,
                 },
             ).first()
 
@@ -222,7 +262,21 @@ def signup(
     created_role = str(row[2])
 
     # Auto-login after signup (sets the same cookie as /login).
-    token = create_access_token(user_id=user_id, username=created_username, role=created_role)
+    mode = (settings.tenant_mode or "shared").strip().lower()
+    token_tenant_id: str | None
+    if mode == "per_tenant":
+        token_tenant_id = tenant_id_for_auth
+    elif mode == "per_user":
+        token_tenant_id = user_id
+    else:
+        token_tenant_id = None
+
+    token = create_access_token(
+        user_id=user_id,
+        username=created_username,
+        role=created_role,
+        tenant_id=token_tenant_id,
+    )
     secure_cookie = settings.environment.lower() == "production"
     samesite = (settings.cookie_samesite or "lax").lower().strip()
     if samesite not in {"lax", "strict", "none"}:
@@ -251,6 +305,7 @@ def logout(response: Response) -> dict[str, Any]:
 def me(current_user: User = Depends(get_current_user)) -> MeResponse:
     return MeResponse(
         id=current_user.id,
+        tenant_id=getattr(current_user, "tenant_id", None),
         username=current_user.username,
         role=current_user.role,
         is_active=current_user.is_active,

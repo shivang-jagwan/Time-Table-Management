@@ -66,6 +66,15 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("frontend_origin", "FRONTEND_ORIGIN"),
     )
 
+    # Multi-tenant / data isolation
+    # - shared: all admins see the same data (current behavior)
+    # - per_user: data is scoped to the current user's tenant (default: user.id)
+    # - per_tenant: data is scoped to current_user.tenant_id (strict isolation)
+    tenant_mode: str = Field(
+        default="shared",
+        validation_alias=AliasChoices("tenant_mode", "TENANT_MODE"),
+    )
+
     @field_validator("frontend_origin")
     @classmethod
     def _normalize_frontend_origin(cls, v: str) -> str:
@@ -82,6 +91,14 @@ class Settings(BaseSettings):
     @classmethod
     def _normalize_signup_default_role(cls, v: str) -> str:
         return (v or "USER").strip().upper()
+
+    @field_validator("tenant_mode")
+    @classmethod
+    def _normalize_tenant_mode(cls, v: str) -> str:
+        v = (v or "shared").strip().lower()
+        if v not in {"shared", "per_user", "per_tenant"}:
+            raise ValueError("TENANT_MODE must be 'shared', 'per_user', or 'per_tenant'")
+        return v
 
     @field_validator("seed_admin_username")
     @classmethod

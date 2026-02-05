@@ -6,7 +6,9 @@ from sqlalchemy.orm import Session
 import uuid
 
 from core.security import decode_token
+from core.config import settings
 from core.db import get_db
+from core.tenancy import set_current_tenant_id
 from models.user import User
 
 
@@ -52,6 +54,25 @@ def get_current_user(
     if not user.is_active:
         raise HTTPException(status_code=403, detail="USER_DISABLED")
 
+    mode = (settings.tenant_mode or "shared").strip().lower()
+    if mode == "per_tenant":
+        token_tenant_id = payload.get("tenant_id")
+        user_tenant_id = getattr(user, "tenant_id", None)
+        if not token_tenant_id or user_tenant_id is None:
+            raise HTTPException(status_code=401, detail="INVALID_TOKEN")
+        if str(user_tenant_id) != str(token_tenant_id):
+            raise HTTPException(status_code=401, detail="INVALID_TOKEN")
+
+    # Always set the tenant context once the user is authenticated.
+    # This makes DB-layer tenant injection work even if an endpoint doesn't call get_tenant_id().
+    if mode == "shared":
+        set_current_tenant_id(None)
+    elif mode == "per_tenant":
+        set_current_tenant_id(getattr(user, "tenant_id", None))
+    else:
+        # per_user
+        set_current_tenant_id(getattr(user, "tenant_id", None) or user.id)
+
     request.state.current_user = user
     request.state.auth_payload = payload
     return user
@@ -69,3 +90,28 @@ def require_admin(
     if role != "ADMIN":
         raise HTTPException(status_code=403, detail="NOT_AUTHORIZED")
     return payload
+
+
+def get_tenant_id(
+    current_user: User = Depends(get_current_user),
+) -> uuid.UUID | None:
+    """Return the tenant_id used to scope data.
+
+    - shared mode: returns None (no scoping)
+    - per_user mode: returns current_user.tenant_id if set, else current_user.id
+    """
+
+    mode = (settings.tenant_mode or "shared").strip().lower()
+    if mode == "shared":
+        set_current_tenant_id(None)
+        return None
+    tenant_id = getattr(current_user, "tenant_id", None)
+    if mode == "per_tenant":
+        if tenant_id is None:
+            raise HTTPException(status_code=403, detail="TENANT_NOT_SET")
+        set_current_tenant_id(tenant_id)
+        return tenant_id
+    # legacy: per_user
+    resolved = tenant_id or current_user.id
+    set_current_tenant_id(resolved)
+    return resolved

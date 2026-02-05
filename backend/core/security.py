@@ -22,11 +22,12 @@ def verify_password(password: str, password_hash: str) -> bool:
         return False
 
 
-def create_access_token(*, user_id: str, username: str, role: str) -> str:
+def create_access_token(*, user_id: str, username: str, role: str, tenant_id: str | None) -> str:
     now = datetime.now(timezone.utc)
     expires_minutes = int(settings.access_token_expire_minutes)
     payload: dict[str, Any] = {
         "sub": user_id,
+        "tenant_id": tenant_id,
         "username": username,
         "role": role,
         "iat": int(now.timestamp()),

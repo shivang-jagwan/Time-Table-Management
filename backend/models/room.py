@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, Integer, Text
+from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, Integer, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import ENUM, UUID
 from sqlalchemy.sql import func
 
@@ -22,7 +22,8 @@ class Room(Base):
     __tablename__ = "rooms"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    code = Column(Text, nullable=False, unique=True)
+    tenant_id = Column(UUID(as_uuid=True), nullable=False, index=True)
+    code = Column(Text, nullable=False)
     name = Column(Text, nullable=False)
     room_type = Column(ROOM_TYPE, nullable=False)
     capacity = Column(Integer, nullable=False, default=0)
@@ -33,4 +34,5 @@ class Room(Base):
 
     __table_args__ = (
         CheckConstraint("capacity >= 0", name="ck_rooms_capacity"),
+        UniqueConstraint("tenant_id", "code", name="uq_rooms_tenant_code"),
     )

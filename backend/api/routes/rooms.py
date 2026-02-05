@@ -8,7 +8,8 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from api.deps import require_admin
+from api.deps import get_tenant_id, require_admin
+from api.tenant import get_by_id, where_tenant
 from core.db import get_db
 from models.fixed_timetable_entry import FixedTimetableEntry
 from models.room import Room
@@ -23,25 +24,46 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-def _ensure_unique_room_code(db: Session, *, code: str, exclude_room_id: uuid.UUID | None) -> None:
+def _ensure_unique_room_code(
+    db: Session,
+    *,
+    code: str,
+    exclude_room_id: uuid.UUID | None,
+    tenant_id: uuid.UUID | None,
+) -> None:
     q = select(Room.id).where(Room.code == code)
+    if tenant_id is None:
+        q = q.where(Room.tenant_id.is_(None))
+    else:
+        q = q.where(Room.tenant_id == tenant_id)
     if exclude_room_id is not None:
         q = q.where(Room.id != exclude_room_id)
     if db.execute(q.limit(1)).first() is not None:
         raise HTTPException(status_code=409, detail="ROOM_CODE_ALREADY_EXISTS")
 
 
-def _room_in_use_flags(db: Session, *, room_id: uuid.UUID) -> dict[str, bool]:
-    used_in_runs = (
-        db.execute(select(TimetableEntry.id).where(TimetableEntry.room_id == room_id).limit(1)).first() is not None
+def _room_in_use_flags(
+    db: Session,
+    *,
+    room_id: uuid.UUID,
+    tenant_id: uuid.UUID | None,
+) -> dict[str, bool]:
+    q_runs = where_tenant(select(TimetableEntry.id).where(TimetableEntry.room_id == room_id).limit(1), TimetableEntry, tenant_id)
+    used_in_runs = db.execute(q_runs).first() is not None
+
+    q_fixed = where_tenant(
+        select(FixedTimetableEntry.id).where(FixedTimetableEntry.room_id == room_id).limit(1),
+        FixedTimetableEntry,
+        tenant_id,
     )
-    used_in_fixed = (
-        db.execute(select(FixedTimetableEntry.id).where(FixedTimetableEntry.room_id == room_id).limit(1)).first()
-        is not None
+    used_in_fixed = db.execute(q_fixed).first() is not None
+
+    q_special = where_tenant(
+        select(SpecialAllotment.id).where(SpecialAllotment.room_id == room_id).limit(1),
+        SpecialAllotment,
+        tenant_id,
     )
-    used_in_special = (
-        db.execute(select(SpecialAllotment.id).where(SpecialAllotment.room_id == room_id).limit(1)).first() is not None
-    )
+    used_in_special = db.execute(q_special).first() is not None
     return {
         "used_in_timetable_entries": bool(used_in_runs),
         "used_in_fixed_entries": bool(used_in_fixed),
@@ -53,8 +75,10 @@ def _room_in_use_flags(db: Session, *, room_id: uuid.UUID) -> dict[str, bool]:
 def list_rooms(
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> list[RoomOut]:
-    return db.execute(select(Room).order_by(Room.code.asc())).scalars().all()
+    q = where_tenant(select(Room), Room, tenant_id).order_by(Room.code.asc())
+    return db.execute(q).scalars().all()
 
 
 @router.post("/", response_model=RoomOut)
@@ -62,6 +86,7 @@ def create_room(
     payload: RoomCreate,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> RoomOut:
     data = payload.model_dump()
     data["code"] = str(data["code"]).strip()
@@ -73,8 +98,10 @@ def create_room(
     if not data["name"]:
         raise HTTPException(status_code=400, detail="INVALID_NAME")
 
-    _ensure_unique_room_code(db, code=data["code"], exclude_room_id=None)
+    _ensure_unique_room_code(db, code=data["code"], exclude_room_id=None, tenant_id=tenant_id)
 
+    if tenant_id is not None:
+        data["tenant_id"] = tenant_id
     room = Room(**data)
     db.add(room)
     try:
@@ -93,8 +120,9 @@ def put_room(
     force: bool = Query(default=False),
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> RoomOut:
-    room = db.get(Room, room_id)
+    room = get_by_id(db, Room, room_id, tenant_id)
     if room is None:
         raise HTTPException(status_code=404, detail="ROOM_NOT_FOUND")
 
@@ -108,12 +136,24 @@ def put_room(
     if not data["name"]:
         raise HTTPException(status_code=400, detail="INVALID_NAME")
 
-    _ensure_unique_room_code(db, code=data["code"], exclude_room_id=room_id)
+    _ensure_unique_room_code(db, code=data["code"], exclude_room_id=room_id, tenant_id=tenant_id)
 
     if str(room.room_type) != str(data.get("room_type")):
-        used_in_runs = db.execute(select(TimetableEntry.id).where(TimetableEntry.room_id == room_id).limit(1)).first()
+        used_in_runs = (
+            db.execute(
+                where_tenant(
+                    select(TimetableEntry.id).where(TimetableEntry.room_id == room_id).limit(1),
+                    TimetableEntry,
+                    tenant_id,
+                )
+            ).first()
+        )
         used_in_fixed = db.execute(
-            select(FixedTimetableEntry.id).where(FixedTimetableEntry.room_id == room_id).limit(1)
+            where_tenant(
+                select(FixedTimetableEntry.id).where(FixedTimetableEntry.room_id == room_id).limit(1),
+                FixedTimetableEntry,
+                tenant_id,
+            )
         ).first()
         if used_in_runs or used_in_fixed:
             logger.warning(
@@ -123,7 +163,7 @@ def put_room(
             )
 
     if bool(data.get("is_special")) and not bool(getattr(room, "is_special", False)):
-        flags = _room_in_use_flags(db, room_id=room_id)
+        flags = _room_in_use_flags(db, room_id=room_id, tenant_id=tenant_id)
         if any(flags.values()) and not force:
             raise HTTPException(
                 status_code=409,
@@ -161,8 +201,9 @@ def update_room(
     force: bool = Query(default=False),
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> RoomOut:
-    room = db.get(Room, room_id)
+    room = get_by_id(db, Room, room_id, tenant_id)
     if room is None:
         raise HTTPException(status_code=404, detail="ROOM_NOT_FOUND")
 
@@ -171,7 +212,7 @@ def update_room(
         updates["code"] = str(updates["code"]).strip()
         if not updates["code"]:
             raise HTTPException(status_code=400, detail="INVALID_CODE")
-        _ensure_unique_room_code(db, code=str(updates["code"]), exclude_room_id=room_id)
+        _ensure_unique_room_code(db, code=str(updates["code"]), exclude_room_id=room_id, tenant_id=tenant_id)
     if "name" in updates and updates.get("name") is not None:
         updates["name"] = str(updates["name"]).strip()
         if not updates["name"]:
@@ -181,9 +222,21 @@ def update_room(
         updates["special_note"] = str(updates["special_note"]).strip() or None
 
     if "room_type" in updates and updates.get("room_type") is not None and str(room.room_type) != str(updates["room_type"]):
-        used_in_runs = db.execute(select(TimetableEntry.id).where(TimetableEntry.room_id == room_id).limit(1)).first()
+        used_in_runs = (
+            db.execute(
+                where_tenant(
+                    select(TimetableEntry.id).where(TimetableEntry.room_id == room_id).limit(1),
+                    TimetableEntry,
+                    tenant_id,
+                )
+            ).first()
+        )
         used_in_fixed = db.execute(
-            select(FixedTimetableEntry.id).where(FixedTimetableEntry.room_id == room_id).limit(1)
+            where_tenant(
+                select(FixedTimetableEntry.id).where(FixedTimetableEntry.room_id == room_id).limit(1),
+                FixedTimetableEntry,
+                tenant_id,
+            )
         ).first()
         if used_in_runs or used_in_fixed:
             logger.warning(
@@ -193,7 +246,7 @@ def update_room(
             )
 
     if updates.get("is_special") is True and not bool(getattr(room, "is_special", False)):
-        flags = _room_in_use_flags(db, room_id=room_id)
+        flags = _room_in_use_flags(db, room_id=room_id, tenant_id=tenant_id)
         if any(flags.values()) and not force:
             raise HTTPException(
                 status_code=409,
@@ -223,8 +276,9 @@ def delete_room(
     room_id: uuid.UUID,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> dict:
-    room = db.get(Room, room_id)
+    room = get_by_id(db, Room, room_id, tenant_id)
     if room is None:
         raise HTTPException(status_code=404, detail="ROOM_NOT_FOUND")
     db.delete(room)

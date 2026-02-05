@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from api.tenant import get_by_id, where_tenant
 from models.program import Program
 from models.section import Section
 from models.section_elective import SectionElective
@@ -25,18 +26,26 @@ def load_curricula(
     *,
     program_code: str,
     academic_year_id,
+    tenant_id=None,
 ) -> tuple[Program | None, list[SectionCurriculum]]:
-    program = db.execute(select(Program).where(Program.code == program_code)).scalar_one_or_none()
+    program = (
+        db.execute(where_tenant(select(Program).where(Program.code == program_code), Program, tenant_id))
+        .scalar_one_or_none()
+    )
     if program is None:
         return None, []
 
     sections = (
         db.execute(
-            select(Section)
-            .where(Section.program_id == program.id)
-            .where(Section.academic_year_id == academic_year_id)
-            .where(Section.is_active.is_(True))
-            .order_by(Section.code)
+            where_tenant(
+                select(Section)
+                .where(Section.program_id == program.id)
+                .where(Section.academic_year_id == academic_year_id)
+                .where(Section.is_active.is_(True))
+                .order_by(Section.code),
+                Section,
+                tenant_id,
+            )
         )
         .scalars()
         .all()
@@ -46,10 +55,14 @@ def load_curricula(
     for section in sections:
         rows = (
             db.execute(
-                select(TrackSubject)
-                .where(TrackSubject.program_id == program.id)
-                .where(TrackSubject.academic_year_id == academic_year_id)
-                .where(TrackSubject.track == section.track)
+                where_tenant(
+                    select(TrackSubject)
+                    .where(TrackSubject.program_id == program.id)
+                    .where(TrackSubject.academic_year_id == academic_year_id)
+                    .where(TrackSubject.track == section.track),
+                    TrackSubject,
+                    tenant_id,
+                )
             )
             .scalars()
             .all()
@@ -59,14 +72,16 @@ def load_curricula(
         elective_ids = [r.subject_id for r in rows if r.is_elective]
 
         mandatory_subjects = (
-            db.execute(select(Subject).where(Subject.id.in_(mandatory_ids)))
+            db.execute(where_tenant(select(Subject).where(Subject.id.in_(mandatory_ids)), Subject, tenant_id))
             .scalars()
             .all()
             if mandatory_ids
             else []
         )
         elective_options = (
-            db.execute(select(Subject).where(Subject.id.in_(elective_ids))).scalars().all()
+            db.execute(where_tenant(select(Subject).where(Subject.id.in_(elective_ids)), Subject, tenant_id))
+            .scalars()
+            .all()
             if elective_ids
             else []
         )
@@ -74,12 +89,18 @@ def load_curricula(
         chosen_elective = None
         if elective_ids:
             selection = (
-                db.execute(select(SectionElective).where(SectionElective.section_id == section.id))
+                db.execute(
+                    where_tenant(
+                        select(SectionElective).where(SectionElective.section_id == section.id),
+                        SectionElective,
+                        tenant_id,
+                    )
+                )
                 .scalars()
                 .first()
             )
             if selection is not None:
-                chosen_elective = db.get(Subject, selection.subject_id)
+                chosen_elective = get_by_id(db, Subject, selection.subject_id, tenant_id)
 
         curricula.append(
             SectionCurriculum(

@@ -29,6 +29,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       const user = await authApi.me()
       setState({ status: 'authenticated', user })
     } catch {
+      authApi.setAccessToken(null)
       setState({ status: 'anonymous' })
     }
   }, [])
@@ -44,6 +45,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const logout = React.useCallback(async () => {
     try {
+      authApi.setAccessToken(null)
       await authApi.logoutServer()
     } finally {
       setState({ status: 'anonymous' })

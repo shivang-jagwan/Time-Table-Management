@@ -13,6 +13,7 @@ class TeacherSubjectSection(Base):
     __tablename__ = "teacher_subject_sections"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), nullable=False, index=True)
     teacher_id = Column(UUID(as_uuid=True), nullable=False)
     subject_id = Column(UUID(as_uuid=True), nullable=False)
     section_id = Column(UUID(as_uuid=True), nullable=False)

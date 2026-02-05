@@ -6,7 +6,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from api.deps import require_admin
+from api.deps import get_tenant_id, require_admin
+from api.tenant import get_by_id, where_tenant
 from core.db import get_db
 from models.academic_year import AcademicYear
 from models.elective_block import ElectiveBlock
@@ -23,18 +24,16 @@ from schemas.timetable import TimetableGridEntryOut
 router = APIRouter()
 
 
-def _pick_run_id(db: Session, *, run_id: uuid.UUID | None) -> uuid.UUID | None:
+def _pick_run_id(db: Session, *, run_id: uuid.UUID | None, tenant_id: uuid.UUID | None) -> uuid.UUID | None:
     if run_id is not None:
-        exists = db.execute(select(TimetableRun.id).where(TimetableRun.id == run_id)).first()
+        q_exists = where_tenant(select(TimetableRun.id).where(TimetableRun.id == run_id), TimetableRun, tenant_id)
+        exists = db.execute(q_exists).first()
         if exists is None:
             raise HTTPException(status_code=404, detail="RUN_NOT_FOUND")
         return run_id
 
-    rows = (
-        db.execute(select(TimetableRun).order_by(TimetableRun.created_at.desc()).limit(200))
-        .scalars()
-        .all()
-    )
+    q_runs = where_tenant(select(TimetableRun), TimetableRun, tenant_id).order_by(TimetableRun.created_at.desc()).limit(200)
+    rows = db.execute(q_runs).scalars().all()
 
     for r in rows:
         params = r.parameters or {}
@@ -75,8 +74,12 @@ def get_section_timetable(
     run_id: uuid.UUID | None = Query(default=None),
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> list[TimetableGridEntryOut]:
-    chosen_run = _pick_run_id(db, run_id=run_id)
+    if get_by_id(db, Section, section_id, tenant_id) is None:
+        raise HTTPException(status_code=404, detail="SECTION_NOT_FOUND")
+
+    chosen_run = _pick_run_id(db, run_id=run_id, tenant_id=tenant_id)
     if chosen_run is None:
         return []
 
@@ -105,6 +108,7 @@ def get_section_timetable(
         .where(TimetableEntry.run_id == chosen_run)
         .where(TimetableEntry.section_id == section_id)
     )
+    q = where_tenant(q, TimetableEntry, tenant_id)
 
     rows = db.execute(q).all()
     return _rows_to_out(rows)
@@ -116,8 +120,12 @@ def get_room_timetable(
     run_id: uuid.UUID | None = Query(default=None),
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> list[TimetableGridEntryOut]:
-    chosen_run = _pick_run_id(db, run_id=run_id)
+    if get_by_id(db, Room, room_id, tenant_id) is None:
+        raise HTTPException(status_code=404, detail="ROOM_NOT_FOUND")
+
+    chosen_run = _pick_run_id(db, run_id=run_id, tenant_id=tenant_id)
     if chosen_run is None:
         return []
 
@@ -146,6 +154,7 @@ def get_room_timetable(
         .where(TimetableEntry.run_id == chosen_run)
         .where(TimetableEntry.room_id == room_id)
     )
+    q = where_tenant(q, TimetableEntry, tenant_id)
 
     rows = db.execute(q).all()
     return _rows_to_out(rows)
@@ -157,8 +166,12 @@ def get_faculty_timetable(
     run_id: uuid.UUID | None = Query(default=None),
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> list[TimetableGridEntryOut]:
-    chosen_run = _pick_run_id(db, run_id=run_id)
+    if get_by_id(db, Teacher, teacher_id, tenant_id) is None:
+        raise HTTPException(status_code=404, detail="TEACHER_NOT_FOUND")
+
+    chosen_run = _pick_run_id(db, run_id=run_id, tenant_id=tenant_id)
     if chosen_run is None:
         return []
 
@@ -187,6 +200,7 @@ def get_faculty_timetable(
         .where(TimetableEntry.run_id == chosen_run)
         .where(TimetableEntry.teacher_id == teacher_id)
     )
+    q = where_tenant(q, TimetableEntry, tenant_id)
 
     rows = db.execute(q).all()
     return _rows_to_out(rows)

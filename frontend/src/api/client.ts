@@ -19,12 +19,24 @@ function normalizeApiBase(raw: string): string {
 // Use VITE_API_BASE only in dev/local setups.
 const API_BASE = import.meta.env.DEV ? normalizeApiBase(RAW_API_BASE) : ''
 
+function getAccessToken(): string | null {
+  try {
+    if (typeof window === 'undefined') return null
+    return window.localStorage.getItem('access_token')
+  } catch {
+    return null
+  }
+}
+
 export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  const token = getAccessToken()
+
   const res = await fetch(`${API_BASE}${path}`, {
     ...init,
     credentials: 'include',
     headers: {
       'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...(init?.headers ?? {}),
     },
   })

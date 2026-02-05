@@ -13,6 +13,7 @@ class TeacherSubjectYear(Base):
     __tablename__ = "teacher_subject_years"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), nullable=False, index=True)
     teacher_id = Column(UUID(as_uuid=True), nullable=False)
     subject_id = Column(UUID(as_uuid=True), nullable=False)
     academic_year_id = Column(UUID(as_uuid=True), nullable=False)

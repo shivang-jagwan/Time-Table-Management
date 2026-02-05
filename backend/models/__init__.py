@@ -14,6 +14,7 @@ from models.timetable_conflict import TimetableConflict
 from models.timetable_entry import TimetableEntry
 from models.timetable_run import TimetableRun
 from models.time_slot import TimeSlot
+from models.tenant import Tenant
 from models.track_subject import TrackSubject
 from models.academic_year import AcademicYear
 from models.fixed_timetable_entry import FixedTimetableEntry
@@ -41,5 +42,6 @@ __all__ = [
 	"FixedTimetableEntry",
 	"SpecialAllotment",
 	"User",
+	"Tenant",
 ]
 

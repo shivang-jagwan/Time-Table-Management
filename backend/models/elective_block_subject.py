@@ -13,6 +13,7 @@ class ElectiveBlockSubject(Base):
     __tablename__ = "elective_block_subjects"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), nullable=False, index=True)
     block_id = Column(UUID(as_uuid=True), nullable=False)
     subject_id = Column(UUID(as_uuid=True), nullable=False)
     teacher_id = Column(UUID(as_uuid=True), nullable=False)

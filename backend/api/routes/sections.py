@@ -8,7 +8,8 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from api.deps import require_admin
+from api.deps import get_tenant_id, require_admin
+from api.tenant import get_by_id, where_tenant
 from core.db import get_db
 from models.academic_year import AcademicYear
 from models.program import Program
@@ -52,32 +53,40 @@ def _ensure_unique_section_code(db: Session, *, program_id, code: str, exclude_s
         raise HTTPException(status_code=409, detail="SECTION_CODE_ALREADY_EXISTS")
 
 
-def _get_program(db: Session, program_code: str) -> Program:
-    program = db.execute(select(Program).where(Program.code == program_code)).scalar_one_or_none()
+def _get_program(db: Session, program_code: str, *, tenant_id: uuid.UUID | None) -> Program:
+    q = select(Program).where(Program.code == program_code)
+    q = where_tenant(q, Program, tenant_id)
+    program = db.execute(q).scalar_one_or_none()
     if program is None:
         raise HTTPException(status_code=404, detail="PROGRAM_NOT_FOUND")
     return program
 
 
-def _get_academic_year(db: Session, year_number: int) -> AcademicYear:
-    ay = db.execute(select(AcademicYear).where(AcademicYear.year_number == int(year_number))).scalar_one_or_none()
+def _get_academic_year(db: Session, year_number: int, *, tenant_id: uuid.UUID | None) -> AcademicYear:
+    q = select(AcademicYear).where(AcademicYear.year_number == int(year_number))
+    q = where_tenant(q, AcademicYear, tenant_id)
+    ay = db.execute(q).scalar_one_or_none()
     if ay is None:
         raise HTTPException(status_code=404, detail="ACADEMIC_YEAR_NOT_FOUND")
     return ay
 
 
-def _active_days_from_time_slots(db: Session) -> list[int]:
+def _active_days_from_time_slots(db: Session, *, tenant_id: uuid.UUID | None) -> list[int]:
     days = (
-        db.execute(select(TimeSlot.day_of_week).distinct().order_by(TimeSlot.day_of_week.asc()))
+        db.execute(
+            where_tenant(select(TimeSlot.day_of_week).distinct(), TimeSlot, tenant_id).order_by(
+                TimeSlot.day_of_week.asc()
+            )
+        )
         .scalars()
         .all()
     )
     return [int(d) for d in days]
 
 
-def _slot_indices_by_day(db: Session) -> dict[int, set[int]]:
+def _slot_indices_by_day(db: Session, *, tenant_id: uuid.UUID | None) -> dict[int, set[int]]:
     out: dict[int, set[int]] = {}
-    rows = db.execute(select(TimeSlot.day_of_week, TimeSlot.slot_index)).all()
+    rows = db.execute(where_tenant(select(TimeSlot.day_of_week, TimeSlot.slot_index), TimeSlot, tenant_id)).all()
     for d, i in rows:
         out.setdefault(int(d), set()).add(int(i))
     return out
@@ -89,15 +98,16 @@ def list_sections(
     academic_year_number: int | None = Query(default=None, ge=1, le=4),
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> list[SectionOut]:
-    q = select(Section).order_by(Section.code.asc())
+    q = where_tenant(select(Section), Section, tenant_id).order_by(Section.code.asc())
 
     if program_code is not None:
-        program = _get_program(db, program_code)
+        program = _get_program(db, program_code, tenant_id=tenant_id)
         q = q.where(Section.program_id == program.id)
 
     if academic_year_number is not None:
-        ay = _get_academic_year(db, int(academic_year_number))
+        ay = _get_academic_year(db, int(academic_year_number), tenant_id=tenant_id)
         q = q.where(Section.academic_year_id == ay.id)
 
     return db.execute(q).scalars().all()
@@ -108,14 +118,16 @@ def create_section(
     payload: SectionCreate,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> SectionOut:
-    program = _get_program(db, payload.program_code)
-    ay = _get_academic_year(db, int(payload.academic_year_number))
+    program = _get_program(db, payload.program_code, tenant_id=tenant_id)
+    ay = _get_academic_year(db, int(payload.academic_year_number), tenant_id=tenant_id)
 
     track = _validate_track(payload.track)
     _ensure_unique_section_code(db, program_id=program.id, code=payload.code, exclude_section_id=None)
 
     section = Section(
+        tenant_id=tenant_id,
         program_id=program.id,
         academic_year_id=ay.id,
         code=payload.code,
@@ -140,8 +152,9 @@ def update_section(
     payload: SectionUpdate,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> SectionOut:
-    section = db.get(Section, section_id)
+    section = get_by_id(db, Section, section_id, tenant_id)
     if section is None:
         raise HTTPException(status_code=404, detail="SECTION_NOT_FOUND")
 
@@ -175,8 +188,9 @@ def put_section(
     payload: SectionStrengthPut,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> SectionOut:
-    section = db.get(Section, section_id)
+    section = get_by_id(db, Section, section_id, tenant_id)
     if section is None:
         raise HTTPException(status_code=404, detail="SECTION_NOT_FOUND")
 
@@ -184,7 +198,10 @@ def put_section(
     if next_strength < 0:
         raise HTTPException(status_code=400, detail="INVALID_STRENGTH")
 
-    max_capacity = db.execute(select(func.max(Room.capacity)).where(Room.is_active.is_(True))).scalar_one_or_none()
+    max_capacity = (
+        db.execute(where_tenant(select(func.max(Room.capacity)).where(Room.is_active.is_(True)), Room, tenant_id))
+        .scalar_one_or_none()
+    )
     if max_capacity is not None and next_strength > int(max_capacity):
         logger.warning(
             "Section strength exceeds max active room capacity (section_id=%s, strength=%s, max_capacity=%s)",
@@ -210,24 +227,21 @@ def list_section_subjects(
     section_id: uuid.UUID,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> list[SubjectOut]:
-    section = db.get(Section, section_id)
+    section = get_by_id(db, Section, section_id, tenant_id)
     if section is None:
         raise HTTPException(status_code=404, detail="SECTION_NOT_FOUND")
 
-    subject_ids = (
-        db.execute(select(SectionSubject.subject_id).where(SectionSubject.section_id == section_id))
-        .scalars()
-        .all()
-    )
+    q_subject_ids = select(SectionSubject.subject_id).where(SectionSubject.section_id == section_id)
+    q_subject_ids = where_tenant(q_subject_ids, SectionSubject, tenant_id)
+    subject_ids = db.execute(q_subject_ids).scalars().all()
     if not subject_ids:
         return []
 
-    subjects = (
-        db.execute(select(Subject).where(Subject.id.in_(subject_ids)).order_by(Subject.code.asc()))
-        .scalars()
-        .all()
-    )
+    q = select(Subject).where(Subject.id.in_(subject_ids))
+    q = where_tenant(q, Subject, tenant_id).order_by(Subject.code.asc())
+    subjects = db.execute(q).scalars().all()
     return subjects
 
 
@@ -237,14 +251,18 @@ def add_section_subject(
     payload: SectionSubjectCreate,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> dict:
-    section = db.get(Section, section_id)
+    section = get_by_id(db, Section, section_id, tenant_id)
     if section is None:
         raise HTTPException(status_code=404, detail="SECTION_NOT_FOUND")
 
-    subject = db.get(Subject, payload.subject_id)
+    subject = get_by_id(db, Subject, payload.subject_id, tenant_id)
     if subject is None:
         raise HTTPException(status_code=404, detail="SUBJECT_NOT_FOUND")
+
+    if getattr(subject, "tenant_id", None) != getattr(section, "tenant_id", None):
+        raise HTTPException(status_code=400, detail="TENANT_MISMATCH")
 
     if subject.program_id != section.program_id:
         raise HTTPException(status_code=400, detail="SUBJECT_PROGRAM_MISMATCH")
@@ -253,7 +271,7 @@ def add_section_subject(
     if not bool(subject.is_active):
         raise HTTPException(status_code=400, detail="SUBJECT_NOT_ACTIVE")
 
-    row = SectionSubject(section_id=section_id, subject_id=payload.subject_id)
+    row = SectionSubject(tenant_id=tenant_id, section_id=section_id, subject_id=payload.subject_id)
     db.add(row)
     try:
         db.commit()
@@ -270,20 +288,19 @@ def delete_section_subject(
     subject_id: uuid.UUID,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> dict:
-    section = db.get(Section, section_id)
+    section = get_by_id(db, Section, section_id, tenant_id)
     if section is None:
         raise HTTPException(status_code=404, detail="SECTION_NOT_FOUND")
 
-    row = (
-        db.execute(
-            select(SectionSubject)
-            .where(SectionSubject.section_id == section_id)
-            .where(SectionSubject.subject_id == subject_id)
-        )
-        .scalars()
-        .first()
+    q_row = (
+        select(SectionSubject)
+        .where(SectionSubject.section_id == section_id)
+        .where(SectionSubject.subject_id == subject_id)
     )
+    q_row = where_tenant(q_row, SectionSubject, tenant_id)
+    row = db.execute(q_row).scalars().first()
     if row is None:
         raise HTTPException(status_code=404, detail="SECTION_SUBJECT_NOT_FOUND")
 
@@ -297,8 +314,9 @@ def delete_section(
     section_id: uuid.UUID,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> dict:
-    section = db.get(Section, section_id)
+    section = get_by_id(db, Section, section_id, tenant_id)
     if section is None:
         raise HTTPException(status_code=404, detail="SECTION_NOT_FOUND")
     db.delete(section)
@@ -311,20 +329,19 @@ def get_section_time_windows(
     section_id: uuid.UUID,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
-    section = db.get(Section, section_id)
+    section = get_by_id(db, Section, section_id, tenant_id)
     if section is None:
         raise HTTPException(status_code=404, detail="SECTION_NOT_FOUND")
 
-    rows = (
-        db.execute(
-            select(SectionTimeWindow)
-            .where(SectionTimeWindow.section_id == section_id)
-            .order_by(SectionTimeWindow.day_of_week.asc())
-        )
-        .scalars()
-        .all()
+    q_rows = (
+        select(SectionTimeWindow)
+        .where(SectionTimeWindow.section_id == section_id)
+        .order_by(SectionTimeWindow.day_of_week.asc())
     )
+    q_rows = where_tenant(q_rows, SectionTimeWindow, tenant_id)
+    rows = db.execute(q_rows).scalars().all()
     return ListSectionTimeWindowsResponse(
         section_id=section_id,
         windows=[
@@ -347,12 +364,13 @@ def put_section_time_windows(
     payload: PutSectionTimeWindowsRequest,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
-    section = db.get(Section, section_id)
+    section = get_by_id(db, Section, section_id, tenant_id)
     if section is None:
         raise HTTPException(status_code=404, detail="SECTION_NOT_FOUND")
 
-    active_days = _active_days_from_time_slots(db)
+    active_days = _active_days_from_time_slots(db, tenant_id=tenant_id)
     if not active_days:
         raise HTTPException(status_code=422, detail="MISSING_TIME_SLOTS")
 
@@ -368,7 +386,7 @@ def put_section_time_windows(
     if missing_days:
         raise HTTPException(status_code=400, detail="MISSING_DAYS")
 
-    indices_by_day = _slot_indices_by_day(db)
+    indices_by_day = _slot_indices_by_day(db, tenant_id=tenant_id)
     for d in active_days:
         w = by_day[d]
         if int(w.end_slot_index) < int(w.start_slot_index):
@@ -377,11 +395,9 @@ def put_section_time_windows(
         if int(w.start_slot_index) not in valid or int(w.end_slot_index) not in valid:
             raise HTTPException(status_code=400, detail="INVALID_SLOT_INDEX")
 
-    existing = (
-        db.execute(select(SectionTimeWindow).where(SectionTimeWindow.section_id == section_id))
-        .scalars()
-        .all()
-    )
+    q_existing = select(SectionTimeWindow).where(SectionTimeWindow.section_id == section_id)
+    q_existing = where_tenant(q_existing, SectionTimeWindow, tenant_id)
+    existing = db.execute(q_existing).scalars().all()
     existing_map = {int(r.day_of_week): r for r in existing}
 
     for d in active_days:
@@ -390,6 +406,7 @@ def put_section_time_windows(
         if row is None:
             db.add(
                 SectionTimeWindow(
+                    tenant_id=tenant_id,
                     section_id=section_id,
                     day_of_week=d,
                     start_slot_index=int(w.start_slot_index),
@@ -401,4 +418,4 @@ def put_section_time_windows(
             row.end_slot_index = int(w.end_slot_index)
 
     db.commit()
-    return get_section_time_windows(section_id, _admin=_admin, db=db)
+    return get_section_time_windows(section_id, _admin=_admin, db=db, tenant_id=tenant_id)

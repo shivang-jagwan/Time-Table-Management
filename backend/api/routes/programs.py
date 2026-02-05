@@ -7,7 +7,8 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from api.deps import require_admin
+from api.deps import get_tenant_id, require_admin
+from api.tenant import get_by_id, where_tenant
 from core.db import get_db
 from models.program import Program
 from schemas.program import ProgramCreate, ProgramOut, ProgramUpdate
@@ -19,8 +20,10 @@ router = APIRouter()
 @router.get("/", response_model=list[ProgramOut])
 def list_programs(
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> list[ProgramOut]:
-    return db.execute(select(Program).order_by(Program.code.asc())).scalars().all()
+    q = where_tenant(select(Program), Program, tenant_id).order_by(Program.code.asc())
+    return db.execute(q).scalars().all()
 
 
 @router.post("/", response_model=ProgramOut)
@@ -28,8 +31,12 @@ def create_program(
     payload: ProgramCreate,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> ProgramOut:
-    program = Program(**payload.model_dump())
+    data = payload.model_dump()
+    if tenant_id is not None:
+        data["tenant_id"] = tenant_id
+    program = Program(**data)
     db.add(program)
     try:
         db.commit()
@@ -46,8 +53,9 @@ def update_program(
     payload: ProgramUpdate,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> ProgramOut:
-    program = db.get(Program, program_id)
+    program = get_by_id(db, Program, program_id, tenant_id)
     if program is None:
         raise HTTPException(status_code=404, detail="PROGRAM_NOT_FOUND")
 
@@ -70,8 +78,9 @@ def delete_program(
     program_id: uuid.UUID,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> dict:
-    program = db.get(Program, program_id)
+    program = get_by_id(db, Program, program_id, tenant_id)
     if program is None:
         raise HTTPException(status_code=404, detail="PROGRAM_NOT_FOUND")
     db.delete(program)

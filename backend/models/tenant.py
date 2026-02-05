@@ -2,18 +2,17 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import Column, DateTime
+from sqlalchemy import Column, DateTime, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.sql import func
 
 from models.base import Base
 
 
-class TeacherSubject(Base):
-    __tablename__ = "teacher_subjects"
+class Tenant(Base):
+    __tablename__ = "tenants"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    tenant_id = Column(UUID(as_uuid=True), nullable=False, index=True)
-    teacher_id = Column(UUID(as_uuid=True), nullable=False)
-    subject_id = Column(UUID(as_uuid=True), nullable=False)
+    slug = Column(Text, nullable=False, unique=True)
+    name = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())

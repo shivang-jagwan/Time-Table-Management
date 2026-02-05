@@ -19,4 +19,5 @@ backend/_dev_uvicorn.*
 backend/_uvicorn.*
 backend/uvicorn.*
 backend/detached_uvicorn.log
+backend/outputs/
 frontend/frontend_dev.*

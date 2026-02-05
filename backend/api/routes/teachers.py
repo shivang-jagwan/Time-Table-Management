@@ -7,7 +7,8 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from api.deps import require_admin
+from api.deps import get_tenant_id, require_admin
+from api.tenant import get_by_id, where_tenant
 from core.db import get_db
 from models.teacher import Teacher
 from schemas.teacher import TeacherCreate, TeacherOut, TeacherPut, TeacherUpdate
@@ -29,8 +30,8 @@ def _validate_teacher_constraints(
         errors.append("WEEKLY_OFF_DAY_OUT_OF_RANGE")
     if int(max_per_day) > 6:
         errors.append("MAX_PER_DAY_EXCEEDS_6")
-    if int(max_per_week) > 30:
-        errors.append("MAX_PER_WEEK_EXCEEDS_30")
+    if int(max_per_week) > 36:
+        errors.append("MAX_PER_WEEK_EXCEEDS_36")
     if int(max_per_day) > int(max_per_week):
         errors.append("MAX_PER_DAY_GT_MAX_PER_WEEK")
     if int(max_continuous) > int(max_per_day):
@@ -52,8 +53,10 @@ def _validate_teacher_constraints(
 def list_teachers(
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> list[TeacherOut]:
-    rows = db.execute(select(Teacher).order_by(Teacher.full_name.asc())).scalars().all()
+    q = where_tenant(select(Teacher), Teacher, tenant_id).order_by(Teacher.full_name.asc())
+    rows = db.execute(q).scalars().all()
     return rows
 
 
@@ -62,6 +65,7 @@ def create_teacher(
     payload: TeacherCreate,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> TeacherOut:
     _validate_teacher_constraints(
         weekly_off_day=payload.weekly_off_day,
@@ -70,7 +74,10 @@ def create_teacher(
         max_continuous=int(payload.max_continuous),
     )
 
-    teacher = Teacher(**payload.model_dump())
+    data = payload.model_dump()
+    if tenant_id is not None:
+        data["tenant_id"] = tenant_id
+    teacher = Teacher(**data)
     db.add(teacher)
     try:
         db.commit()
@@ -87,8 +94,9 @@ def update_teacher(
     payload: TeacherUpdate,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> TeacherOut:
-    teacher = db.get(Teacher, teacher_id)
+    teacher = get_by_id(db, Teacher, teacher_id, tenant_id)
     if teacher is None:
         raise HTTPException(status_code=404, detail="TEACHER_NOT_FOUND")
 
@@ -124,8 +132,9 @@ def put_teacher(
     payload: TeacherPut,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> TeacherOut:
-    teacher = db.get(Teacher, teacher_id)
+    teacher = get_by_id(db, Teacher, teacher_id, tenant_id)
     if teacher is None:
         raise HTTPException(status_code=404, detail="TEACHER_NOT_FOUND")
 
@@ -158,8 +167,9 @@ def delete_teacher(
     teacher_id: uuid.UUID,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> dict:
-    teacher = db.get(Teacher, teacher_id)
+    teacher = get_by_id(db, Teacher, teacher_id, tenant_id)
     if teacher is None:
         raise HTTPException(status_code=404, detail="TEACHER_NOT_FOUND")
     db.delete(teacher)
