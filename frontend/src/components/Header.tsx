@@ -1,6 +1,17 @@
 import React from 'react'
 import { listPrograms, type Program } from '../api/programs'
+import { useAuth } from '../auth/AuthProvider'
 import { PremiumSelect } from './PremiumSelect'
+
+function initialsFromName(name: string) {
+  const parts = name
+    .split(/\s+/)
+    .map((p) => p.trim())
+    .filter(Boolean)
+  const a = parts[0]?.[0] ?? 'U'
+  const b = parts[1]?.[0] ?? parts[0]?.[1] ?? ''
+  return (a + b).toUpperCase()
+}
 
 export function Header({
   collapsed,
@@ -19,8 +30,18 @@ export function Header({
   onChangeAcademicYearNumber: (v: number) => void
   onLogout: () => void
 }) {
+  const { state } = useAuth()
   const [programs, setPrograms] = React.useState<Program[]>([])
   const [useCustomProgram, setUseCustomProgram] = React.useState(false)
+
+  const displayName = state.status === 'authenticated' ? state.user.username : 'User'
+  const roleLabel =
+    state.status === 'authenticated'
+      ? state.user.role
+      : state.status === 'loading'
+        ? 'Loading…'
+        : 'Signed out'
+  const userInitials = state.status === 'authenticated' ? initialsFromName(state.user.username) : 'U'
 
   React.useEffect(() => {
     let cancelled = false
@@ -131,11 +152,11 @@ export function Header({
         <div className="flex items-center gap-2">
           <div className="hidden items-center gap-2 rounded-2xl border border-white/30 bg-white/55 px-3 py-2 text-sm text-slate-800 backdrop-blur-[10px] md:flex">
             <span className="grid size-7 place-items-center rounded-xl bg-slate-900 text-white">
-              DA
+              {userInitials}
             </span>
             <div className="leading-tight">
-              <div className="text-xs font-semibold text-slate-900">Demo Admin</div>
-              <div className="text-[11px] text-slate-500">Local session</div>
+              <div className="text-xs font-semibold text-slate-900">{displayName}</div>
+              <div className="text-[11px] text-slate-500">{roleLabel}</div>
             </div>
           </div>
           <button

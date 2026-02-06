@@ -1,5 +1,6 @@
 import React from 'react'
 import { listPrograms, type Program } from '../../api/programs'
+import { useAuth } from '../../auth/AuthProvider'
 import { HamburgerButton } from './HamburgerButton'
 import { PremiumSelect } from '../PremiumSelect'
 
@@ -34,6 +35,7 @@ export function Header({
   onChangeAcademicYearNumber,
   onLogout,
 }: Props) {
+  const { state } = useAuth()
   const [programs, setPrograms] = React.useState<Program[]>([])
   const [useCustomProgram, setUseCustomProgram] = React.useState(false)
 
@@ -84,8 +86,14 @@ export function Header({
     'rounded-lg border border-white/30 bg-white/15 px-3 py-2 text-sm text-white shadow-sm backdrop-blur-sm transition ' +
     'placeholder:text-white/70 hover:border-white/50 focus:outline-none focus:ring-2 focus:ring-white/40'
 
-  const displayName = 'Demo Admin'
-  const userInitials = initialsFromName(displayName)
+  const displayName = state.status === 'authenticated' ? state.user.username : 'User'
+  const roleLabel =
+    state.status === 'authenticated'
+      ? state.user.role
+      : state.status === 'loading'
+        ? 'Loading…'
+        : 'Signed out'
+  const userInitials = state.status === 'authenticated' ? initialsFromName(state.user.username) : 'U'
 
   return (
     <header className="fixed top-0 left-0 right-0 z-50 h-16 bg-gradient-to-r from-green-600 to-green-500 shadow-md backdrop-blur-sm border-b border-green-400/30 text-white">
@@ -179,7 +187,7 @@ export function Header({
               </span>
               <div className="leading-tight">
                 <div className="text-sm font-semibold text-white">{displayName}</div>
-                <div className="text-xs text-white/80">Local Session</div>
+                <div className="text-xs text-white/80">{roleLabel}</div>
               </div>
             </div>
           </div>
