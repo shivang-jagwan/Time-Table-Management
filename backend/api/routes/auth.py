@@ -47,13 +47,33 @@ def _enforce_login_rate_limit(request: Request, username: str) -> None:
         raise HTTPException(status_code=429, detail="RATE_LIMITED")
 
 
-def _resolve_tenant_id_for_auth(db: Session, tenant_hint: str | None) -> str | None:
+def _resolve_tenant_id_for_auth(
+    db: Session,
+    tenant_hint: str | None,
+    *,
+    username_hint: str | None = None,
+) -> str | None:
     mode = (settings.tenant_mode or "shared").strip().lower()
     if mode != "per_tenant":
         return None
 
     hint = (tenant_hint or "").strip()
     if not hint:
+        # Backward-compatible UX: allow login without a tenant field.
+        # If the username uniquely exists in exactly one tenant, infer it.
+        # If it exists in multiple tenants, force the caller to specify tenant.
+        un = (username_hint or "").strip()
+        if un:
+            rows = db.execute(
+                select(User.tenant_id).where(func.lower(User.username) == func.lower(un))
+            ).all()
+            tenant_ids = [str(r[0]) for r in rows if r and r[0] is not None]
+            distinct = sorted(set(tenant_ids))
+            if len(distinct) == 1:
+                return distinct[0]
+            if len(distinct) > 1:
+                raise HTTPException(status_code=401, detail="TENANT_REQUIRED")
+
         hint = "default"
 
     q = select(Tenant.id).where(func.lower(Tenant.slug) == func.lower(hint))
@@ -76,7 +96,7 @@ def login(
     username = str(payload.username or "").strip()
     _enforce_login_rate_limit(request, username)
 
-    tenant_id_for_auth = _resolve_tenant_id_for_auth(db, payload.tenant)
+    tenant_id_for_auth = _resolve_tenant_id_for_auth(db, payload.tenant, username_hint=username)
 
     ip = request.client.host if request.client else "unknown"
 
