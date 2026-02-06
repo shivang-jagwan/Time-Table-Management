@@ -90,11 +90,24 @@ def list_subjects(
     q = where_tenant(select(Subject), Subject, tenant_id).order_by(Subject.code.asc())
 
     if program_code is not None:
-        program = _get_program(db, program_code, tenant_id=tenant_id)
+        # For list views we prefer a clean empty result over a hard 404
+        # when the program hasn't been created yet.
+        q_program = where_tenant(select(Program).where(Program.code == program_code), Program, tenant_id)
+        program = db.execute(q_program).scalar_one_or_none()
+        if program is None:
+            return []
         q = q.where(Subject.program_id == program.id)
 
     if academic_year_number is not None:
-        ay = _get_academic_year(db, int(academic_year_number), tenant_id=tenant_id)
+        # Same rationale as program: missing academic years are common in fresh tenants.
+        q_ay = where_tenant(
+            select(AcademicYear).where(AcademicYear.year_number == int(academic_year_number)),
+            AcademicYear,
+            tenant_id,
+        )
+        ay = db.execute(q_ay).scalar_one_or_none()
+        if ay is None:
+            return []
         q = q.where(Subject.academic_year_id == ay.id)
 
     return db.execute(q).scalars().all()

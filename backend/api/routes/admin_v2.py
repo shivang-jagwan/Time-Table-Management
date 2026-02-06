@@ -23,7 +23,6 @@ from models.special_allotment import SpecialAllotment
 from models.subject import Subject
 from models.teacher import Teacher
 from models.teacher_subject_section import TeacherSubjectSection
-from models.teacher_subject_year import TeacherSubjectYear
 from models.time_slot import TimeSlot
 from models.timetable_entry import TimetableEntry
 from models.timetable_run import TimetableRun
@@ -174,8 +173,19 @@ def map_program_data_to_year(
         if payload.dry_run:
             bucket[key] = 0
             return
-        res = db.execute(stmt)
-        bucket[key] = res.rowcount or 0
+        try:
+            res = db.execute(stmt)
+            bucket[key] = res.rowcount or 0
+        except IntegrityError:
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "YEAR_MAPPING_CONFLICT",
+                    "step": key,
+                    "hint": "Try replace_target=true if target year already has data.",
+                },
+            )
 
     # Optional: clear target-year data first to avoid uniqueness conflicts.
     if payload.replace_target:
@@ -212,14 +222,6 @@ def map_program_data_to_year(
                 )
             ),
             key="section_time_windows",
-            bucket=deleted,
-        )
-        _maybe_exec(
-            delete(TeacherSubjectYear).where(
-                TeacherSubjectYear.academic_year_id == to_year.id,
-                TeacherSubjectYear.subject_id.in_(program_subject_ids),
-            ),
-            key="teacher_subject_years",
             bucket=deleted,
         )
         _maybe_exec(
@@ -298,13 +300,6 @@ def map_program_data_to_year(
         bucket=updated_counts,
     )
 
-    _maybe_exec(
-        update(TeacherSubjectYear)
-        .where(TeacherSubjectYear.academic_year_id == from_year.id, TeacherSubjectYear.subject_id.in_(program_subject_ids))
-        .values(academic_year_id=to_year.id),
-        key="teacher_subject_years",
-        bucket=updated_counts,
-    )
 
     _maybe_exec(
         update(CombinedSubjectGroup)
