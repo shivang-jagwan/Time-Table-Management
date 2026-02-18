@@ -1000,10 +1000,15 @@ def create_combined_subject_group(
 
     legacy_group = CombinedSubjectGroup(tenant_id=tenant_id, academic_year_id=year.id, subject_id=subject.id)
     db.add(legacy_group)
-    db.flush()
-    for sec in sections:
-        db.add(CombinedSubjectSection(tenant_id=tenant_id, combined_group_id=legacy_group.id, section_id=sec.id))
-    db.commit()
+    try:
+        db.flush()
+        for sec in sections:
+            db.add(CombinedSubjectSection(tenant_id=tenant_id, combined_group_id=legacy_group.id, section_id=sec.id))
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="SECTION_IN_MULTIPLE_COMBINED_GROUPS")
+
     db.refresh(legacy_group)
 
     return CombinedSubjectGroupOut(
@@ -1179,7 +1184,11 @@ def update_combined_subject_group(
     db.execute(stmt_del)
     for sec in sections:
         db.add(CombinedSubjectSection(tenant_id=tenant_id, combined_group_id=group.id, section_id=sec.id))
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="SECTION_IN_MULTIPLE_COMBINED_GROUPS")
 
     return CombinedSubjectGroupOut(
         id=group.id,

@@ -1738,6 +1738,8 @@ def validate_prereqs(
                 Subject.academic_year_id.in_(solve_year_ids)
             )
         q_combined = where_tenant(q_combined, CombinedGroup, tenant_id)
+        q_combined = where_tenant(q_combined, CombinedGroupSection, tenant_id)
+        q_combined = where_tenant(q_combined, Subject, tenant_id)
         combined_rows = db.execute(q_combined).all()
     else:
         q_combined = (
