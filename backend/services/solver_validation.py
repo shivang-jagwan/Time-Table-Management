@@ -8,8 +8,11 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from api.tenant import where_tenant
+from core.db import table_exists
 from models.combined_group import CombinedGroup
 from models.combined_group_section import CombinedGroupSection
+from models.combined_subject_group import CombinedSubjectGroup
+from models.combined_subject_section import CombinedSubjectSection
 from models.elective_block import ElectiveBlock
 from models.elective_block_subject import ElectiveBlockSubject
 from models.room import Room
@@ -1717,22 +1720,42 @@ def validate_prereqs(
             )
 
     # =========================
-    # Combined Groups (v2)
+    # Combined Groups (v2 + legacy fallback)
     # =========================
-    q_combined = (
-        select(CombinedGroup, Subject, Teacher, CombinedGroupSection.section_id)
-        .join(Subject, Subject.id == CombinedGroup.subject_id)
-        .outerjoin(Teacher, Teacher.id == CombinedGroup.teacher_id)
-        .join(CombinedGroupSection, CombinedGroupSection.combined_group_id == CombinedGroup.id)
-        .where(Subject.program_id == program_id)
-        .where(Subject.is_active.is_(True))
-    )
-    if solve_year_ids:
-        q_combined = q_combined.where(CombinedGroup.academic_year_id.in_(solve_year_ids)).where(
-            Subject.academic_year_id.in_(solve_year_ids)
+    use_v2 = table_exists(db, "combined_groups") and table_exists(db, "combined_group_sections")
+
+    if use_v2:
+        q_combined = (
+            select(CombinedGroup, Subject, Teacher, CombinedGroupSection.section_id)
+            .join(Subject, Subject.id == CombinedGroup.subject_id)
+            .outerjoin(Teacher, Teacher.id == CombinedGroup.teacher_id)
+            .join(CombinedGroupSection, CombinedGroupSection.combined_group_id == CombinedGroup.id)
+            .where(Subject.program_id == program_id)
+            .where(Subject.is_active.is_(True))
         )
-    q_combined = where_tenant(q_combined, CombinedGroup, tenant_id)
-    combined_rows = db.execute(q_combined).all()
+        if solve_year_ids:
+            q_combined = q_combined.where(CombinedGroup.academic_year_id.in_(solve_year_ids)).where(
+                Subject.academic_year_id.in_(solve_year_ids)
+            )
+        q_combined = where_tenant(q_combined, CombinedGroup, tenant_id)
+        combined_rows = db.execute(q_combined).all()
+    else:
+        q_combined = (
+            select(CombinedSubjectGroup, Subject, CombinedSubjectSection.section_id)
+            .join(Subject, Subject.id == CombinedSubjectGroup.subject_id)
+            .join(CombinedSubjectSection, CombinedSubjectSection.combined_group_id == CombinedSubjectGroup.id)
+            .where(Subject.program_id == program_id)
+            .where(Subject.is_active.is_(True))
+        )
+        if solve_year_ids:
+            q_combined = q_combined.where(CombinedSubjectGroup.academic_year_id.in_(solve_year_ids)).where(
+                Subject.academic_year_id.in_(solve_year_ids)
+            )
+        q_combined = where_tenant(q_combined, CombinedSubjectGroup, tenant_id)
+        q_combined = where_tenant(q_combined, CombinedSubjectSection, tenant_id)
+        q_combined = where_tenant(q_combined, Subject, tenant_id)
+        legacy_rows = db.execute(q_combined).all()
+        combined_rows = [(g, subj, None, sec_id) for g, subj, sec_id in legacy_rows]
 
     if combined_rows:
         has_lt = (
@@ -1841,6 +1864,38 @@ def validate_prereqs(
 
         tid = group_teacher_id.get(gid)
         t = group_teacher.get(gid)
+
+        # If v2 teacher isn't present (or we're on legacy tables), infer teacher via strict assignments.
+        mismatch = False
+        if tid is None:
+            inferred_tid = None
+            for sid in sec_ids:
+                assigned_tid = assigned_teacher_by_section_subject.get((sid, subj_id))
+                if assigned_tid is None:
+                    inferred_tid = None
+                    break
+                if inferred_tid is None:
+                    inferred_tid = assigned_tid
+                elif inferred_tid != assigned_tid:
+                    mismatch = True
+                    inferred_tid = None
+                    break
+            tid = inferred_tid
+
+        if mismatch:
+            conflicts.append(
+                ValidationConflict(
+                    conflict_type="COMBINED_GROUP_TEACHER_MISMATCH",
+                    message="Combined group requires a single shared teacher across sections.",
+                    subject_id=subj_id,
+                    metadata={"combined_group_id": str(gid), "subject_code": subj_code},
+                )
+            )
+
+        if tid is not None and t is None:
+            t = (
+                db.execute(where_tenant(select(Teacher).where(Teacher.id == tid), Teacher, tenant_id)).scalars().first()
+            )
         if tid is None or t is None or not bool(getattr(t, "is_active", False)):
             conflicts.append(
                 ValidationConflict(

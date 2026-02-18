@@ -87,6 +87,9 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
               'Cannot replace time slots while existing timetables exist. Disable “Replace existing” or clear timetable runs/entries first.',
             )
           }
+          if (detail.trim().toLowerCase() === 'internal server error') {
+            throw new Error(`Internal Server Error (${res.status}). Check backend logs.`)
+          }
           throw new Error(detail)
         }
 
@@ -115,6 +118,9 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
       }
     }
 
+    if (raw && raw.trim().toLowerCase() === 'internal server error') {
+      throw new Error(`Internal Server Error (${res.status}). Check backend logs.`)
+    }
     throw new Error(raw || `Request failed: ${res.status}`)
   }
   return (await res.json()) as T

@@ -15,6 +15,7 @@ from core.db import (
     DatabaseUnavailableError,
     get_db,
     is_transient_db_connectivity_error,
+    table_exists,
     validate_db_connection,
 )
 from models.academic_year import AcademicYear
@@ -38,6 +39,8 @@ from models.elective_block import ElectiveBlock
 from models.elective_block_subject import ElectiveBlockSubject
 from models.combined_group import CombinedGroup
 from models.combined_group_section import CombinedGroupSection
+from models.combined_subject_group import CombinedSubjectGroup
+from models.combined_subject_section import CombinedSubjectSection
 from schemas.solver import (
     GenerateTimetableRequest,
     GenerateGlobalTimetableRequest,
@@ -251,24 +254,48 @@ def _validate_special_allotment_refs(
         raise HTTPException(status_code=400, detail="SUBJECT_IN_ELECTIVE_BLOCK_NOT_SUPPORTED")
 
     # Not supported: special locks for combined-class subjects.
-    in_combined = (
-        db.execute(
-            where_tenant(
+    use_v2 = table_exists(db, "combined_groups") and table_exists(db, "combined_group_sections")
+    if use_v2:
+        in_combined = (
+            db.execute(
                 where_tenant(
-                    select(CombinedGroup.id)
-                    .join(CombinedGroupSection, CombinedGroupSection.combined_group_id == CombinedGroup.id)
-                    .where(CombinedGroup.subject_id == subject.id)
-                    .where(CombinedGroupSection.section_id == section.id)
-                    .limit(1),
-                    CombinedGroup,
+                    where_tenant(
+                        select(CombinedGroup.id)
+                        .join(CombinedGroupSection, CombinedGroupSection.combined_group_id == CombinedGroup.id)
+                        .where(CombinedGroup.subject_id == subject.id)
+                        .where(CombinedGroupSection.section_id == section.id)
+                        .limit(1),
+                        CombinedGroup,
+                        tenant_id,
+                    ),
+                    CombinedGroupSection,
                     tenant_id,
-                ),
-                CombinedGroupSection,
-                tenant_id,
-            )
-        ).first()
-        is not None
-    )
+                )
+            ).first()
+            is not None
+        )
+    else:
+        in_combined = (
+            db.execute(
+                where_tenant(
+                    where_tenant(
+                        select(CombinedSubjectGroup.id)
+                        .join(
+                            CombinedSubjectSection,
+                            CombinedSubjectSection.combined_group_id == CombinedSubjectGroup.id,
+                        )
+                        .where(CombinedSubjectGroup.subject_id == subject.id)
+                        .where(CombinedSubjectSection.section_id == section.id)
+                        .limit(1),
+                        CombinedSubjectGroup,
+                        tenant_id,
+                    ),
+                    CombinedSubjectSection,
+                    tenant_id,
+                )
+            ).first()
+            is not None
+        )
     if in_combined:
         raise HTTPException(status_code=400, detail="SUBJECT_IN_COMBINED_CLASS_NOT_SUPPORTED")
 

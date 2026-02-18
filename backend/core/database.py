@@ -186,3 +186,23 @@ def validate_db_connection(db: Session) -> None:
         if is_transient_db_connectivity_error(exc):
             raise DatabaseUnavailableError("Database temporarily unavailable") from exc
         raise
+
+
+def table_exists(db: Session, table_name: str, *, schema: str = "public") -> bool:
+    """Return True if the given table exists.
+
+    Used to keep the API/solver resilient when DB migrations haven't yet been applied.
+    """
+
+    full_name = f"{schema}.{table_name}" if schema else table_name
+    try:
+        # Postgres-specific and very fast.
+        reg = db.execute(text("select to_regclass(:name)"), {"name": full_name}).scalar_one_or_none()
+        return reg is not None
+    except Exception:
+        # Fallback to SQLAlchemy inspection.
+        try:
+            bind = db.get_bind()
+            return bool(inspect(bind).has_table(table_name, schema=schema))
+        except Exception:
+            return False

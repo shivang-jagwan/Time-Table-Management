@@ -92,21 +92,34 @@ export function CombinedClasses() {
         setSections([])
         setGroups([])
         setSubjectCode('')
-        setSelectedSectionCodes(new Set())
+        setNewSelectedSectionCodes(new Set())
         return
       }
-      const [subjs, secs, gs] = await Promise.all([
+      // Load core data first so the UI can still function
+      // even if combined groups fail (e.g., missing DB migration).
+      const [subjs, secs] = await Promise.all([
         listSubjects({ program_code: pc, academic_year_number: nextYear }),
         listSections({ program_code: pc, academic_year_number: nextYear }),
-        listCombinedSubjectGroups({ program_code: pc, academic_year_number: nextYear }),
       ])
       setSubjects(subjs)
       setSections(secs)
-      setGroups(gs)
 
-      // Teachers are global in this app; load once per refresh.
-      const ts = await listTeachers()
-      setTeachers(ts)
+      try {
+        const gs = await listCombinedSubjectGroups({ program_code: pc, academic_year_number: nextYear })
+        setGroups(gs)
+      } catch (e: any) {
+        setGroups([])
+        showToast(`Load combined groups failed: ${String(e?.message ?? e)}`, 4000)
+      }
+
+      try {
+        // Teachers are global in this app; load once per refresh.
+        const ts = await listTeachers()
+        setTeachers(ts)
+      } catch (e: any) {
+        setTeachers([])
+        showToast(`Load teachers failed: ${String(e?.message ?? e)}`, 4000)
+      }
 
       // If current subject isn't valid in this year anymore, reset.
       if (subjectCode) {
@@ -345,7 +358,7 @@ export function CombinedClasses() {
                     const nextYear = Number(v)
                     setYear(nextYear)
                     setSubjectCode('')
-                    setSelectedSectionCodes(new Set())
+                    setNewSelectedSectionCodes(new Set())
                     await refreshRulesData(nextYear)
                   }}
                   options={[1, 2, 3].map((n) => ({ value: String(n), label: `Year ${n}` }))}

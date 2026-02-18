@@ -11,10 +11,12 @@ from sqlalchemy.orm import Session
 
 from api.deps import get_tenant_id, require_admin
 from api.tenant import where_tenant
-from core.db import get_db
+from core.db import get_db, table_exists
 from models.academic_year import AcademicYear
 from models.combined_group import CombinedGroup
 from models.combined_group_section import CombinedGroupSection
+from models.combined_subject_group import CombinedSubjectGroup
+from models.combined_subject_section import CombinedSubjectSection
 from models.program import Program
 from models.section import Section
 from models.section_time_window import SectionTimeWindow
@@ -724,39 +726,126 @@ def list_combined_subject_groups(
             return []
         subj_filter_id = subject.id
 
-    q = (
-        select(CombinedGroup, Subject, Teacher)
-        .join(Subject, Subject.id == CombinedGroup.subject_id)
-        .outerjoin(Teacher, Teacher.id == CombinedGroup.teacher_id)
-        .where(CombinedGroup.academic_year_id == year.id)
-        .where(Subject.program_id == program.id)
-    )
-    q = where_tenant(q, CombinedGroup, tenant_id)
-    if subj_filter_id is not None:
-        q = q.where(CombinedGroup.subject_id == subj_filter_id)
+    use_v2 = table_exists(db, "combined_groups") and table_exists(db, "combined_group_sections")
 
-    groups = db.execute(q.order_by(Subject.code.asc(), CombinedGroup.created_at.asc())).all()
-    if not groups:
+    if use_v2:
+        q = (
+            select(CombinedGroup, Subject, Teacher)
+            .join(Subject, Subject.id == CombinedGroup.subject_id)
+            .outerjoin(Teacher, Teacher.id == CombinedGroup.teacher_id)
+            .where(CombinedGroup.academic_year_id == year.id)
+            .where(Subject.program_id == program.id)
+        )
+        q = where_tenant(q, CombinedGroup, tenant_id)
+        if subj_filter_id is not None:
+            q = q.where(CombinedGroup.subject_id == subj_filter_id)
+
+        groups = db.execute(q.order_by(Subject.code.asc(), CombinedGroup.created_at.asc())).all()
+        if not groups:
+            return []
+
+        group_ids = [g.id for g, _subj, _teacher in groups]
+        sec_q = (
+            select(CombinedGroupSection.combined_group_id, Section)
+            .join(Section, Section.id == CombinedGroupSection.section_id)
+            .where(CombinedGroupSection.combined_group_id.in_(group_ids))
+            .order_by(Section.code.asc())
+        )
+        sec_q = where_tenant(sec_q, CombinedGroupSection, tenant_id)
+        sec_rows = db.execute(sec_q).all()
+
+        sections_by_group: dict[uuid.UUID, list[CombinedSubjectGroupSectionOut]] = {}
+        for gid, sec in sec_rows:
+            sections_by_group.setdefault(gid, []).append(
+                CombinedSubjectGroupSectionOut(section_id=sec.id, section_code=sec.code, section_name=sec.name)
+            )
+
+        out: list[CombinedSubjectGroupOut] = []
+        for g, subj, teacher in groups:
+            out.append(
+                CombinedSubjectGroupOut(
+                    id=g.id,
+                    academic_year_number=academic_year_number,
+                    subject_id=subj.id,
+                    subject_code=subj.code,
+                    subject_name=subj.name,
+                    teacher_id=getattr(g, "teacher_id", None),
+                    teacher_code=getattr(teacher, "code", None) if teacher is not None else None,
+                    teacher_name=getattr(teacher, "full_name", None) if teacher is not None else None,
+                    label=getattr(g, "label", None),
+                    sections=sections_by_group.get(g.id, []),
+                    created_at=g.created_at,
+                )
+            )
+        return out
+
+    # Legacy fallback
+    q = (
+        select(CombinedSubjectGroup, Subject)
+        .join(Subject, Subject.id == CombinedSubjectGroup.subject_id)
+        .where(CombinedSubjectGroup.academic_year_id == year.id)
+        .where(Subject.program_id == program.id)
+        .where(Subject.is_active.is_(True))
+        .order_by(Subject.code.asc(), CombinedSubjectGroup.created_at.asc())
+    )
+    q = where_tenant(q, CombinedSubjectGroup, tenant_id)
+    if subj_filter_id is not None:
+        q = q.where(CombinedSubjectGroup.subject_id == subj_filter_id)
+
+    legacy_groups = db.execute(q).all()
+    if not legacy_groups:
         return []
 
-    group_ids = [g.id for g, _subj, _teacher in groups]
+    group_ids = [g.id for g, _subj in legacy_groups]
     sec_q = (
-        select(CombinedGroupSection.combined_group_id, Section)
-        .join(Section, Section.id == CombinedGroupSection.section_id)
-        .where(CombinedGroupSection.combined_group_id.in_(group_ids))
+        select(CombinedSubjectSection.combined_group_id, Section)
+        .join(Section, Section.id == CombinedSubjectSection.section_id)
+        .where(CombinedSubjectSection.combined_group_id.in_(group_ids))
         .order_by(Section.code.asc())
     )
-    sec_q = where_tenant(sec_q, CombinedGroupSection, tenant_id)
+    sec_q = where_tenant(sec_q, CombinedSubjectSection, tenant_id)
     sec_rows = db.execute(sec_q).all()
 
     sections_by_group: dict[uuid.UUID, list[CombinedSubjectGroupSectionOut]] = {}
+    section_ids: set[uuid.UUID] = set()
     for gid, sec in sec_rows:
+        section_ids.add(sec.id)
         sections_by_group.setdefault(gid, []).append(
             CombinedSubjectGroupSectionOut(section_id=sec.id, section_code=sec.code, section_name=sec.name)
         )
 
+    subj_ids = {subj.id for _g, subj in legacy_groups}
+    teacher_by_sec_subj: dict[tuple[uuid.UUID, uuid.UUID], Teacher] = {}
+    if section_ids and subj_ids:
+        tss_q = (
+            select(TeacherSubjectSection.section_id, TeacherSubjectSection.subject_id, Teacher)
+            .join(Teacher, Teacher.id == TeacherSubjectSection.teacher_id)
+            .where(TeacherSubjectSection.section_id.in_(list(section_ids)))
+            .where(TeacherSubjectSection.subject_id.in_(list(subj_ids)))
+            .where(TeacherSubjectSection.is_active.is_(True))
+        )
+        tss_q = where_tenant(tss_q, TeacherSubjectSection, tenant_id)
+        for sec_id, subj_id, t in db.execute(tss_q).all():
+            teacher_by_sec_subj[(sec_id, subj_id)] = t
+
     out: list[CombinedSubjectGroupOut] = []
-    for g, subj, teacher in groups:
+    for g, subj in legacy_groups:
+        secs = sections_by_group.get(g.id, [])
+        eff_teacher: Teacher | None = None
+        ok = True
+        for s in secs:
+            t = teacher_by_sec_subj.get((s.section_id, subj.id))
+            if t is None:
+                ok = False
+                break
+            if eff_teacher is None:
+                eff_teacher = t
+            elif eff_teacher.id != t.id:
+                ok = False
+                break
+        if not ok:
+            eff_teacher = None
+
         out.append(
             CombinedSubjectGroupOut(
                 id=g.id,
@@ -764,11 +853,11 @@ def list_combined_subject_groups(
                 subject_id=subj.id,
                 subject_code=subj.code,
                 subject_name=subj.name,
-                teacher_id=getattr(g, "teacher_id", None),
-                teacher_code=getattr(teacher, "code", None) if teacher is not None else None,
-                teacher_name=getattr(teacher, "full_name", None) if teacher is not None else None,
-                label=getattr(g, "label", None),
-                sections=sections_by_group.get(g.id, []),
+                teacher_id=eff_teacher.id if eff_teacher is not None else None,
+                teacher_code=eff_teacher.code if eff_teacher is not None else None,
+                teacher_name=eff_teacher.full_name if eff_teacher is not None else None,
+                label=None,
+                sections=secs,
                 created_at=g.created_at,
             )
         )
@@ -843,35 +932,82 @@ def create_combined_subject_group(
     if len(sections) != len(section_codes):
         raise HTTPException(status_code=422, detail="SECTION_NOT_FOUND")
 
-    group = CombinedGroup(
-        tenant_id=tenant_id,
-        academic_year_id=year.id,
-        subject_id=subject.id,
-        teacher_id=teacher.id,
-        label=(payload.label.strip() if payload.label is not None and payload.label.strip() else None),
-    )
-    db.add(group)
-    db.flush()
+    use_v2 = table_exists(db, "combined_groups") and table_exists(db, "combined_group_sections")
+    if use_v2:
+        group = CombinedGroup(
+            tenant_id=tenant_id,
+            academic_year_id=year.id,
+            subject_id=subject.id,
+            teacher_id=teacher.id,
+            label=(payload.label.strip() if payload.label is not None and payload.label.strip() else None),
+        )
+        db.add(group)
+        db.flush()
 
-    for sec in sections:
-        db.add(
-            CombinedGroupSection(
-                tenant_id=tenant_id,
-                combined_group_id=group.id,
-                subject_id=subject.id,
-                section_id=sec.id,
+        for sec in sections:
+            db.add(
+                CombinedGroupSection(
+                    tenant_id=tenant_id,
+                    combined_group_id=group.id,
+                    subject_id=subject.id,
+                    section_id=sec.id,
+                )
             )
+
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            raise HTTPException(status_code=409, detail="SECTION_IN_MULTIPLE_COMBINED_GROUPS")
+
+        db.refresh(group)
+        return CombinedSubjectGroupOut(
+            id=group.id,
+            academic_year_number=payload.academic_year_number,
+            subject_id=subject.id,
+            subject_code=subject.code,
+            subject_name=subject.name,
+            teacher_id=teacher.id,
+            teacher_code=teacher.code,
+            teacher_name=teacher.full_name,
+            label=getattr(group, "label", None),
+            sections=[
+                CombinedSubjectGroupSectionOut(section_id=s.id, section_code=s.code, section_name=s.name)
+                for s in sections
+            ],
+            created_at=group.created_at,
         )
 
-    try:
-        db.commit()
-    except IntegrityError:
-        db.rollback()
-        raise HTTPException(status_code=409, detail="SECTION_IN_MULTIPLE_COMBINED_GROUPS")
+    # Legacy fallback: requires strict per-section assignment to be consistent with chosen teacher.
+    for sec in sections:
+        ok = (
+            db.execute(
+                where_tenant(
+                    select(TeacherSubjectSection.id)
+                    .where(TeacherSubjectSection.teacher_id == teacher.id)
+                    .where(TeacherSubjectSection.subject_id == subject.id)
+                    .where(TeacherSubjectSection.section_id == sec.id)
+                    .where(TeacherSubjectSection.is_active.is_(True))
+                    .limit(1),
+                    TeacherSubjectSection,
+                    tenant_id,
+                )
+            ).first()
+            is not None
+        )
+        if not ok:
+            raise HTTPException(status_code=422, detail="TEACHER_NOT_ASSIGNED_TO_SECTION_SUBJECT")
 
-    db.refresh(group)
+    legacy_group = CombinedSubjectGroup(tenant_id=tenant_id, academic_year_id=year.id, subject_id=subject.id)
+    db.add(legacy_group)
+    db.flush()
+    for sec in sections:
+        db.add(CombinedSubjectSection(tenant_id=tenant_id, combined_group_id=legacy_group.id, section_id=sec.id))
+    db.commit()
+    db.refresh(legacy_group)
+
     return CombinedSubjectGroupOut(
-        id=group.id,
+        id=legacy_group.id,
         academic_year_number=payload.academic_year_number,
         subject_id=subject.id,
         subject_code=subject.code,
@@ -879,12 +1015,12 @@ def create_combined_subject_group(
         teacher_id=teacher.id,
         teacher_code=teacher.code,
         teacher_name=teacher.full_name,
-        label=getattr(group, "label", None),
+        label=None,
         sections=[
             CombinedSubjectGroupSectionOut(section_id=s.id, section_code=s.code, section_name=s.name)
             for s in sections
         ],
-        created_at=group.created_at,
+        created_at=legacy_group.created_at,
     )
 
 
@@ -896,13 +1032,30 @@ def update_combined_subject_group(
     db: Session = Depends(get_db),
     tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
-    group = (
-        db.execute(where_tenant(select(CombinedGroup).where(CombinedGroup.id == group_id), CombinedGroup, tenant_id))
-        .scalars()
-        .first()
-    )
-    if group is None:
-        raise HTTPException(status_code=404, detail="GROUP_NOT_FOUND")
+    use_v2 = table_exists(db, "combined_groups") and table_exists(db, "combined_group_sections")
+
+    if use_v2:
+        group = (
+            db.execute(where_tenant(select(CombinedGroup).where(CombinedGroup.id == group_id), CombinedGroup, tenant_id))
+            .scalars()
+            .first()
+        )
+        if group is None:
+            raise HTTPException(status_code=404, detail="GROUP_NOT_FOUND")
+    else:
+        group = (
+            db.execute(
+                where_tenant(
+                    select(CombinedSubjectGroup).where(CombinedSubjectGroup.id == group_id),
+                    CombinedSubjectGroup,
+                    tenant_id,
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if group is None:
+            raise HTTPException(status_code=404, detail="GROUP_NOT_FOUND")
 
     subject = (
         db.execute(where_tenant(select(Subject).where(Subject.id == group.subject_id), Subject, tenant_id))
@@ -960,28 +1113,73 @@ def update_combined_subject_group(
     if len(sections) != len(section_codes):
         raise HTTPException(status_code=422, detail="SECTION_NOT_FOUND")
 
-    group.teacher_id = teacher.id
-    group.label = payload.label.strip() if payload.label is not None and payload.label.strip() else None
+    if use_v2:
+        group.teacher_id = teacher.id
+        group.label = payload.label.strip() if payload.label is not None and payload.label.strip() else None
 
-    stmt_del = delete(CombinedGroupSection).where(CombinedGroupSection.combined_group_id == group.id)
-    stmt_del = where_tenant(stmt_del, CombinedGroupSection, tenant_id)
-    db.execute(stmt_del)
+        stmt_del = delete(CombinedGroupSection).where(CombinedGroupSection.combined_group_id == group.id)
+        stmt_del = where_tenant(stmt_del, CombinedGroupSection, tenant_id)
+        db.execute(stmt_del)
 
-    for sec in sections:
-        db.add(
-            CombinedGroupSection(
-                tenant_id=tenant_id,
-                combined_group_id=group.id,
-                subject_id=subject.id,
-                section_id=sec.id,
+        for sec in sections:
+            db.add(
+                CombinedGroupSection(
+                    tenant_id=tenant_id,
+                    combined_group_id=group.id,
+                    subject_id=subject.id,
+                    section_id=sec.id,
+                )
             )
+
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            raise HTTPException(status_code=409, detail="SECTION_IN_MULTIPLE_COMBINED_GROUPS")
+
+        return CombinedSubjectGroupOut(
+            id=group.id,
+            academic_year_number=int(getattr(year, "year_number", 0) or 0),
+            subject_id=subject.id,
+            subject_code=subject.code,
+            subject_name=subject.name,
+            teacher_id=teacher.id,
+            teacher_code=teacher.code,
+            teacher_name=teacher.full_name,
+            label=getattr(group, "label", None),
+            sections=[
+                CombinedSubjectGroupSectionOut(section_id=s.id, section_code=s.code, section_name=s.name)
+                for s in sections
+            ],
+            created_at=group.created_at,
         )
 
-    try:
-        db.commit()
-    except IntegrityError:
-        db.rollback()
-        raise HTTPException(status_code=409, detail="SECTION_IN_MULTIPLE_COMBINED_GROUPS")
+    # Legacy fallback: requires strict per-section assignment to be consistent with chosen teacher.
+    for sec in sections:
+        ok = (
+            db.execute(
+                where_tenant(
+                    select(TeacherSubjectSection.id)
+                    .where(TeacherSubjectSection.teacher_id == teacher.id)
+                    .where(TeacherSubjectSection.subject_id == subject.id)
+                    .where(TeacherSubjectSection.section_id == sec.id)
+                    .where(TeacherSubjectSection.is_active.is_(True))
+                    .limit(1),
+                    TeacherSubjectSection,
+                    tenant_id,
+                )
+            ).first()
+            is not None
+        )
+        if not ok:
+            raise HTTPException(status_code=422, detail="TEACHER_NOT_ASSIGNED_TO_SECTION_SUBJECT")
+
+    stmt_del = delete(CombinedSubjectSection).where(CombinedSubjectSection.combined_group_id == group.id)
+    stmt_del = where_tenant(stmt_del, CombinedSubjectSection, tenant_id)
+    db.execute(stmt_del)
+    for sec in sections:
+        db.add(CombinedSubjectSection(tenant_id=tenant_id, combined_group_id=group.id, section_id=sec.id))
+    db.commit()
 
     return CombinedSubjectGroupOut(
         id=group.id,
@@ -992,7 +1190,7 @@ def update_combined_subject_group(
         teacher_id=teacher.id,
         teacher_code=teacher.code,
         teacher_name=teacher.full_name,
-        label=getattr(group, "label", None),
+        label=None,
         sections=[
             CombinedSubjectGroupSectionOut(section_id=s.id, section_code=s.code, section_name=s.name)
             for s in sections
@@ -1008,12 +1206,28 @@ def delete_combined_subject_group(
     db: Session = Depends(get_db),
     tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
-    stmt_links = delete(CombinedGroupSection).where(CombinedGroupSection.combined_group_id == group_id)
-    stmt_links = where_tenant(stmt_links, CombinedGroupSection, tenant_id)
+    use_v2 = table_exists(db, "combined_groups") and table_exists(db, "combined_group_sections")
+
+    if use_v2:
+        stmt_links = delete(CombinedGroupSection).where(CombinedGroupSection.combined_group_id == group_id)
+        stmt_links = where_tenant(stmt_links, CombinedGroupSection, tenant_id)
+        deleted_links = db.execute(stmt_links).rowcount or 0
+
+        stmt_groups = delete(CombinedGroup).where(CombinedGroup.id == group_id)
+        stmt_groups = where_tenant(stmt_groups, CombinedGroup, tenant_id)
+        deleted_groups = db.execute(stmt_groups).rowcount or 0
+        if deleted_groups == 0:
+            raise HTTPException(status_code=404, detail="GROUP_NOT_FOUND")
+
+        db.commit()
+        return DeleteCombinedSubjectGroupResponse(ok=True, deleted=deleted_groups or deleted_links or 1)
+
+    stmt_links = delete(CombinedSubjectSection).where(CombinedSubjectSection.combined_group_id == group_id)
+    stmt_links = where_tenant(stmt_links, CombinedSubjectSection, tenant_id)
     deleted_links = db.execute(stmt_links).rowcount or 0
 
-    stmt_groups = delete(CombinedGroup).where(CombinedGroup.id == group_id)
-    stmt_groups = where_tenant(stmt_groups, CombinedGroup, tenant_id)
+    stmt_groups = delete(CombinedSubjectGroup).where(CombinedSubjectGroup.id == group_id)
+    stmt_groups = where_tenant(stmt_groups, CombinedSubjectGroup, tenant_id)
     deleted_groups = db.execute(stmt_groups).rowcount or 0
     if deleted_groups == 0:
         raise HTTPException(status_code=404, detail="GROUP_NOT_FOUND")

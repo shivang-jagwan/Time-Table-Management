@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from api.tenant import where_tenant
+from core.db import table_exists
 from models import (
     Program,
     Section,
@@ -23,6 +24,9 @@ from models import (
     CombinedGroup,
     CombinedGroupSection,
 )
+
+from models.combined_subject_group import CombinedSubjectGroup
+from models.combined_subject_section import CombinedSubjectSection
 
 
 def _slots_for_subject(subj: Any, sessions_per_week: int) -> int:
@@ -97,20 +101,35 @@ def build_capacity_data(
     fixed_entries: list[FixedTimetableEntry] = db.execute(where_tenant(select(FixedTimetableEntry), FixedTimetableEntry, tenant_id)).scalars().all()
     special_allotments: list[SpecialAllotment] = db.execute(where_tenant(select(SpecialAllotment), SpecialAllotment, tenant_id)).scalars().all()
 
-    # Combined groups (v2)
+    # Combined groups (v2 + legacy fallback)
     group_sections: dict[Any, list[Any]] = defaultdict(list)
     group_subject: dict[Any, Any] = {}
     if section_ids:
-        q_cg = (
-            select(CombinedGroup.id, CombinedGroup.subject_id, CombinedGroupSection.section_id)
-            .join(CombinedGroupSection, CombinedGroupSection.combined_group_id == CombinedGroup.id)
-            .where(CombinedGroupSection.section_id.in_(section_ids))
-        )
-        if academic_year_id is not None:
-            q_cg = q_cg.where(CombinedGroup.academic_year_id == academic_year_id)
-        q_cg = where_tenant(q_cg, CombinedGroup, tenant_id)
-        q_cg = where_tenant(q_cg, CombinedGroupSection, tenant_id)
-        for gid, subj_id, sec_id in db.execute(q_cg).all():
+        use_v2 = table_exists(db, "combined_groups") and table_exists(db, "combined_group_sections")
+        if use_v2:
+            q_cg = (
+                select(CombinedGroup.id, CombinedGroup.subject_id, CombinedGroupSection.section_id)
+                .join(CombinedGroupSection, CombinedGroupSection.combined_group_id == CombinedGroup.id)
+                .where(CombinedGroupSection.section_id.in_(section_ids))
+            )
+            if academic_year_id is not None:
+                q_cg = q_cg.where(CombinedGroup.academic_year_id == academic_year_id)
+            q_cg = where_tenant(q_cg, CombinedGroup, tenant_id)
+            q_cg = where_tenant(q_cg, CombinedGroupSection, tenant_id)
+            rows = db.execute(q_cg).all()
+        else:
+            q_cg = (
+                select(CombinedSubjectGroup.id, CombinedSubjectGroup.subject_id, CombinedSubjectSection.section_id)
+                .join(CombinedSubjectSection, CombinedSubjectSection.combined_group_id == CombinedSubjectGroup.id)
+                .where(CombinedSubjectSection.section_id.in_(section_ids))
+            )
+            if academic_year_id is not None:
+                q_cg = q_cg.where(CombinedSubjectGroup.academic_year_id == academic_year_id)
+            q_cg = where_tenant(q_cg, CombinedSubjectGroup, tenant_id)
+            q_cg = where_tenant(q_cg, CombinedSubjectSection, tenant_id)
+            rows = db.execute(q_cg).all()
+
+        for gid, subj_id, sec_id in rows:
             group_subject[gid] = subj_id
             group_sections[gid].append(sec_id)
 

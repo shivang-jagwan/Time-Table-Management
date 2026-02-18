@@ -8,6 +8,7 @@ from core.database import (  # noqa: F401
     SessionLocal,
     get_db,
     is_transient_db_connectivity_error,
+    table_exists,
     validate_db_connection,
 )
 
@@ -17,5 +18,6 @@ __all__ = [
     "SessionLocal",
     "get_db",
     "is_transient_db_connectivity_error",
+    "table_exists",
     "validate_db_connection",
 ]

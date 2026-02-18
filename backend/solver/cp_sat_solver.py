@@ -5,12 +5,15 @@ from collections import defaultdict
 from typing import Any
 
 from ortools.sat.python import cp_model
-from sqlalchemy import delete, select
+from sqlalchemy import delete, literal, select
 from sqlalchemy.orm import Session
 
 from api.tenant import where_tenant
+from core.db import table_exists
 from models.combined_group import CombinedGroup
 from models.combined_group_section import CombinedGroupSection
+from models.combined_subject_group import CombinedSubjectGroup
+from models.combined_subject_section import CombinedSubjectSection
 from models.room import Room
 from models.section import Section
 from models.elective_block import ElectiveBlock
@@ -481,26 +484,50 @@ def _solve_program(
                 yield start
 
     # =========================
-    # Combined Groups (v2)
+    # Combined Groups (v2 + legacy fallback)
     # =========================
     # Each combined group schedules sessions together (shared vars).
-    # Multiple groups per subject are allowed.
+    # Multiple groups per subject are allowed (v2). For legacy tables, we treat teacher_id as None
+    # and fall back to strict per-section teacher assignments.
 
-    q_combined = (
-        select(CombinedGroup.id, CombinedGroup.subject_id, CombinedGroup.teacher_id, CombinedGroupSection.section_id)
-        .join(CombinedGroupSection, CombinedGroupSection.combined_group_id == CombinedGroup.id)
-        .join(Subject, Subject.id == CombinedGroup.subject_id)
-        .where(Subject.program_id == program_id)
-        .where(Subject.is_active.is_(True))
-    )
-    if solve_year_ids:
-        q_combined = q_combined.where(CombinedGroup.academic_year_id.in_(solve_year_ids)).where(
-            Subject.academic_year_id.in_(solve_year_ids)
+    use_v2 = table_exists(db, "combined_groups") and table_exists(db, "combined_group_sections")
+    if use_v2:
+        q_combined = (
+            select(CombinedGroup.id, CombinedGroup.subject_id, CombinedGroup.teacher_id, CombinedGroupSection.section_id)
+            .join(CombinedGroupSection, CombinedGroupSection.combined_group_id == CombinedGroup.id)
+            .join(Subject, Subject.id == CombinedGroup.subject_id)
+            .where(Subject.program_id == program_id)
+            .where(Subject.is_active.is_(True))
         )
-    q_combined = where_tenant(q_combined, CombinedGroup, tenant_id)
-    q_combined = where_tenant(q_combined, CombinedGroupSection, tenant_id)
-    q_combined = where_tenant(q_combined, Subject, tenant_id)
-    combined_rows = db.execute(q_combined).all()
+        if solve_year_ids:
+            q_combined = q_combined.where(CombinedGroup.academic_year_id.in_(solve_year_ids)).where(
+                Subject.academic_year_id.in_(solve_year_ids)
+            )
+        q_combined = where_tenant(q_combined, CombinedGroup, tenant_id)
+        q_combined = where_tenant(q_combined, CombinedGroupSection, tenant_id)
+        q_combined = where_tenant(q_combined, Subject, tenant_id)
+        combined_rows = db.execute(q_combined).all()
+    else:
+        q_combined = (
+            select(
+                CombinedSubjectGroup.id,
+                CombinedSubjectGroup.subject_id,
+                literal(None).label("teacher_id"),
+                CombinedSubjectSection.section_id,
+            )
+            .join(CombinedSubjectSection, CombinedSubjectSection.combined_group_id == CombinedSubjectGroup.id)
+            .join(Subject, Subject.id == CombinedSubjectGroup.subject_id)
+            .where(Subject.program_id == program_id)
+            .where(Subject.is_active.is_(True))
+        )
+        if solve_year_ids:
+            q_combined = q_combined.where(CombinedSubjectGroup.academic_year_id.in_(solve_year_ids)).where(
+                Subject.academic_year_id.in_(solve_year_ids)
+            )
+        q_combined = where_tenant(q_combined, CombinedSubjectGroup, tenant_id)
+        q_combined = where_tenant(q_combined, CombinedSubjectSection, tenant_id)
+        q_combined = where_tenant(q_combined, Subject, tenant_id)
+        combined_rows = db.execute(q_combined).all()
 
     group_sections = defaultdict(list)  # group_id -> [section_id]
     group_subject = {}  # group_id -> subject_id
