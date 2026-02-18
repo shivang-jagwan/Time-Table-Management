@@ -9,11 +9,10 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from api.tenant import where_tenant
-from models.combined_subject_group import CombinedSubjectGroup
-from models.combined_subject_section import CombinedSubjectSection
+from models.combined_group import CombinedGroup
+from models.combined_group_section import CombinedGroupSection
 from models.room import Room
 from models.section import Section
-from models.section_elective import SectionElective
 from models.elective_block import ElectiveBlock
 from models.elective_block_subject import ElectiveBlockSubject
 from models.section_elective_block import SectionElectiveBlock
@@ -260,37 +259,17 @@ def _solve_program(
         mandatory = [r for r in track_rows if not r.is_elective]
         elective_options = [r for r in track_rows if r.is_elective]
 
-        required = list(mandatory)
-        if elective_options:
-            sel = (
-                db.execute(
-                    where_tenant(
-                        select(SectionElective).where(SectionElective.section_id == section.id),
-                        SectionElective,
-                        tenant_id,
-                    )
-                )
-                .scalars()
-                .first()
-            )
-            if sel is not None:
-                # Add selected elective as a required subject with no override
-                required.append(
-                    TrackSubject(
-                        program_id=program_id,
-                        academic_year_id=section.academic_year_id,
-                        track=section.track,
-                        subject_id=sel.subject_id,
-                        is_elective=False,
-                    )
-                )
+        # Electives are handled via elective blocks (parallel electives) and are
+        # not added as per-section required subjects here.
+        section_required[section.id] = [(r.subject_id, r.sessions_override) for r in mandatory]
 
-        section_required[section.id] = [(r.subject_id, r.sessions_override) for r in required]
-
-    # Elective blocks per section (parallel elective events)
+    # Elective blocks (parallel electives)
+    # NOTE: An elective block is scheduled as a shared event for all mapped sections.
     blocks_by_section = defaultdict(list)  # section_id -> [block_id]
+    sections_by_block = defaultdict(list)  # block_id -> [section_id]
     elective_block_by_id: dict[str, ElectiveBlock] = {}
     block_subject_pairs_by_block = defaultdict(list)  # block_id -> [(subject_id, teacher_id)]
+    elective_block_by_section_subject: dict[tuple[str, str], str] = {}  # (section_id, subject_id) -> block_id
 
     if sections:
         sec_block_rows = (
@@ -307,6 +286,7 @@ def _solve_program(
         block_ids = sorted({bid for _sid, bid in sec_block_rows})
         for sid, bid in sec_block_rows:
             blocks_by_section[sid].append(bid)
+            sections_by_block[bid].append(sid)
 
         if block_ids:
             blocks = (
@@ -329,6 +309,13 @@ def _solve_program(
             )
             for row in bsubs:
                 block_subject_pairs_by_block[row.block_id].append((row.subject_id, row.teacher_id))
+
+            # Build a quick lookup from (section, subject) -> elective block.
+            # If the same subject appears in multiple blocks for a section, keep the first.
+            for sid, bids in blocks_by_section.items():
+                for bid in bids:
+                    for subj_id, _tid in block_subject_pairs_by_block.get(bid, []):
+                        elective_block_by_section_subject.setdefault((sid, subj_id), bid)
 
     # Allowed slots per section
     allowed_slots_by_section = defaultdict(set)
@@ -387,6 +374,15 @@ def _solve_program(
     special_room_by_section_slot: dict[tuple[str, str], str] = {}
     special_entries_to_write: list[tuple[str, str, str, str, str]] = []  # (sec, subj, teacher, room, slot)
 
+    # Elective-block locks (shared per block):
+    # Any lock (special allotment / fixed entry) on a block subject implies the entire block
+    # occurrence is fixed to that slot for ALL mapped sections in this solve.
+    locked_elective_sessions_by_block = defaultdict(int)  # block_id -> locked occurrences
+    locked_elective_sessions_by_block_day = defaultdict(int)  # (block_id, day) -> locked occurrences
+    locked_elective_block_slots: set[tuple[str, str]] = set()  # (block_id, slot_id)
+    forced_room_by_block_subject_slot: dict[tuple[str, str, str], str] = {}  # (block_id, subject_id, slot_id) -> room_id
+    locked_block_theory_room_demand_by_slot = defaultdict(int)  # slot_id -> room demand (normal rooms only)
+
     for sa in special_allotments:
         subj = subject_by_id.get(sa.subject_id)
         if subj is None:
@@ -419,6 +415,32 @@ def _solve_program(
             continue
 
         # THEORY (and any other non-LAB)
+        block_id = elective_block_by_section_subject.get((sa.section_id, sa.subject_id))
+        if block_id is not None:
+            pairs = block_subject_pairs_by_block.get(block_id, [])
+            if pairs:
+                # Count and lock this block occurrence once.
+                if (block_id, sa.slot_id) not in locked_elective_block_slots:
+                    locked_elective_block_slots.add((block_id, sa.slot_id))
+                    locked_elective_sessions_by_block[block_id] += 1
+                    locked_elective_sessions_by_block_day[(block_id, day)] += 1
+
+                    for sec_id in sections_by_block.get(block_id, []):
+                        locked_section_slots.add((sec_id, sa.slot_id))
+                        locked_slot_indices_by_section_day[(sec_id, day)].add(int(slot_idx))
+                        allowed_slots_by_section[sec_id].discard(sa.slot_id)
+
+                    for _subj_id, teacher_id in pairs:
+                        locked_teacher_slots.add((teacher_id, sa.slot_id))
+                        locked_teacher_slot_day[(teacher_id, sa.slot_id)] = day
+
+                    # This subject uses a special room and does NOT consume normal room capacity.
+                    locked_block_theory_room_demand_by_slot[sa.slot_id] += int(max(0, len(pairs) - 1))
+
+                forced_room_by_block_subject_slot[(block_id, sa.subject_id, sa.slot_id)] = sa.room_id
+                # Skip standalone write; this will be emitted with the block.
+                continue
+
         locked_theory_sessions_by_sec_subj[(sa.section_id, sa.subject_id)] += 1
         locked_theory_sessions_by_sec_subj_day[(sa.section_id, sa.subject_id, day)] += 1
         locked_section_slots.add((sa.section_id, sa.slot_id))
@@ -459,33 +481,35 @@ def _solve_program(
                 yield start
 
     # =========================
-    # Combined Subject Groups (strict)
+    # Combined Groups (v2)
     # =========================
-    # If (academic_year_id, subject_id) has a combined group with >=2 sections,
-    # we schedule ALL sessions of that subject together (shared vars) and forbid
-    # independent scheduling per section.
+    # Each combined group schedules sessions together (shared vars).
+    # Multiple groups per subject are allowed.
 
     q_combined = (
-        select(CombinedSubjectGroup.id, CombinedSubjectGroup.subject_id, CombinedSubjectSection.section_id)
-        .join(CombinedSubjectSection, CombinedSubjectSection.combined_group_id == CombinedSubjectGroup.id)
-        .join(Subject, Subject.id == CombinedSubjectGroup.subject_id)
+        select(CombinedGroup.id, CombinedGroup.subject_id, CombinedGroup.teacher_id, CombinedGroupSection.section_id)
+        .join(CombinedGroupSection, CombinedGroupSection.combined_group_id == CombinedGroup.id)
+        .join(Subject, Subject.id == CombinedGroup.subject_id)
         .where(Subject.program_id == program_id)
         .where(Subject.is_active.is_(True))
     )
     if solve_year_ids:
-        q_combined = q_combined.where(CombinedSubjectGroup.academic_year_id.in_(solve_year_ids)).where(
+        q_combined = q_combined.where(CombinedGroup.academic_year_id.in_(solve_year_ids)).where(
             Subject.academic_year_id.in_(solve_year_ids)
         )
-    q_combined = where_tenant(q_combined, CombinedSubjectGroup, tenant_id)
-    q_combined = where_tenant(q_combined, CombinedSubjectSection, tenant_id)
+    q_combined = where_tenant(q_combined, CombinedGroup, tenant_id)
+    q_combined = where_tenant(q_combined, CombinedGroupSection, tenant_id)
     q_combined = where_tenant(q_combined, Subject, tenant_id)
     combined_rows = db.execute(q_combined).all()
 
     group_sections = defaultdict(list)  # group_id -> [section_id]
     group_subject = {}  # group_id -> subject_id
-    for gid, subj_id, sec_id in combined_rows:
+    group_teacher_id = {}  # group_id -> teacher_id (optional)
+    for gid, subj_id, teacher_id, sec_id in combined_rows:
         group_sections[gid].append(sec_id)
         group_subject[gid] = subj_id
+        if gid not in group_teacher_id:
+            group_teacher_id[gid] = teacher_id
 
     solve_section_ids = {s.id for s in sections}
     combined_gid_by_sec_subj = {}  # (section_id, subject_id) -> group_id
@@ -519,13 +543,7 @@ def _solve_program(
     #
     # We intentionally skip:
     # - Combined THEORY fixed entries (must drive shared combined vars)
-    # - Elective-block subjects (these are generated via z vars)
-
-    elective_subjects_by_section = defaultdict(set)  # section_id -> {subject_id}
-    for sec_id, block_ids in blocks_by_section.items():
-        for bid in block_ids:
-            for subj_id, _teacher_id in block_subject_pairs_by_block.get(bid, []):
-                elective_subjects_by_section[sec_id].add(subj_id)
+    # Elective-block subject fixed entries are converted into block-level locks.
 
     fixed_room_by_section_slot: dict[tuple[str, str], str] = {}
     fixed_entries_to_write: list[tuple[str, str, str, str, str]] = []  # (sec, subj, teacher, room, slot)
@@ -545,9 +563,31 @@ def _solve_program(
         if gid is not None and str(subj.subject_type) == "THEORY":
             continue
 
-        # Skip elective-block subjects; handled later by forcing z vars.
-        if fe.subject_id in elective_subjects_by_section.get(fe.section_id, set()):
-            continue
+        # Elective-block THEORY: lock the entire block occurrence (shared across sections).
+        block_id = elective_block_by_section_subject.get((fe.section_id, fe.subject_id))
+        if block_id is not None and str(subj.subject_type) == "THEORY":
+            pairs = block_subject_pairs_by_block.get(block_id, [])
+            if pairs:
+                if (block_id, fe.slot_id) not in locked_elective_block_slots:
+                    locked_elective_block_slots.add((block_id, fe.slot_id))
+                    locked_elective_sessions_by_block[block_id] += 1
+                    locked_elective_sessions_by_block_day[(block_id, day)] += 1
+
+                    for sec_id in sections_by_block.get(block_id, []):
+                        locked_section_slots.add((sec_id, fe.slot_id))
+                        locked_slot_indices_by_section_day[(sec_id, day)].add(int(slot_idx))
+                        allowed_slots_by_section[sec_id].discard(fe.slot_id)
+
+                    for _subj_id, teacher_id in pairs:
+                        locked_teacher_slots.add((teacher_id, fe.slot_id))
+                        locked_teacher_slot_day[(teacher_id, fe.slot_id)] = day
+
+                    # Room capacity: one normal theory room per elective subject.
+                    locked_block_theory_room_demand_by_slot[fe.slot_id] += int(len(pairs))
+
+                forced_room_by_block_subject_slot[(block_id, fe.subject_id, fe.slot_id)] = fe.room_id
+                locked_fixed_entry_ids.add(str(fe.id))
+                continue
 
         if str(subj.subject_type) == "LAB":
             block = int(getattr(subj, "lab_block_size_slots", 1) or 1)
@@ -617,9 +657,9 @@ def _solve_program(
     x_by_sec_subj = defaultdict(list)  # (sec, subj) -> [Bool]
     x_by_sec_subj_day = defaultdict(list)  # (sec, subj, day) -> [Bool]
 
-    z = {}  # elective block event: (sec, block, slot) -> Bool
-    z_by_sec_block = defaultdict(list)  # (sec, block) -> [Bool]
-    z_by_sec_block_day = defaultdict(list)  # (sec, block, day) -> [Bool]
+    z = {}  # elective block event: (block, slot) -> Bool
+    z_by_block = defaultdict(list)  # block_id -> [Bool]
+    z_by_block_day = defaultdict(list)  # (block_id, day) -> [Bool]
 
     teacher_slot_terms = defaultdict(list)
     section_slot_terms = defaultdict(list)
@@ -788,6 +828,8 @@ def _solve_program(
                 elif day_x:
                     model.Add(sum(day_x) <= int(cap))
 
+    effective_teacher_by_gid: dict[uuid.UUID, uuid.UUID] = {}
+
     # Combined THEORY variables and constraints (shared decision variables)
     for group_id, sec_ids in group_sections.items():
         subj_id = group_subject.get(group_id)
@@ -809,21 +851,23 @@ def _solve_program(
         if not allowed:
             continue
 
-        # Strict combined-class rule: all sections in the group must have the same assigned teacher.
-        assigned_teacher_id = None
-        for sid in sec_ids:
-            tid = assigned_teacher_by_section_subject.get((sid, subj_id))
-            if tid is None:
-                assigned_teacher_id = None
-                break
-            if assigned_teacher_id is None:
-                assigned_teacher_id = tid
-            elif assigned_teacher_id != tid:
-                assigned_teacher_id = None
-                break
+        assigned_teacher_id = group_teacher_id.get(group_id)
         if assigned_teacher_id is None:
-            # Validation should have caught teacher assignment mismatch; skip generating vars.
+            # Legacy fallback: strict combined-class rule (all sections must have same assigned teacher).
+            for sid in sec_ids:
+                tid = assigned_teacher_by_section_subject.get((sid, subj_id))
+                if tid is None:
+                    assigned_teacher_id = None
+                    break
+                if assigned_teacher_id is None:
+                    assigned_teacher_id = tid
+                elif assigned_teacher_id != tid:
+                    assigned_teacher_id = None
+                    break
+        if assigned_teacher_id is None:
             continue
+
+        effective_teacher_by_gid[group_id] = assigned_teacher_id
         for slot_id in sorted(list(allowed)):
             # Prune slots that the shared teacher can never take.
             if slot_id in teacher_disallowed_slot_ids.get(assigned_teacher_id, set()):
@@ -859,74 +903,93 @@ def _solve_program(
             if day_terms:
                 model.Add(sum(day_terms) <= int(subj.max_per_day))
 
-    # Elective block variables and constraints (per-section shared slot)
-    for section in sections:
-        sec_block_ids = blocks_by_section.get(section.id, [])
-        if not sec_block_ids:
+    # Elective block variables and constraints (shared slot per block)
+    for block_id, sec_ids in sections_by_block.items():
+        if not sec_ids:
             continue
-        for block_id in sec_block_ids:
-            pairs = block_subject_pairs_by_block.get(block_id, [])
-            if not pairs:
+        pairs = block_subject_pairs_by_block.get(block_id, [])
+        if not pairs:
+            continue
+
+        # Derive sessions/week and max/day from subjects inside the block.
+        subj_objs = [subject_by_id.get(subj_id) for subj_id, _tid in pairs]
+        subj_objs = [s for s in subj_objs if s is not None]
+        if len(subj_objs) != len(pairs):
+            continue
+        if any(str(s.subject_type) != "THEORY" for s in subj_objs):
+            continue
+
+        sessions_vals = [int(getattr(s, "sessions_per_week", 0) or 0) for s in subj_objs]
+        if not sessions_vals or len(set(sessions_vals)) != 1:
+            continue
+        sessions_per_week = int(sessions_vals[0])
+        if sessions_per_week <= 0:
+            continue
+
+        max_per_day = min(int(getattr(s, "max_per_day", 1) or 1) for s in subj_objs)
+        if max_per_day < 0:
+            max_per_day = 0
+
+        # Allowed slots must be in-window for ALL mapped sections.
+        allowed = None
+        for sid in sec_ids:
+            s_allowed = set(allowed_slots_by_section.get(sid, set()))
+            allowed = s_allowed if allowed is None else (allowed & s_allowed)
+        if not allowed:
+            continue
+
+        for slot_id in sorted(list(allowed)):
+            # Prune slots where any teacher in the block is unavailable.
+            blocked = False
+            for _subj_id, teacher_id in pairs:
+                if slot_id in teacher_disallowed_slot_ids.get(teacher_id, set()):
+                    blocked = True
+                    break
+            if blocked:
                 continue
 
-            # Derive sessions/week and max/day from subjects inside the block.
-            subj_objs = [subject_by_id.get(subj_id) for subj_id, _tid in pairs]
-            subj_objs = [s for s in subj_objs if s is not None]
-            if len(subj_objs) != len(pairs):
-                continue
-            if any(str(s.subject_type) != "THEORY" for s in subj_objs):
-                continue
+            zv = model.NewBoolVar(f"z_{block_id}_{slot_id}")
+            z[(block_id, slot_id)] = zv
+            z_by_block[block_id].append(zv)
 
-            sessions_vals = [int(getattr(s, "sessions_per_week", 0) or 0) for s in subj_objs]
-            if not sessions_vals or len(set(sessions_vals)) != 1:
-                continue
-            sessions_per_week = int(sessions_vals[0])
-            if sessions_per_week <= 0:
-                continue
+            # All mapped sections are occupied when the block occurs.
+            for sid in sec_ids:
+                section_slot_terms[(sid, slot_id)].append(zv)
 
-            max_per_day = min(int(getattr(s, "max_per_day", 1) or 1) for s in subj_objs)
-            if max_per_day < 0:
-                max_per_day = 0
-
-            for slot_id in sorted(list(allowed_slots_by_section.get(section.id, set()))):
-                # Prune slots where any teacher in the block is unavailable.
-                blocked = False
-                for _subj_id, teacher_id in pairs:
-                    if slot_id in teacher_disallowed_slot_ids.get(teacher_id, set()):
-                        blocked = True
-                        break
-                if blocked:
-                    continue
-                zv = model.NewBoolVar(f"z_{section.id}_{block_id}_{slot_id}")
-                z[(section.id, block_id, slot_id)] = zv
-                section_slot_terms[(section.id, slot_id)].append(zv)
-
-                # Elective block consumes one THEORY-capable room in this slot.
+            # Room capacity: one THEORY-capable room per elective subject.
+            for _subj_id, _teacher_id in pairs:
                 room_terms_by_slot[slot_id].append(zv)
 
-                d = slot_info.get(slot_id, (None, None))[0]
+            d = slot_info.get(slot_id, (None, None))[0]
+            if d is not None:
+                z_by_block_day[(block_id, int(d))].append(zv)
+
+            # Every teacher in the block occupies this slot when the block occurs.
+            for _subj_id, teacher_id in pairs:
+                teacher_slot_terms[(teacher_id, slot_id)].append(zv)
+                teacher_all_terms[teacher_id].append(zv)
                 if d is not None:
-                    z_by_sec_block_day[(section.id, block_id, int(d))].append(zv)
-                z_by_sec_block[(section.id, block_id)].append(zv)
+                    teacher_day_terms[(teacher_id, int(d))].append(zv)
+                    teacher_active_days[teacher_id].add(int(d))
 
-                # Every teacher in the block occupies this slot when the block occurs.
-                for _subj_id, teacher_id in pairs:
-                    teacher_slot_terms[(teacher_id, slot_id)].append(zv)
-                    teacher_all_terms[teacher_id].append(zv)
-                    if d is not None:
-                        teacher_day_terms[(teacher_id, int(d))].append(zv)
-                        teacher_active_days[teacher_id].add(int(d))
+        terms = z_by_block.get(block_id, [])
+        locked = int(locked_elective_sessions_by_block.get(block_id, 0) or 0)
+        needed = int(sessions_per_week) - locked
+        if needed < 0:
+            model.Add(0 == 1)
+        elif terms:
+            model.Add(sum(terms) == int(needed))
+        else:
+            model.Add(int(needed) == 0)
 
-            terms = z_by_sec_block.get((section.id, block_id), [])
-            if terms:
-                model.Add(sum(terms) == int(sessions_per_week))
-            else:
-                model.Add(int(sessions_per_week) == 0)
-
-            for day in range(0, 6):
-                day_terms = z_by_sec_block_day.get((section.id, block_id, day), [])
-                if day_terms:
-                    model.Add(sum(day_terms) <= int(max_per_day))
+        for day in range(0, 6):
+            day_terms = z_by_block_day.get((block_id, day), [])
+            locked_day = int(locked_elective_sessions_by_block_day.get((block_id, day), 0) or 0)
+            cap = int(max_per_day) - locked_day
+            if cap < 0:
+                model.Add(0 == 1)
+            elif day_terms:
+                model.Add(sum(day_terms) <= int(cap))
 
     # =========================
     # Room capacity constraints
@@ -969,6 +1032,7 @@ def _solve_program(
             sum(room_terms_by_slot.get(slot_id, []))
             + int(special_theory_by_slot.get(slot_id, 0))
             + int(fixed_theory_by_slot.get(slot_id, 0))
+            + int(locked_block_theory_room_demand_by_slot.get(slot_id, 0))
             <= int(theory_room_capacity)
         )
         model.Add(
@@ -1015,6 +1079,32 @@ def _solve_program(
         # Combined THEORY: force the shared variable instead of per-section theory vars.
         gid = combined_gid_by_sec_subj.get((fe.section_id, fe.subject_id))
         if gid is not None and str(subj.subject_type) == "THEORY":
+            if getattr(fe, "teacher_id", None) is not None:
+                expected_tid = group_teacher_id.get(gid)
+                if expected_tid is None:
+                    # Legacy fallback: strict teacher per section-subject.
+                    strict_tid = None
+                    for sid in group_sections.get(gid, []):
+                        _tid = assigned_teacher_by_section_subject.get((sid, fe.subject_id))
+                        if _tid is None:
+                            strict_tid = None
+                            break
+                        if strict_tid is None:
+                            strict_tid = _tid
+                        elif strict_tid != _tid:
+                            strict_tid = None
+                            break
+                    expected_tid = strict_tid
+                if expected_tid is not None and expected_tid != fe.teacher_id:
+                    _make_infeasible(
+                        "Fixed combined-class teacher does not match the group's assigned teacher.",
+                        section_id=fe.section_id,
+                        subject_id=fe.subject_id,
+                        teacher_id=fe.teacher_id,
+                        slot_id=fe.slot_id,
+                    )
+                    continue
+
             gv = combined_x.get((gid, fe.slot_id))
             if gv is None:
                 _make_infeasible(
@@ -1610,56 +1700,80 @@ def _solve_program(
         entries_written += 1
 
     # Elective block entries (one per subject-teacher pair; grouped by elective_block_id)
-    for (sec_id, block_id, slot_id), zv in z.items():
-        if solver.Value(zv) != 1:
-            continue
+    # Note: A block occurrence is a single shared event across all mapped sections.
+    chosen_room_by_block_slot_subject: dict[tuple[Any, Any, Any], tuple[Any, bool]] = {}
+
+    def _emit_block_occurrence(block_id: Any, slot_id: Any):
+        nonlocal entries_written
         pairs = block_subject_pairs_by_block.get(block_id, [])
         if not pairs:
-            continue
+            return
 
-        for subj_id, teacher_id in pairs:
-            subj = subject_by_id.get(subj_id)
-            if subj is None:
+        # Pick (or reuse) one room per subject for this block occurrence.
+        for subj_id, _teacher_id in pairs:
+            if (block_id, slot_id, subj_id) in chosen_room_by_block_slot_subject:
+                continue
+            forced = forced_room_by_block_subject_slot.get((block_id, subj_id, slot_id))
+            if forced is not None:
+                used_rooms_by_slot[_sid(slot_id)].add(_rid(forced))
+                chosen_room_by_block_slot_subject[(block_id, slot_id, subj_id)] = (forced, True)
                 continue
 
-            # Electives are THEORY by validation; assign a free LT if possible.
             room_id, ok_room = pick_lt_room(slot_id)
             if room_id is None:
                 continue
+            chosen_room_by_block_slot_subject[(block_id, slot_id, subj_id)] = (room_id, ok_room)
 
-            combined_conflict_id = None if ok_room else _room_conflict_group_id(room_id=room_id, slot_id=slot_id)
+        for sec_id in sections_by_block.get(block_id, []):
+            for subj_id, teacher_id in pairs:
+                picked = chosen_room_by_block_slot_subject.get((block_id, slot_id, subj_id))
+                if picked is None:
+                    continue
+                room_id, ok_room = picked
+                combined_conflict_id = None if ok_room else _room_conflict_group_id(room_id=room_id, slot_id=slot_id)
 
-            if not ok_room:
+                if not ok_room:
+                    db.add(
+                        TimetableConflict(
+                            tenant_id=tenant_id,
+                            run_id=run.id,
+                            severity="WARN",
+                            conflict_type="NO_LT_ROOM_AVAILABLE",
+                            message="No free LT room available for this elective block slot; assigned a conflicting LT.",
+                            section_id=sec_id,
+                            subject_id=subj_id,
+                            teacher_id=teacher_id,
+                            room_id=room_id,
+                            slot_id=slot_id,
+                            metadata_json={"elective_block_id": str(block_id)},
+                        )
+                    )
+
                 db.add(
-                    TimetableConflict(
+                    TimetableEntry(
                         tenant_id=tenant_id,
                         run_id=run.id,
-                        severity="WARN",
-                        conflict_type="NO_LT_ROOM_AVAILABLE",
-                        message="No free LT room available for this elective block slot; assigned a conflicting LT.",
+                        academic_year_id=section_year_by_id.get(sec_id) or run.academic_year_id,
                         section_id=sec_id,
                         subject_id=subj_id,
                         teacher_id=teacher_id,
                         room_id=room_id,
                         slot_id=slot_id,
-                        metadata_json={"elective_block_id": str(block_id)},
+                        combined_class_id=combined_conflict_id,
+                        elective_block_id=block_id,
                     )
                 )
-            db.add(
-                TimetableEntry(
-                    tenant_id=tenant_id,
-                    run_id=run.id,
-                    academic_year_id=section_year_by_id.get(sec_id) or run.academic_year_id,
-                    section_id=sec_id,
-                    subject_id=subj_id,
-                    teacher_id=teacher_id,
-                    room_id=room_id,
-                    slot_id=slot_id,
-                    combined_class_id=combined_conflict_id,
-                    elective_block_id=block_id,
-                )
-            )
-            entries_written += 1
+                entries_written += 1
+
+    # Emit locked block occurrences first.
+    for block_id, slot_id in sorted(list(locked_elective_block_slots), key=lambda x: (str(x[0]), str(x[1]))):
+        _emit_block_occurrence(block_id, slot_id)
+
+    # Emit solver-chosen block occurrences.
+    for (block_id, slot_id), zv in z.items():
+        if solver.Value(zv) != 1:
+            continue
+        _emit_block_occurrence(block_id, slot_id)
 
     # Combined THEORY entries (shared decision variable expanded to per-section rows)
     for (group_id, slot_id), gv in combined_x.items():
@@ -1670,18 +1784,19 @@ def _solve_program(
         if subj_id is None:
             continue
 
-        # Teacher is strict: all sections in the group must share the same assigned teacher.
-        chosen_t = None
-        for sec_id in group_sections.get(group_id, []):
-            tid = assigned_teacher_by_section_subject.get((sec_id, subj_id))
-            if tid is None:
-                chosen_t = None
-                break
-            if chosen_t is None:
-                chosen_t = tid
-            elif chosen_t != tid:
-                chosen_t = None
-                break
+        chosen_t = effective_teacher_by_gid.get(group_id)
+        if chosen_t is None:
+            # Legacy fallback: strict teacher across sections.
+            for sec_id in group_sections.get(group_id, []):
+                tid = assigned_teacher_by_section_subject.get((sec_id, subj_id))
+                if tid is None:
+                    chosen_t = None
+                    break
+                if chosen_t is None:
+                    chosen_t = tid
+                elif chosen_t != tid:
+                    chosen_t = None
+                    break
         if chosen_t is None:
             continue
 

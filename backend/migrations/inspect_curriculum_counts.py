@@ -41,8 +41,13 @@ def main() -> int:
             track_subjects = cur.fetchone()[0]
             cur.execute("select count(*) from teacher_subject_years")
             teacher_subject_years = cur.fetchone()[0]
-            cur.execute("select count(*) from section_electives")
-            section_electives = cur.fetchone()[0]
+            cur.execute("select to_regclass('public.section_electives')")
+            has_section_electives = cur.fetchone()[0] is not None
+            if has_section_electives:
+                cur.execute("select count(*) from section_electives")
+                section_electives = cur.fetchone()[0]
+            else:
+                section_electives = 0
 
     print(
         {

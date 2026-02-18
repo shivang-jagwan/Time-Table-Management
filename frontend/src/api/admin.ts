@@ -75,56 +75,6 @@ export async function generateTimeSlots(
   })
 }
 
-export type SectionElectiveAssignment = {
-  section_code: string
-  section_name: string
-  subject_code?: string | null
-  subject_name?: string | null
-}
-
-export async function listSectionElectives(params: {
-  program_code: string
-  academic_year_number: number
-}): Promise<SectionElectiveAssignment[]> {
-  const qs = new URLSearchParams({
-    program_code: params.program_code,
-    academic_year_number: String(params.academic_year_number),
-  })
-  return apiFetch<SectionElectiveAssignment[]>(`/api/admin/section-electives?${qs.toString()}`)
-}
-
-export type SetSectionElectiveRequest = {
-  program_code: string
-  academic_year_number: number
-  section_code: string
-  subject_code: string
-}
-
-export async function setSectionElective(
-  payload: SetSectionElectiveRequest,
-): Promise<AdminActionResult> {
-  return apiFetch<AdminActionResult>('/api/admin/section-electives/set', {
-    method: 'POST',
-    body: JSON.stringify(payload),
-  })
-}
-
-export type BulkSetCoreElectiveRequest = {
-  program_code: string
-  academic_year_number: number
-  subject_code: string
-  replace_existing: boolean
-}
-
-export async function bulkSetCoreElective(
-  payload: BulkSetCoreElectiveRequest,
-): Promise<AdminActionResult> {
-  return apiFetch<AdminActionResult>('/api/admin/core-electives/bulk-set', {
-    method: 'POST',
-    body: JSON.stringify(payload),
-  })
-}
-
 export type ClearTimetablesRequest = {
   confirm: string
   academic_year_number?: number | null
@@ -205,6 +155,10 @@ export type CombinedSubjectGroupOut = {
   subject_id: string
   subject_code: string
   subject_name: string
+  teacher_id?: string | null
+  teacher_code?: string | null
+  teacher_name?: string | null
+  label?: string | null
   sections: CombinedSubjectGroupSectionOut[]
   created_at: string
 }
@@ -226,10 +180,26 @@ export async function createCombinedSubjectGroup(payload: {
   program_code: string
   academic_year_number: number
   subject_code: string
+  teacher_code: string
+  label?: string | null
   section_codes: string[]
 }): Promise<CombinedSubjectGroupOut> {
   return apiFetch<CombinedSubjectGroupOut>('/api/admin/combined-subject-groups', {
     method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export async function updateCombinedSubjectGroup(
+  group_id: string,
+  payload: {
+    teacher_code: string
+    label?: string | null
+    section_codes: string[]
+  },
+): Promise<CombinedSubjectGroupOut> {
+  return apiFetch<CombinedSubjectGroupOut>(`/api/admin/combined-subject-groups/${group_id}`, {
+    method: 'PUT',
     body: JSON.stringify(payload),
   })
 }
@@ -242,6 +212,7 @@ export async function deleteCombinedSubjectGroup(group_id: string): Promise<{ ok
 }
 
 export type ElectiveBlockSubjectOut = {
+  id: string
   subject_id: string
   subject_code: string
   subject_name: string
@@ -342,11 +313,14 @@ export async function upsertElectiveBlockSubject(payload: {
 
 export async function deleteElectiveBlockSubject(payload: {
   block_id: string
-  subject_id: string
+  assignment_id: string
 }): Promise<AdminActionResult> {
-  return apiFetch<AdminActionResult>(`/api/admin/elective-blocks/${payload.block_id}/subjects/${payload.subject_id}`, {
+  return apiFetch<AdminActionResult>(
+    `/api/admin/elective-blocks/${payload.block_id}/subjects/${payload.assignment_id}`,
+    {
     method: 'DELETE',
-  })
+    },
+  )
 }
 
 export async function setElectiveBlockSections(payload: {

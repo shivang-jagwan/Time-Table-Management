@@ -242,7 +242,7 @@ export function Dashboard() {
         </div>
 
         <div className="rounded-2xl border bg-white p-4 shadow-sm">
-          <div className="text-sm font-semibold text-slate-900">Electives</div>
+          <div className="text-sm font-semibold text-slate-900">Elective Blocks</div>
           <div className="mt-3 flex flex-wrap gap-2">
             <Link className="btn-secondary text-sm" to="/elective-blocks">Elective Blocks</Link>
             <Link className="btn-secondary text-sm" to="/combined-classes">Combined Classes</Link>

@@ -202,7 +202,7 @@ export function GenerateTimetable() {
             <div className="rounded-2xl border bg-slate-50 p-4">
               <div className="text-sm font-semibold text-slate-900">Next checks</div>
               <div className="mt-1 text-sm text-slate-600">
-                Teachers, subjects, sections, rooms, curriculum, and electives checks will appear here.
+                Teachers, subjects, sections, rooms, curriculum, and elective blocks checks will appear here.
               </div>
             </div>
           </div>

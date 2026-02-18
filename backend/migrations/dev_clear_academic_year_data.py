@@ -41,6 +41,9 @@ def _print_counts(cur, *, year_number: int, program_code: str | None) -> None:
         "program_code": program_code,
     }
 
+    cur.execute("select to_regclass('public.section_electives')")
+    has_section_electives = cur.fetchone()[0] is not None
+
     counts_sql = """
 WITH
   year AS (
@@ -72,13 +75,23 @@ WITH
     FROM combined_subject_groups g
     JOIN year y ON y.id = g.academic_year_id
     WHERE g.subject_id IN (SELECT id FROM subjects_y)
+  ),
+  groups2_y AS (
+    SELECT g.id
+    FROM combined_groups g
+    JOIN year y ON y.id = g.academic_year_id
+    WHERE g.subject_id IN (SELECT id FROM subjects_y)
   )
 SELECT
   (SELECT count(*) FROM sections_y) AS sections,
   (SELECT count(*) FROM subjects_y) AS subjects,
   (SELECT count(*) FROM section_subjects WHERE section_id IN (SELECT id FROM sections_y) OR subject_id IN (SELECT id FROM subjects_y)) AS section_subjects,
   (SELECT count(*) FROM section_time_windows WHERE section_id IN (SELECT id FROM sections_y)) AS section_time_windows,
-  (SELECT count(*) FROM section_electives WHERE section_id IN (SELECT id FROM sections_y) OR subject_id IN (SELECT id FROM subjects_y)) AS section_electives,
+  """ + (
+        "(SELECT count(*) FROM section_electives WHERE section_id IN (SELECT id FROM sections_y) OR subject_id IN (SELECT id FROM subjects_y)) AS section_electives,"
+        if has_section_electives
+        else "0 AS section_electives,"
+    ) + """
   (SELECT count(*) FROM section_elective_blocks WHERE section_id IN (SELECT id FROM sections_y) OR block_id IN (SELECT id FROM blocks_y)) AS section_elective_blocks,
   (SELECT count(*) FROM track_subjects WHERE academic_year_id = (SELECT id FROM year) AND (%(program_code)s IS NULL OR program_id = (SELECT program_id FROM program))) AS track_subjects,
   (SELECT count(*) FROM teacher_subject_years WHERE academic_year_id = (SELECT id FROM year) AND subject_id IN (SELECT id FROM subjects_y)) AS teacher_subject_years,
@@ -86,6 +99,8 @@ SELECT
   (SELECT count(*) FROM teacher_subjects WHERE subject_id IN (SELECT id FROM subjects_y)) AS teacher_subjects,
   (SELECT count(*) FROM elective_blocks WHERE id IN (SELECT id FROM blocks_y)) AS elective_blocks,
   (SELECT count(*) FROM elective_block_subjects WHERE block_id IN (SELECT id FROM blocks_y) OR subject_id IN (SELECT id FROM subjects_y)) AS elective_block_subjects,
+  (SELECT count(*) FROM combined_groups WHERE id IN (SELECT id FROM groups2_y)) AS combined_groups,
+  (SELECT count(*) FROM combined_group_sections WHERE combined_group_id IN (SELECT id FROM groups2_y) OR section_id IN (SELECT id FROM sections_y)) AS combined_group_sections,
   (SELECT count(*) FROM combined_subject_groups WHERE id IN (SELECT id FROM groups_y)) AS combined_subject_groups,
   (SELECT count(*) FROM combined_subject_sections WHERE combined_group_id IN (SELECT id FROM groups_y) OR section_id IN (SELECT id FROM sections_y)) AS combined_subject_sections,
   (SELECT count(*) FROM fixed_timetable_entries WHERE section_id IN (SELECT id FROM sections_y)) AS fixed_timetable_entries,
@@ -119,6 +134,9 @@ def _delete_year_data(
         "year_number": year_number,
         "program_code": program_code,
     }
+
+    cur.execute("select to_regclass('public.section_electives')")
+    has_section_electives = cur.fetchone()[0] is not None
 
     deletes: list[tuple[str, str]] = [
         (
@@ -271,29 +289,6 @@ WHERE section_id IN (SELECT id FROM sections_y)
 """,
         ),
         (
-            "section_electives",
-            """
-WITH
-  year AS (SELECT id FROM academic_years WHERE year_number = %(year_number)s),
-  program AS (SELECT id AS program_id FROM programs WHERE code = %(program_code)s),
-  sections_y AS (
-    SELECT s.id
-    FROM sections s
-    JOIN year y ON y.id = s.academic_year_id
-    WHERE (%(program_code)s IS NULL OR s.program_id = (SELECT program_id FROM program))
-  ),
-  subjects_y AS (
-    SELECT sub.id
-    FROM subjects sub
-    JOIN year y ON y.id = sub.academic_year_id
-    WHERE (%(program_code)s IS NULL OR sub.program_id = (SELECT program_id FROM program))
-  )
-DELETE FROM section_electives
-WHERE section_id IN (SELECT id FROM sections_y)
-   OR subject_id IN (SELECT id FROM subjects_y);
-""",
-        ),
-        (
             "section_subjects",
             """
 WITH
@@ -314,6 +309,35 @@ WITH
 DELETE FROM section_subjects
 WHERE section_id IN (SELECT id FROM sections_y)
    OR subject_id IN (SELECT id FROM subjects_y);
+""",
+        ),
+        (
+            "combined_group_sections",
+            """
+WITH
+  year AS (SELECT id FROM academic_years WHERE year_number = %(year_number)s),
+  program AS (SELECT id AS program_id FROM programs WHERE code = %(program_code)s),
+  sections_y AS (
+    SELECT s.id
+    FROM sections s
+    JOIN year y ON y.id = s.academic_year_id
+    WHERE (%(program_code)s IS NULL OR s.program_id = (SELECT program_id FROM program))
+  ),
+  subjects_y AS (
+    SELECT sub.id
+    FROM subjects sub
+    JOIN year y ON y.id = sub.academic_year_id
+    WHERE (%(program_code)s IS NULL OR sub.program_id = (SELECT program_id FROM program))
+  ),
+  groups2_y AS (
+    SELECT g.id
+    FROM combined_groups g
+    JOIN year y ON y.id = g.academic_year_id
+    WHERE g.subject_id IN (SELECT id FROM subjects_y)
+  )
+DELETE FROM combined_group_sections
+WHERE combined_group_id IN (SELECT id FROM groups2_y)
+   OR section_id IN (SELECT id FROM sections_y);
 """,
         ),
         (
@@ -413,6 +437,23 @@ WHERE subject_id IN (SELECT id FROM subjects_y);
 """,
         ),
         (
+            "combined_groups",
+            """
+WITH
+  year AS (SELECT id FROM academic_years WHERE year_number = %(year_number)s),
+  program AS (SELECT id AS program_id FROM programs WHERE code = %(program_code)s),
+  subjects_y AS (
+    SELECT sub.id
+    FROM subjects sub
+    JOIN year y ON y.id = sub.academic_year_id
+    WHERE (%(program_code)s IS NULL OR sub.program_id = (SELECT program_id FROM program))
+  )
+DELETE FROM combined_groups
+WHERE academic_year_id = (SELECT id FROM year)
+  AND subject_id IN (SELECT id FROM subjects_y);
+""",
+        ),
+        (
             "combined_subject_groups",
             """
 WITH
@@ -463,6 +504,33 @@ WHERE academic_year_id = (SELECT id FROM year)
 """,
         ),
     ]
+
+    if has_section_electives:
+        deletes.append(
+            (
+                "section_electives",
+                """
+WITH
+  year AS (SELECT id FROM academic_years WHERE year_number = %(year_number)s),
+  program AS (SELECT id AS program_id FROM programs WHERE code = %(program_code)s),
+  sections_y AS (
+    SELECT s.id
+    FROM sections s
+    JOIN year y ON y.id = s.academic_year_id
+    WHERE (%(program_code)s IS NULL OR s.program_id = (SELECT program_id FROM program))
+  ),
+  subjects_y AS (
+    SELECT sub.id
+    FROM subjects sub
+    JOIN year y ON y.id = sub.academic_year_id
+    WHERE (%(program_code)s IS NULL OR sub.program_id = (SELECT program_id FROM program))
+  )
+DELETE FROM section_electives
+WHERE section_id IN (SELECT id FROM sections_y)
+   OR subject_id IN (SELECT id FROM subjects_y);
+""",
+            )
+        )
 
     results: dict[str, int] = {}
     for table_name, sql in deletes:

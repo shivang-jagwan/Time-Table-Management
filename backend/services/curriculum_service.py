@@ -8,7 +8,6 @@ from sqlalchemy.orm import Session
 from api.tenant import get_by_id, where_tenant
 from models.program import Program
 from models.section import Section
-from models.section_elective import SectionElective
 from models.subject import Subject
 from models.track_subject import TrackSubject
 
@@ -87,20 +86,9 @@ def load_curricula(
         )
 
         chosen_elective = None
-        if elective_ids:
-            selection = (
-                db.execute(
-                    where_tenant(
-                        select(SectionElective).where(SectionElective.section_id == section.id),
-                        SectionElective,
-                        tenant_id,
-                    )
-                )
-                .scalars()
-                .first()
-            )
-            if selection is not None:
-                chosen_elective = get_by_id(db, Subject, selection.subject_id, tenant_id)
+        # Legacy section_electives table has been removed in favor of elective blocks.
+        # This service is currently kept for backwards compatibility, but does not
+        # attempt to infer a single chosen elective.
 
         curricula.append(
             SectionCurriculum(

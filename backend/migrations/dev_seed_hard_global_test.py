@@ -363,17 +363,18 @@ ON CONFLICT (teacher_id, subject_id, section_id) DO UPDATE SET is_active = TRUE;
             assign("T7", "AI", ["Y3-A", "Y3-B", "Y3-C"])
             assign("T9", "AI", ["Y3-D", "Y3-E", "Y3-F"])
 
-            # Combined group: AI for Y3-D/E/F
+            # Combined group (v2): AI for Y3-D/E/F with explicit teacher
             ai_year_id = year_ids[3]
             ai_subject_id = subject_ids["AI"]
+            ai_teacher_id = teacher_ids["T9"]
             cur.execute(
                 """
-INSERT INTO combined_subject_groups (academic_year_id, subject_id)
-VALUES (%s, %s)
-ON CONFLICT (academic_year_id, subject_id) DO NOTHING
+INSERT INTO combined_groups (academic_year_id, subject_id, teacher_id)
+VALUES (%s, %s, %s)
+ON CONFLICT (id) DO NOTHING
 RETURNING id;
 """,
-                (ai_year_id, ai_subject_id),
+                (ai_year_id, ai_subject_id, ai_teacher_id),
             )
             row = cur.fetchone()
             if row and row[0]:
@@ -381,18 +382,18 @@ RETURNING id;
             else:
                 group_id = _get_id(
                     cur,
-                    "SELECT id FROM combined_subject_groups WHERE academic_year_id = %s AND subject_id = %s",
-                    (ai_year_id, ai_subject_id),
+                    "SELECT id FROM combined_groups WHERE academic_year_id = %s AND subject_id = %s AND teacher_id = %s",
+                    (ai_year_id, ai_subject_id, ai_teacher_id),
                 )
 
             for sc in ["Y3-D", "Y3-E", "Y3-F"]:
                 cur.execute(
                     """
-INSERT INTO combined_subject_sections (combined_group_id, section_id)
-VALUES (%s, %s)
+INSERT INTO combined_group_sections (combined_group_id, subject_id, section_id)
+VALUES (%s, %s, %s)
 ON CONFLICT (combined_group_id, section_id) DO NOTHING;
 """,
-                    (group_id, section_ids[sc]),
+                    (group_id, ai_subject_id, section_ids[sc]),
                 )
 
             # Special allotment: Y3-A OS locked (avoid T5 weekly off day = Monday)
@@ -430,7 +431,7 @@ SELECT
   (SELECT count(*) FROM teachers WHERE code = ANY(%s)) AS teachers,
   (SELECT count(*) FROM rooms WHERE code = ANY(%s)) AS rooms,
   (SELECT count(*) FROM time_slots WHERE day_of_week = ANY(%s) AND slot_index BETWEEN 0 AND 7) AS time_slots,
-  (SELECT count(*) FROM combined_subject_groups WHERE academic_year_id = %s AND subject_id = %s) AS combined_groups,
+    (SELECT count(*) FROM combined_groups WHERE academic_year_id = %s AND subject_id = %s) AS combined_groups,
   (SELECT count(*) FROM special_allotments WHERE section_id = %s AND slot_id = %s AND is_active IS TRUE) AS special_allotments
 """,
                 (

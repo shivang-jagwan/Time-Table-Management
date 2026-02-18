@@ -80,11 +80,12 @@ def _truncate_dynamic_tables() -> None:
         "fixed_timetable_entries",
         "teacher_subject_sections",
         "section_subjects",
+        "combined_group_sections",
+        "combined_groups",
         "combined_subject_sections",
         "combined_subject_groups",
         "elective_block_subjects",
         "section_elective_blocks",
-        "section_electives",
         "elective_blocks",
     ]
     with ENGINE.begin() as conn:
@@ -527,12 +528,17 @@ def _setup_electives_and_combined(client: Any, program_code: str, teachers: Dict
         # Combined group: combine N sections for Y{year}-T3 if year is enabled
         if year in combined_years and combined_count > 0:
             secs = list(sections_by_year[year].values())[:combined_count]
+            # Pick any active teacher (teacher choice is now explicit per combined group).
+            any_teacher_code = (next(iter(teachers.values()), None) or {}).get("code")
+            if not any_teacher_code:
+                any_teacher_code = "T1"
             client.post(
                 "/api/admin/combined-subject-groups",
                 json={
                     "program_code": program_code,
                     "academic_year_number": year,
                     "subject_code": f"Y{year}-T3",
+                    "teacher_code": any_teacher_code,
                     "section_codes": [s["code"] for s in secs],
                 },
             ).raise_for_status()

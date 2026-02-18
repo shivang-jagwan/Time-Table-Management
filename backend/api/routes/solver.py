@@ -21,7 +21,6 @@ from models.academic_year import AcademicYear
 from models.program import Program
 from models.room import Room
 from models.section import Section
-from models.section_elective import SectionElective
 from models.section_subject import SectionSubject
 from models.section_time_window import SectionTimeWindow
 from models.section_elective_block import SectionElectiveBlock
@@ -37,8 +36,8 @@ from models.special_allotment import SpecialAllotment
 from models.track_subject import TrackSubject
 from models.elective_block import ElectiveBlock
 from models.elective_block_subject import ElectiveBlockSubject
-from models.combined_subject_group import CombinedSubjectGroup
-from models.combined_subject_section import CombinedSubjectSection
+from models.combined_group import CombinedGroup
+from models.combined_group_section import CombinedGroupSection
 from schemas.solver import (
     GenerateTimetableRequest,
     GenerateGlobalTimetableRequest,
@@ -85,7 +84,7 @@ def _required_subject_ids_for_section(
     if mapped:
         return list(mapped)
 
-    # Track curriculum (+ elective selection)
+    # Track curriculum (+ elective blocks)
     q_track = (
         select(TrackSubject)
         .where(TrackSubject.program_id == program_id)
@@ -95,15 +94,20 @@ def _required_subject_ids_for_section(
     q_track = where_tenant(q_track, TrackSubject, tenant_id)
     track_rows = db.execute(q_track).scalars().all()
     mandatory = [r for r in track_rows if not r.is_elective]
-    elective_options = [r for r in track_rows if r.is_elective]
-
     subject_ids: list[uuid.UUID] = [r.subject_id for r in mandatory]
-    if elective_options:
-        q_sel = select(SectionElective).where(SectionElective.section_id == section.id)
-        q_sel = where_tenant(q_sel, SectionElective, tenant_id)
-        sel = db.execute(q_sel).scalars().first()
-        if sel is not None:
-            subject_ids.append(sel.subject_id)
+
+    # Add elective block subjects for this section (parallel electives).
+    q_blocks = select(SectionElectiveBlock.block_id).where(SectionElectiveBlock.section_id == section.id)
+    q_blocks = where_tenant(q_blocks, SectionElectiveBlock, tenant_id)
+    block_ids = [bid for (bid,) in db.execute(q_blocks).all()]
+    if block_ids:
+        q_bsub = (
+            select(ElectiveBlockSubject.subject_id)
+            .where(ElectiveBlockSubject.block_id.in_(block_ids))
+        )
+        q_bsub = where_tenant(q_bsub, ElectiveBlockSubject, tenant_id)
+        for sid in db.execute(q_bsub).scalars().all():
+            subject_ids.append(sid)
     return subject_ids
 
 
@@ -251,15 +255,15 @@ def _validate_special_allotment_refs(
         db.execute(
             where_tenant(
                 where_tenant(
-                    select(CombinedSubjectGroup.id)
-                    .join(CombinedSubjectSection, CombinedSubjectSection.combined_group_id == CombinedSubjectGroup.id)
-                    .where(CombinedSubjectGroup.subject_id == subject.id)
-                    .where(CombinedSubjectSection.section_id == section.id)
+                    select(CombinedGroup.id)
+                    .join(CombinedGroupSection, CombinedGroupSection.combined_group_id == CombinedGroup.id)
+                    .where(CombinedGroup.subject_id == subject.id)
+                    .where(CombinedGroupSection.section_id == section.id)
                     .limit(1),
-                    CombinedSubjectGroup,
+                    CombinedGroup,
                     tenant_id,
                 ),
-                CombinedSubjectSection,
+                CombinedGroupSection,
                 tenant_id,
             )
         ).first()

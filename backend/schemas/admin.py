@@ -49,6 +49,10 @@ class CombinedSubjectGroupOut(BaseModel):
     subject_id: UUID
     subject_code: str
     subject_name: str
+    teacher_id: UUID | None = None
+    teacher_code: str | None = None
+    teacher_name: str | None = None
+    label: str | None = None
     sections: list[CombinedSubjectGroupSectionOut]
     created_at: datetime
 
@@ -57,6 +61,14 @@ class CreateCombinedSubjectGroupRequest(BaseModel):
     program_code: str = Field(min_length=1)
     academic_year_number: int = Field(ge=1, le=4)
     subject_code: str = Field(min_length=1)
+    teacher_code: str = Field(min_length=1)
+    label: str | None = None
+    section_codes: list[str] = Field(default_factory=list)
+
+
+class UpdateCombinedSubjectGroupRequest(BaseModel):
+    teacher_code: str = Field(min_length=1)
+    label: str | None = None
     section_codes: list[str] = Field(default_factory=list)
 
 
@@ -75,35 +87,6 @@ class SetDefaultSectionWindowsRequest(BaseModel):
     start_slot_index: int = Field(default=0, ge=0)
     end_slot_index: int = Field(default=7, ge=0)
     replace_existing: bool = True
-
-
-class SetSectionElectiveRequest(BaseModel):
-    program_code: str = Field(min_length=1)
-    academic_year_number: int = Field(ge=1, le=4)
-    section_code: str = Field(min_length=1)
-    subject_code: str = Field(min_length=1)
-
-
-class BulkSetCoreElectiveRequest(BaseModel):
-    program_code: str = Field(min_length=1)
-    academic_year_number: int = Field(ge=1, le=4)
-    subject_code: str = Field(min_length=1)
-    replace_existing: bool = True
-
-
-class SectionElectiveOut(BaseModel):
-    section_code: str
-    section_name: str
-    subject_code: str | None = None
-    subject_name: str | None = None
-
-
-class AdminActionResult(BaseModel):
-    ok: bool = True
-    created: int = 0
-    updated: int = 0
-    deleted: int = 0
-    message: str | None = None
 
 
 class ClearTimetablesRequest(BaseModel):
@@ -178,6 +161,7 @@ class DeleteCombinedSubjectGroupResponse(BaseModel):
 
 
 class ElectiveBlockSubjectOut(BaseModel):
+    id: UUID
     subject_id: UUID
     subject_code: str
     subject_name: str

@@ -6,11 +6,13 @@ import {
   createCombinedSubjectGroup,
   deleteCombinedSubjectGroup,
   listCombinedSubjectGroups,
+  updateCombinedSubjectGroup,
   type CombinedSubjectGroupOut,
 } from '../api/admin'
 import { listSections, type Section } from '../api/sections'
 import { listRunEntries, listRuns, type RunSummary, type TimetableEntry } from '../api/solver'
 import { listSubjects, type Subject } from '../api/subjects'
+import { listTeachers, type Teacher } from '../api/teachers'
 
 type CombinedGroup = {
   id: string
@@ -27,9 +29,16 @@ export function CombinedClasses() {
   const [year, setYear] = React.useState<number>(academicYearNumber)
   const [subjects, setSubjects] = React.useState<Subject[]>([])
   const [sections, setSections] = React.useState<Section[]>([])
+  const [teachers, setTeachers] = React.useState<Teacher[]>([])
   const [groups, setGroups] = React.useState<CombinedSubjectGroupOut[]>([])
   const [subjectCode, setSubjectCode] = React.useState<string>('')
-  const [selectedSectionCodes, setSelectedSectionCodes] = React.useState<Set<string>>(new Set())
+
+  const [newTeacherCode, setNewTeacherCode] = React.useState<string>('')
+  const [newSelectedSectionCodes, setNewSelectedSectionCodes] = React.useState<Set<string>>(new Set())
+
+  const [draftByGroupId, setDraftByGroupId] = React.useState<
+    Record<string, { teacher_code: string; section_codes: Set<string> }>
+  >({})
 
   const [runs, setRuns] = React.useState<RunSummary[]>([])
   const [runId, setRunId] = React.useState<string>('')
@@ -54,10 +63,25 @@ export function CombinedClasses() {
     [sections],
   )
 
-  const selectedGroup = React.useMemo(() => {
-    if (!subjectCode) return null
-    return groups.find((g) => String(g.subject_code).toUpperCase() === String(subjectCode).toUpperCase()) ?? null
+  const activeTeachers = React.useMemo(
+    () => teachers.filter((t) => t.is_active).sort((a, b) => a.code.localeCompare(b.code)),
+    [teachers],
+  )
+
+  const groupsForSubject = React.useMemo(() => {
+    if (!subjectCode) return []
+    return groups.filter((g) => String(g.subject_code).toUpperCase() === String(subjectCode).toUpperCase())
   }, [groups, subjectCode])
+
+  const usedSectionToGroupId = React.useMemo(() => {
+    const map = new Map<string, string>()
+    for (const g of groupsForSubject) {
+      for (const s of g.sections ?? []) {
+        map.set(String(s.section_code).toUpperCase(), g.id)
+      }
+    }
+    return map
+  }, [groupsForSubject])
 
   async function refreshRulesData(nextYear = year) {
     setLoading(true)
@@ -80,6 +104,10 @@ export function CombinedClasses() {
       setSections(secs)
       setGroups(gs)
 
+      // Teachers are global in this app; load once per refresh.
+      const ts = await listTeachers()
+      setTeachers(ts)
+
       // If current subject isn't valid in this year anymore, reset.
       if (subjectCode) {
         const exists = subjs.some((s) => String(s.code).toUpperCase() === String(subjectCode).toUpperCase())
@@ -92,8 +120,8 @@ export function CombinedClasses() {
     }
   }
 
-  function toggleSection(code: string) {
-    setSelectedSectionCodes((prev) => {
+  function toggleNewSection(code: string) {
+    setNewSelectedSectionCodes((prev) => {
       const next = new Set(prev)
       if (next.has(code)) next.delete(code)
       else next.add(code)
@@ -101,7 +129,18 @@ export function CombinedClasses() {
     })
   }
 
-  async function saveGroup() {
+  function toggleDraftSection(groupId: string, code: string) {
+    setDraftByGroupId((prev) => {
+      const cur = prev[groupId]
+      if (!cur) return prev
+      const nextSet = new Set(cur.section_codes)
+      if (nextSet.has(code)) nextSet.delete(code)
+      else nextSet.add(code)
+      return { ...prev, [groupId]: { ...cur, section_codes: nextSet } }
+    })
+  }
+
+  async function createGroup() {
     const pc = programCode.trim()
     if (!pc) {
       showToast('Select a program first', 3000)
@@ -111,7 +150,11 @@ export function CombinedClasses() {
       showToast('Select a THEORY subject first')
       return
     }
-    const section_codes = Array.from(selectedSectionCodes)
+    if (!newTeacherCode) {
+      showToast('Select a teacher')
+      return
+    }
+    const section_codes = Array.from(newSelectedSectionCodes)
     if (section_codes.length < 2) {
       showToast('Select at least 2 sections')
       return
@@ -122,24 +165,51 @@ export function CombinedClasses() {
         program_code: pc,
         academic_year_number: year,
         subject_code: subjectCode,
+        teacher_code: newTeacherCode,
         section_codes,
       })
-      showToast('Combined rule saved')
+      showToast('Combined group created')
+      setNewSelectedSectionCodes(new Set())
       await refreshRulesData(year)
     } catch (e: any) {
-      showToast(`Save failed: ${String(e?.message ?? e)}`, 3500)
+      showToast(`Create failed: ${String(e?.message ?? e)}`, 3500)
     } finally {
       setLoading(false)
     }
   }
 
-  async function removeGroup() {
-    if (!selectedGroup) return
+  async function saveGroupEdits(groupId: string) {
+    const draft = draftByGroupId[groupId]
+    if (!draft) return
+    if (!draft.teacher_code) {
+      showToast('Select a teacher')
+      return
+    }
+    const section_codes = Array.from(draft.section_codes)
+    if (section_codes.length < 2) {
+      showToast('Select at least 2 sections')
+      return
+    }
     setLoading(true)
     try {
-      await deleteCombinedSubjectGroup(selectedGroup.id)
-      showToast('Combined rule deleted (future solves only)')
-      setSelectedSectionCodes(new Set())
+      await updateCombinedSubjectGroup(groupId, {
+        teacher_code: draft.teacher_code,
+        section_codes,
+      })
+      showToast('Combined group updated')
+      await refreshRulesData(year)
+    } catch (e: any) {
+      showToast(`Update failed: ${String(e?.message ?? e)}`, 3500)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function removeGroup(groupId: string) {
+    setLoading(true)
+    try {
+      await deleteCombinedSubjectGroup(groupId)
+      showToast('Combined group deleted (future solves only)')
       await refreshRulesData(year)
     } catch (e: any) {
       showToast(`Delete failed: ${String(e?.message ?? e)}`, 3500)
@@ -212,18 +282,23 @@ export function CombinedClasses() {
   React.useEffect(() => {
     // keep local year in sync with global selection by default
     setYear(academicYearNumber)
-    setSelectedSectionCodes(new Set())
+    setNewSelectedSectionCodes(new Set())
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [academicYearNumber])
 
   React.useEffect(() => {
-    // When a group exists for the selected subject, mirror the selection.
-    if (selectedGroup) {
-      setSelectedSectionCodes(new Set(selectedGroup.sections.map((s) => s.section_code)))
-    } else {
-      setSelectedSectionCodes(new Set())
+    // Initialize drafts for the selected subject.
+    const next: Record<string, { teacher_code: string; section_codes: Set<string> }> = {}
+    for (const g of groupsForSubject) {
+      next[g.id] = {
+        teacher_code: String(g.teacher_code ?? ''),
+        section_codes: new Set((g.sections ?? []).map((s) => s.section_code)),
+      }
     }
-  }, [selectedGroup])
+    setDraftByGroupId(next)
+    setNewTeacherCode('')
+    setNewSelectedSectionCodes(new Set())
+  }, [subjectCode, groupsForSubject])
 
   return (
     <div className="space-y-6">
@@ -302,105 +377,190 @@ export function CombinedClasses() {
               </div>
             </div>
 
-            <div className="mt-4">
-              <div className="text-xs font-semibold text-slate-600">Sections (select 2+)</div>
-              <div className="mt-2 grid gap-2 md:grid-cols-3">
-                {activeSections.length === 0 ? (
-                  <div className="rounded-2xl border bg-slate-50 p-4 text-sm text-slate-700">No sections found.</div>
-                ) : (
-                  activeSections.map((sec) => (
-                    <label
-                      key={sec.id}
-                      className="checkbox-row"
-                    >
-                      <input
-                        type="checkbox"
-                        checked={selectedSectionCodes.has(sec.code)}
-                        onChange={() => toggleSection(sec.code)}
-                        disabled={Boolean(selectedGroup)}
-                      />
-                      <span className="font-semibold text-slate-900">{sec.code}</span>
-                      <span className="text-slate-600">{sec.name}</span>
-                    </label>
-                  ))
-                )}
-              </div>
-              {selectedGroup ? (
-                <div className="mt-2 text-xs text-slate-500">
-                  This subject already has a combined rule for Year {year}. Delete it to create a different one.
-                </div>
-              ) : null}
-            </div>
-
-            <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
-              <div className="text-xs text-slate-500">
-                Solver enforces strict combined scheduling: same slot/teacher/LT room; teacher load counted once.
-              </div>
-              <div className="flex items-center gap-2">
-                {selectedGroup ? (
-                  <button
-                    className="btn-danger disabled:opacity-50"
-                    onClick={removeGroup}
-                    disabled={loading}
-                  >
-                    Delete Rule
-                  </button>
-                ) : (
-                  <button
-                    className="btn-primary disabled:opacity-50"
-                    onClick={saveGroup}
-                    disabled={loading || !subjectCode}
-                  >
-                    Save Rule
-                  </button>
-                )}
-              </div>
+            <div className="mt-4 text-xs text-slate-500">
+              Each combined group schedules the subject together for its selected sections (one shared slot/teacher/LT room).
             </div>
           </div>
 
           <div className="rounded-3xl border bg-white p-5">
-            <div className="text-sm font-semibold text-slate-900">Existing Rules</div>
-            <div className="mt-1 text-xs text-slate-500">Unique per (subject, academic year).</div>
+            <div className="text-sm font-semibold text-slate-900">Groups</div>
+            <div className="mt-1 text-xs text-slate-500">Pick a subject to manage its groups.</div>
 
-            <div className="mt-4 overflow-x-auto">
-              <table className="min-w-full text-left text-sm">
-                <thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-500">
-                  <tr>
-                    <th className="px-3 py-2">Subject</th>
-                    <th className="px-3 py-2">Sections</th>
-                    <th className="px-3 py-2">Created</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-200">
-                  {groups.length === 0 ? (
-                    <tr>
-                      <td className="px-3 py-3 text-slate-700" colSpan={3}>
-                        No combined rules configured.
-                      </td>
-                    </tr>
-                  ) : (
-                    groups
-                      .slice()
-                      .sort((a, b) => String(a.subject_code).localeCompare(String(b.subject_code)))
-                      .map((g) => (
-                        <tr
-                          key={g.id}
-                          className="cursor-pointer hover:bg-slate-50"
-                          onClick={() => setSubjectCode(g.subject_code)}
-                        >
-                          <td className="px-3 py-2 font-medium text-slate-900">
-                            {g.subject_code} <span className="font-normal text-slate-500">— {g.subject_name}</span>
-                          </td>
-                          <td className="px-3 py-2 text-slate-700">
-                            {g.sections.map((s) => s.section_code).join(', ')}
-                          </td>
-                          <td className="px-3 py-2 text-slate-700">{new Date(g.created_at).toLocaleString()}</td>
-                        </tr>
-                      ))
-                  )}
-                </tbody>
-              </table>
-            </div>
+            {!subjectCode ? (
+              <div className="mt-4 rounded-2xl border bg-slate-50 p-4 text-sm text-slate-700">
+                Select a THEORY subject to view and edit its combined groups.
+              </div>
+            ) : (
+              <div className="mt-4 space-y-4">
+                {/* Existing groups */}
+                {groupsForSubject.length === 0 ? (
+                  <div className="rounded-2xl border bg-slate-50 p-4 text-sm text-slate-700">
+                    No combined groups for this subject.
+                  </div>
+                ) : (
+                  groupsForSubject.map((g, idx) => {
+                    const draft = draftByGroupId[g.id]
+                    const mySections = new Set((g.sections ?? []).map((s) => String(s.section_code).toUpperCase()))
+                    return (
+                      <div key={g.id} className="rounded-2xl border bg-white p-4">
+                        <div className="flex flex-wrap items-end justify-between gap-3">
+                          <div>
+                            <div className="text-sm font-semibold text-slate-900">
+                              Group {idx + 1}{' '}
+                              <span className="font-normal text-slate-500">({g.id})</span>
+                            </div>
+                            <div className="mt-1 text-xs text-slate-500">
+                              {g.subject_code} — {g.subject_name}
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <button
+                              className="btn-secondary disabled:opacity-50"
+                              onClick={() => saveGroupEdits(g.id)}
+                              disabled={loading || !draft}
+                            >
+                              Save
+                            </button>
+                            <button
+                              className="btn-danger disabled:opacity-50"
+                              onClick={() => removeGroup(g.id)}
+                              disabled={loading}
+                            >
+                              Delete
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="mt-4 grid gap-3 md:grid-cols-2">
+                          <div>
+                            <div className="text-xs font-semibold text-slate-600">Teacher</div>
+                            <PremiumSelect
+                              ariaLabel="Group teacher"
+                              className="mt-1"
+                              value={draft?.teacher_code || '__none__'}
+                              onValueChange={(v) => {
+                                setDraftByGroupId((prev) => ({
+                                  ...prev,
+                                  [g.id]: {
+                                    teacher_code: v === '__none__' ? '' : v,
+                                    section_codes: prev[g.id]?.section_codes ?? new Set(),
+                                  },
+                                }))
+                              }}
+                              options={[
+                                { value: '__none__', label: 'Select a teacher…' },
+                                ...activeTeachers.map((t) => ({ value: t.code, label: `${t.code} — ${t.full_name}` })),
+                              ]}
+                            />
+                          </div>
+                        </div>
+
+                        <div className="mt-4">
+                          <div className="text-xs font-semibold text-slate-600">Sections (select 2+)</div>
+                          <div className="mt-2 grid gap-2 md:grid-cols-3">
+                            {activeSections.length === 0 ? (
+                              <div className="rounded-2xl border bg-slate-50 p-4 text-sm text-slate-700">
+                                No sections found.
+                              </div>
+                            ) : (
+                              activeSections.map((sec) => {
+                                const secKey = String(sec.code).toUpperCase()
+                                const usedBy = usedSectionToGroupId.get(secKey)
+                                const disabled = Boolean(usedBy && usedBy !== g.id)
+                                const checked = Boolean(draft?.section_codes?.has(sec.code))
+                                return (
+                                  <label key={sec.id} className="checkbox-row">
+                                    <input
+                                      type="checkbox"
+                                      checked={checked}
+                                      onChange={() => toggleDraftSection(g.id, sec.code)}
+                                      disabled={disabled || loading}
+                                    />
+                                    <span className="font-semibold text-slate-900">{sec.code}</span>
+                                    <span className="text-slate-600">
+                                      {sec.name}
+                                      {disabled ? ' (used in another group)' : ''}
+                                    </span>
+                                  </label>
+                                )
+                              })
+                            )}
+                          </div>
+                          {mySections.size === 0 ? (
+                            <div className="mt-2 text-xs text-slate-500">This group currently has no sections.</div>
+                          ) : null}
+                        </div>
+                      </div>
+                    )
+                  })
+                )}
+
+                {/* Create new group */}
+                <div className="rounded-2xl border bg-slate-50 p-4">
+                  <div className="flex flex-wrap items-end justify-between gap-3">
+                    <div>
+                      <div className="text-sm font-semibold text-slate-900">Add Group</div>
+                      <div className="mt-1 text-xs text-slate-500">
+                        Sections cannot be repeated across groups for the same subject.
+                      </div>
+                    </div>
+                    <button
+                      className="btn-primary disabled:opacity-50"
+                      onClick={createGroup}
+                      disabled={loading || !subjectCode}
+                    >
+                      Create
+                    </button>
+                  </div>
+
+                  <div className="mt-4 grid gap-3 md:grid-cols-2">
+                    <div>
+                      <div className="text-xs font-semibold text-slate-600">Teacher</div>
+                      <PremiumSelect
+                        ariaLabel="New group teacher"
+                        className="mt-1"
+                        value={newTeacherCode || '__none__'}
+                        onValueChange={(v) => setNewTeacherCode(v === '__none__' ? '' : v)}
+                        options={[
+                          { value: '__none__', label: 'Select a teacher…' },
+                          ...activeTeachers.map((t) => ({ value: t.code, label: `${t.code} — ${t.full_name}` })),
+                        ]}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="mt-4">
+                    <div className="text-xs font-semibold text-slate-600">Sections (select 2+)</div>
+                    <div className="mt-2 grid gap-2 md:grid-cols-3">
+                      {activeSections.length === 0 ? (
+                        <div className="rounded-2xl border bg-white p-4 text-sm text-slate-700">No sections found.</div>
+                      ) : (
+                        activeSections.map((sec) => {
+                          const secKey = String(sec.code).toUpperCase()
+                          const disabled = usedSectionToGroupId.has(secKey)
+                          const checked = newSelectedSectionCodes.has(sec.code)
+                          return (
+                            <label key={sec.id} className="checkbox-row">
+                              <input
+                                type="checkbox"
+                                checked={checked}
+                                onChange={() => toggleNewSection(sec.code)}
+                                disabled={disabled || loading}
+                              />
+                              <span className="font-semibold text-slate-900">{sec.code}</span>
+                              <span className="text-slate-600">
+                                {sec.name}
+                                {disabled ? ' (used in another group)' : ''}
+                              </span>
+                            </label>
+                          )
+                        })
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         </>
       ) : (

@@ -85,7 +85,7 @@ export function ElectiveBlocks() {
 
   const duplicateTeacherInBlock = React.useMemo(() => {
     if (!selectedBlock || !assignTeacherId) return false
-    return selectedBlock.subjects.some((s) => s.teacher_id === assignTeacherId && s.subject_id !== assignSubjectId)
+    return selectedBlock.subjects.some((s) => s.teacher_id === assignTeacherId)
   }, [selectedBlock, assignTeacherId, assignSubjectId])
 
   async function refresh(nextYear = year) {
@@ -228,11 +228,11 @@ export function ElectiveBlocks() {
     }
   }
 
-  async function onDeleteAssignment(subjectId: string) {
+  async function onDeleteAssignment(assignmentId: string) {
     if (!selectedBlock) return
     setLoading(true)
     try {
-      await deleteElectiveBlockSubject({ block_id: selectedBlock.id, subject_id: subjectId })
+      await deleteElectiveBlockSubject({ block_id: selectedBlock.id, assignment_id: assignmentId })
       showToast('Assignment removed')
       await refresh(year)
     } catch (e: any) {
@@ -458,7 +458,7 @@ export function ElectiveBlocks() {
                         </tr>
                       ) : (
                         selectedBlock.subjects.map((s) => (
-                          <tr key={s.subject_id} className="border-t border-slate-200">
+                          <tr key={s.id} className="border-t border-slate-200">
                             <td className="px-3 py-2 text-sm text-slate-900">
                               <div className="font-semibold">{s.subject_code}</div>
                               <div className="text-xs text-slate-600">{s.subject_name}</div>
@@ -471,7 +471,7 @@ export function ElectiveBlocks() {
                               <button
                                 className="btn-secondary"
                                 disabled={loading}
-                                onClick={() => onDeleteAssignment(s.subject_id)}
+                                onClick={() => onDeleteAssignment(s.id)}
                               >
                                 Remove
                               </button>

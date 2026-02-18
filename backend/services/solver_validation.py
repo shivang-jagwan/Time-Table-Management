@@ -8,12 +8,11 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from api.tenant import where_tenant
-from models.combined_subject_group import CombinedSubjectGroup
-from models.combined_subject_section import CombinedSubjectSection
+from models.combined_group import CombinedGroup
+from models.combined_group_section import CombinedGroupSection
 from models.elective_block import ElectiveBlock
 from models.elective_block_subject import ElectiveBlockSubject
 from models.room import Room
-from models.section_elective import SectionElective
 from models.section_elective_block import SectionElectiveBlock
 from models.section_subject import SectionSubject
 from models.section_break import SectionBreak
@@ -302,8 +301,29 @@ def validate_prereqs(
                 )
             )
 
-    # Elective selection rules (explicit; no inference from names).
-    # If explicit section_subjects mapping exists, electives are ignored.
+    # Elective rules (new): electives are modeled via elective blocks.
+    # If a section has electives configured in track_subjects, it must either:
+    # - use explicit section_subjects mapping (override), OR
+    # - be mapped to at least one elective block.
+    #
+    # Note: blocks can also be used for a single elective (legacy conversion); we warn
+    # when a block has fewer than 2 assignments.
+    blocks_by_section: dict[Any, list[Any]] = defaultdict(list)
+    if section_ids:
+        sec_block_rows = (
+            db.execute(
+                where_tenant(
+                    select(SectionElectiveBlock.section_id, SectionElectiveBlock.block_id)
+                    .where(SectionElectiveBlock.section_id.in_(section_ids)),
+                    SectionElectiveBlock,
+                    tenant_id,
+                )
+            )
+            .all()
+        )
+        for sid, bid in sec_block_rows:
+            blocks_by_section[sid].append(bid)
+
     for section in sections:
         if mapped_subject_ids_by_section.get(section.id):
             continue
@@ -324,61 +344,16 @@ def validate_prereqs(
             .scalars()
             .all()
         )
-        selection = (
-            db.execute(
-                where_tenant(
-                    select(SectionElective).where(SectionElective.section_id == section.id),
-                    SectionElective,
-                    tenant_id,
+
+        if elective_subject_ids and not blocks_by_section.get(section.id):
+            conflicts.append(
+                ValidationConflict(
+                    conflict_type="MISSING_ELECTIVE_BLOCKS",
+                    message="Section has elective options configured but is not mapped to any elective blocks.",
+                    section_id=section.id,
+                    metadata={"track": str(section.track), "academic_year_id": str(effective_year_id)},
                 )
             )
-            .scalars()
-            .first()
-        )
-
-        if section.track != "CORE":
-            if selection is not None:
-                conflicts.append(
-                    ValidationConflict(
-                        conflict_type="NON_CORE_HAS_ELECTIVE_SELECTION",
-                        message="Non-CORE sections must not use section_electives.",
-                        section_id=section.id,
-                        subject_id=selection.subject_id,
-                        metadata={"track": section.track},
-                    )
-                )
-            continue
-
-        # CORE track
-        if elective_subject_ids:
-            if selection is None:
-                conflicts.append(
-                    ValidationConflict(
-                        conflict_type="MISSING_ELECTIVE_SELECTION",
-                        message="CORE section must select exactly one elective (section_electives).",
-                        section_id=section.id,
-                    )
-                )
-            else:
-                if selection.subject_id not in set(elective_subject_ids):
-                    conflicts.append(
-                        ValidationConflict(
-                            conflict_type="INVALID_ELECTIVE_SELECTION",
-                            message="Selected elective is not an allowed elective option for CORE track.",
-                            section_id=section.id,
-                            subject_id=selection.subject_id,
-                        )
-                    )
-        else:
-            if selection is not None:
-                conflicts.append(
-                    ValidationConflict(
-                        conflict_type="UNEXPECTED_ELECTIVE_SELECTION",
-                        message="CORE section has a selection but CORE track has no elective options configured.",
-                        section_id=section.id,
-                        subject_id=selection.subject_id,
-                    )
-                )
 
     # Teacher assignment validation (strict): each (section, required subject) must have exactly one active teacher.
     # We validate against the curriculum per section (mapping override else track + electives).
@@ -439,21 +414,6 @@ def validate_prereqs(
         for r in track_rows_all:
             track_by_year_track[(r.academic_year_id, str(r.track))].append(r)
 
-        elective_by_section = {}
-        elective_rows = (
-            db.execute(
-                where_tenant(
-                    select(SectionElective).where(SectionElective.section_id.in_(section_ids)),
-                    SectionElective,
-                    tenant_id,
-                )
-            )
-            .scalars()
-            .all()
-        )
-        for e in elective_rows:
-            elective_by_section[e.section_id] = e.subject_id
-
         for section in sections:
             mapped = mapped_subject_ids_by_section.get(section.id, [])
             if mapped:
@@ -463,13 +423,7 @@ def validate_prereqs(
             effective_year_id = academic_year_id if academic_year_id is not None else section.academic_year_id
             rows = track_by_year_track.get((effective_year_id, str(section.track)), [])
             mandatory = [r for r in rows if not r.is_elective]
-            elective_options = [r for r in rows if r.is_elective]
             allowed = {r.subject_id for r in mandatory}
-            # Legacy section elective is ignored if the section uses elective blocks.
-            if elective_options and not blocks_by_section.get(section.id):
-                sel = elective_by_section.get(section.id)
-                if sel is not None:
-                    allowed.add(sel)
             allowed_subject_ids_by_section[section.id] = allowed
 
         required_pairs: list[tuple[Any, Any]] = []
@@ -573,6 +527,17 @@ def validate_prereqs(
                         )
                         continue
 
+                    if len(pairs) < 2:
+                        conflicts.append(
+                            ValidationConflict(
+                                conflict_type="ELECTIVE_BLOCK_TOO_SMALL",
+                                message="Elective block has fewer than 2 subject-teacher assignments (parallel electives).",
+                                severity="WARN",
+                                section_id=section.id,
+                                metadata={"block_id": str(bid), "assignments": int(len(pairs))},
+                            )
+                        )
+
                     # Duplicate teacher within the same block.
                     teacher_ids = [tid for _sid, tid in pairs]
                     if len(set(teacher_ids)) != len(teacher_ids):
@@ -607,6 +572,21 @@ def validate_prereqs(
                                     section_id=section.id,
                                     subject_id=subj_id,
                                     metadata={"block_id": str(bid)},
+                                )
+                            )
+
+                        # Subject must be marked as elective in curriculum for this section's track.
+                        effective_year_id = academic_year_id if academic_year_id is not None else section.academic_year_id
+                        track_rows = track_by_year_track.get((effective_year_id, str(section.track)), [])
+                        elective_ids_for_track = {r.subject_id for r in track_rows if bool(r.is_elective)}
+                        if elective_ids_for_track and subj_id not in elective_ids_for_track:
+                            conflicts.append(
+                                ValidationConflict(
+                                    conflict_type="ELECTIVE_BLOCK_SUBJECT_NOT_ELECTIVE",
+                                    message="Elective block contains a subject that is not marked as elective in track_subjects for this section's track.",
+                                    section_id=section.id,
+                                    subject_id=subj_id,
+                                    metadata={"block_id": str(bid), "track": str(section.track)},
                                 )
                             )
                         sessions_vals.append(int(getattr(subj, "sessions_per_week", 0) or 0))
@@ -791,21 +771,6 @@ def validate_prereqs(
             for r in track_rows_all:
                 track_by_year_track[(r.academic_year_id, str(r.track))].append(r)
 
-            elective_by_section = {}
-            elective_rows = (
-                db.execute(
-                    where_tenant(
-                        select(SectionElective).where(SectionElective.section_id.in_(section_ids)),
-                        SectionElective,
-                        tenant_id,
-                    )
-                )
-                .scalars()
-                .all()
-            )
-            for e in elective_rows:
-                elective_by_section[e.section_id] = e.subject_id
-
             for section in sections:
                 mapped = mapped_subject_ids_by_section.get(section.id, [])
                 if mapped:
@@ -815,12 +780,17 @@ def validate_prereqs(
                 effective_year_id = academic_year_id if academic_year_id is not None else section.academic_year_id
                 rows = track_by_year_track.get((effective_year_id, str(section.track)), [])
                 mandatory = [r for r in rows if not r.is_elective]
-                elective_options = [r for r in rows if r.is_elective]
                 allowed = {r.subject_id for r in mandatory}
-                if elective_options:
-                    sel = elective_by_section.get(section.id)
-                    if sel is not None:
-                        allowed.add(sel)
+
+                # Also allow elective-block subjects for this section.
+                sec_block_ids = blocks_by_section.get(section.id, [])
+                if sec_block_ids:
+                    b_pairs = []
+                    if block_ids:
+                        for bid in sec_block_ids:
+                            b_pairs.extend(block_subjects_by_block.get(bid, []))
+                    for subj_id, _tid in b_pairs:
+                        allowed.add(subj_id)
                 allowed_subject_ids_by_section[section.id] = allowed
 
             # Assignment lookup for fixed entries: (section, subject) -> teacher_id
@@ -1159,15 +1129,6 @@ def validate_prereqs(
             for r in track_rows_all:
                 track_by_year_track[(r.academic_year_id, str(r.track))].append(r)
 
-            elective_by_section = {}
-            elective_rows = (
-                db.execute(where_tenant(select(SectionElective).where(SectionElective.section_id.in_(section_ids)), SectionElective, tenant_id))
-                .scalars()
-                .all()
-            )
-            for e in elective_rows:
-                elective_by_section[e.section_id] = e.subject_id
-
             for section in sections:
                 mapped = mapped_subject_ids_by_section.get(section.id, [])
                 if mapped:
@@ -1177,12 +1138,17 @@ def validate_prereqs(
                 effective_year_id = academic_year_id if academic_year_id is not None else section.academic_year_id
                 rows = track_by_year_track.get((effective_year_id, str(section.track)), [])
                 mandatory = [r for r in rows if not r.is_elective]
-                elective_options = [r for r in rows if r.is_elective]
                 allowed = {r.subject_id for r in mandatory}
-                if elective_options:
-                    sel = elective_by_section.get(section.id)
-                    if sel is not None:
-                        allowed.add(sel)
+
+                # Also allow elective-block subjects for this section.
+                sec_block_ids = blocks_by_section.get(section.id, [])
+                if sec_block_ids:
+                    b_pairs = []
+                    if block_ids:
+                        for bid in sec_block_ids:
+                            b_pairs.extend(block_subjects_by_block.get(bid, []))
+                    for subj_id, _tid in b_pairs:
+                        allowed.add(subj_id)
                 allowed_subject_ids_by_section[section.id] = allowed
 
             # Assignment lookup: (section, subject) -> teacher_id
@@ -1634,23 +1600,8 @@ def validate_prereqs(
             .scalars()
             .all()
         )
-        elective_subject_ids = [r.subject_id for r in track_rows if r.is_elective]
         mandatory_rows = [r for r in track_rows if not r.is_elective]
-        chosen_elective_id = None
-        if elective_subject_ids:
-            sel = (
-                db.execute(
-                    where_tenant(
-                        select(SectionElective).where(SectionElective.section_id == section.id),
-                        SectionElective,
-                        tenant_id,
-                    )
-                )
-                .scalars()
-                .first()
-            )
-            if sel is not None:
-                chosen_elective_id = sel.subject_id
+        sec_block_ids = blocks_by_section.get(section.id, [])
 
         any_subject = False
 
@@ -1666,21 +1617,18 @@ def validate_prereqs(
             else:
                 required_slots_by_subject[subj.id] += int(sessions)
 
-        # Elective chosen
-        if chosen_elective_id is not None:
-            any_subject = True
-            chosen_row = next((r for r in track_rows if r.subject_id == chosen_elective_id), None)
-            subj = subject_by_id.get(chosen_elective_id)
-            if subj is not None:
-                sessions = (
-                    chosen_row.sessions_override
-                    if (chosen_row is not None and chosen_row.sessions_override is not None)
-                    else subj.sessions_per_week
-                )
-                if str(subj.subject_type) == "LAB":
-                    required_slots_by_subject[subj.id] += int(sessions) * int(subj.lab_block_size_slots)
-                else:
-                    required_slots_by_subject[subj.id] += int(sessions)
+        # Elective blocks: section load is one slot per block occurrence (shared across parallel electives).
+        # We estimate required slots based on sessions_per_week of subjects in the block.
+        if sec_block_ids:
+            for bid in sec_block_ids:
+                pairs = block_subjects_by_block.get(bid, [])
+                if not pairs:
+                    continue
+                subj = subject_by_id.get(pairs[0][0])
+                if subj is None:
+                    continue
+                any_subject = True
+                required_slots_by_subject[subj.id] += int(getattr(subj, "sessions_per_week", 0) or 0)
 
         if not any_subject:
             conflicts.append(
@@ -1738,24 +1686,6 @@ def validate_prereqs(
                 .all()
             )
             mandatory_rows = [r for r in track_rows if not r.is_elective]
-            elective_rows = [r for r in track_rows if r.is_elective]
-
-            chosen_elective_id = None
-            if elective_rows and str(section.track) == "CORE":
-                sel = (
-                    db.execute(
-                        where_tenant(
-                            select(SectionElective).where(SectionElective.section_id == section.id),
-                            SectionElective,
-                            tenant_id,
-                        )
-                    )
-                    .scalars()
-                    .first()
-                )
-                if sel is not None:
-                    chosen_elective_id = sel.subject_id
-
             for r in mandatory_rows:
                 subj = subject_by_id.get(r.subject_id)
                 if subj is None:
@@ -1764,12 +1694,17 @@ def validate_prereqs(
                 block = int(subj.lab_block_size_slots) if str(subj.subject_type) == "LAB" else 1
                 required_slots += int(sessions) * block
 
-            if chosen_elective_id is not None:
-                subj = subject_by_id.get(chosen_elective_id)
-                if subj is not None:
-                    sessions = int(subj.sessions_per_week)
-                    block = int(subj.lab_block_size_slots) if str(subj.subject_type) == "LAB" else 1
-                    required_slots += sessions * block
+            # Add elective block load: one slot per block occurrence.
+            sec_block_ids = blocks_by_section.get(section.id, [])
+            if sec_block_ids:
+                for bid in sec_block_ids:
+                    pairs = block_subjects_by_block.get(bid, [])
+                    if not pairs:
+                        continue
+                    subj = subject_by_id.get(pairs[0][0])
+                    if subj is None:
+                        continue
+                    required_slots += int(getattr(subj, "sessions_per_week", 0) or 0)
 
         if required_slots > len(allowed):
             conflicts.append(
@@ -1782,20 +1717,21 @@ def validate_prereqs(
             )
 
     # =========================
-    # Combined Subject Groups (strict)
+    # Combined Groups (v2)
     # =========================
     q_combined = (
-        select(CombinedSubjectGroup, Subject, CombinedSubjectSection.section_id)
-        .join(Subject, Subject.id == CombinedSubjectGroup.subject_id)
-        .join(CombinedSubjectSection, CombinedSubjectSection.combined_group_id == CombinedSubjectGroup.id)
+        select(CombinedGroup, Subject, Teacher, CombinedGroupSection.section_id)
+        .join(Subject, Subject.id == CombinedGroup.subject_id)
+        .outerjoin(Teacher, Teacher.id == CombinedGroup.teacher_id)
+        .join(CombinedGroupSection, CombinedGroupSection.combined_group_id == CombinedGroup.id)
         .where(Subject.program_id == program_id)
         .where(Subject.is_active.is_(True))
     )
     if solve_year_ids:
-        q_combined = q_combined.where(CombinedSubjectGroup.academic_year_id.in_(solve_year_ids)).where(
+        q_combined = q_combined.where(CombinedGroup.academic_year_id.in_(solve_year_ids)).where(
             Subject.academic_year_id.in_(solve_year_ids)
         )
-    q_combined = where_tenant(q_combined, CombinedSubjectGroup, tenant_id)
+    q_combined = where_tenant(q_combined, CombinedGroup, tenant_id)
     combined_rows = db.execute(q_combined).all()
 
     if combined_rows:
@@ -1820,10 +1756,15 @@ def validate_prereqs(
     group_sections = defaultdict(set)
     group_subject = {}
     group_subject_code = {}
-    for g, subj, sec_id in combined_rows:
+    group_teacher_id = {}
+    group_teacher = {}
+    for g, subj, teacher, sec_id in combined_rows:
         group_sections[g.id].add(sec_id)
         group_subject[g.id] = subj.id
         group_subject_code[g.id] = str(subj.code)
+        group_teacher_id[g.id] = getattr(g, "teacher_id", None)
+        if g.id not in group_teacher:
+            group_teacher[g.id] = teacher
 
     section_by_id = {s.id: s for s in sections}
     solve_section_ids = set(section_by_id.keys())
@@ -1844,13 +1785,6 @@ def validate_prereqs(
     for r in track_rows_all:
         track_rows_by_track_year[(str(r.track), r.academic_year_id)].append(r)
 
-    electives_by_section_id = {}
-    if section_ids:
-        q_e = select(SectionElective).where(SectionElective.section_id.in_(section_ids))
-        q_e = where_tenant(q_e, SectionElective, tenant_id)
-        for e in db.execute(q_e).scalars().all():
-            electives_by_section_id[e.section_id] = e
-
     def required_sessions_for_section_subject(section, subj_id):
         mapped = mapped_subject_ids_by_section.get(section.id, [])
         subj = subject_by_id.get(subj_id)
@@ -1870,10 +1804,13 @@ def validate_prereqs(
                 sessions = r.sessions_override if r.sessions_override is not None else subj.sessions_per_week
                 return int(sessions or 0)
 
-        if elective and str(section.track) == "CORE":
-            sel = electives_by_section_id.get(section.id)
-            if sel is not None and sel.subject_id == subj_id:
-                return int(subj.sessions_per_week)
+        # Elective blocks: treat any block subject as present in the mapped sections.
+        sec_block_ids = blocks_by_section.get(section.id, [])
+        if sec_block_ids:
+            for bid in sec_block_ids:
+                pairs = block_subjects_by_block.get(bid, [])
+                if any(sid == subj_id for sid, _tid in pairs):
+                    return int(subj.sessions_per_week)
 
         return None
 
@@ -1897,6 +1834,18 @@ def validate_prereqs(
                 ValidationConflict(
                     conflict_type="COMBINED_GROUP_SUBJECT_NOT_THEORY",
                     message="Combined groups are allowed only for THEORY subjects.",
+                    subject_id=subj_id,
+                    metadata={"combined_group_id": str(gid), "subject_code": subj_code},
+                )
+            )
+
+        tid = group_teacher_id.get(gid)
+        t = group_teacher.get(gid)
+        if tid is None or t is None or not bool(getattr(t, "is_active", False)):
+            conflicts.append(
+                ValidationConflict(
+                    conflict_type="COMBINED_GROUP_TEACHER_MISSING",
+                    message="Combined group must have an active teacher assigned.",
                     subject_id=subj_id,
                     metadata={"combined_group_id": str(gid), "subject_code": subj_code},
                 )

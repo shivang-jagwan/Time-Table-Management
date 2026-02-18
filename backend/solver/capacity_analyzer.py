@@ -20,8 +20,8 @@ from models import (
     Room,
     FixedTimetableEntry,
     SpecialAllotment,
-    CombinedSubjectGroup,
-    CombinedSubjectSection,
+    CombinedGroup,
+    CombinedGroupSection,
 )
 
 
@@ -97,17 +97,22 @@ def build_capacity_data(
     fixed_entries: list[FixedTimetableEntry] = db.execute(where_tenant(select(FixedTimetableEntry), FixedTimetableEntry, tenant_id)).scalars().all()
     special_allotments: list[SpecialAllotment] = db.execute(where_tenant(select(SpecialAllotment), SpecialAllotment, tenant_id)).scalars().all()
 
-    # Combined groups
-    groups = db.execute(where_tenant(select(CombinedSubjectGroup), CombinedSubjectGroup, tenant_id)).scalars().all()
+    # Combined groups (v2)
     group_sections: dict[Any, list[Any]] = defaultdict(list)
     group_subject: dict[Any, Any] = {}
-    for g in groups:
-        group_subject[g.id] = getattr(g, "subject_id", None)
-    if groups:
-        q_gs = select(CombinedSubjectSection).where(CombinedSubjectSection.combined_group_id.in_([g.id for g in groups]))
-        q_gs = where_tenant(q_gs, CombinedSubjectSection, tenant_id)
-        for row in db.execute(q_gs).scalars().all():
-            group_sections[row.combined_group_id].append(row.section_id)
+    if section_ids:
+        q_cg = (
+            select(CombinedGroup.id, CombinedGroup.subject_id, CombinedGroupSection.section_id)
+            .join(CombinedGroupSection, CombinedGroupSection.combined_group_id == CombinedGroup.id)
+            .where(CombinedGroupSection.section_id.in_(section_ids))
+        )
+        if academic_year_id is not None:
+            q_cg = q_cg.where(CombinedGroup.academic_year_id == academic_year_id)
+        q_cg = where_tenant(q_cg, CombinedGroup, tenant_id)
+        q_cg = where_tenant(q_cg, CombinedGroupSection, tenant_id)
+        for gid, subj_id, sec_id in db.execute(q_cg).all():
+            group_subject[gid] = subj_id
+            group_sections[gid].append(sec_id)
 
     # Filter combined groups to the target `sections` to avoid cross-year/program leakage.
     # Keep only groups with at least 2 relevant sections within the provided section set.

@@ -2,7 +2,6 @@ from models.program import Program
 from models.room import Room
 from models.section import Section
 from models.section_break import SectionBreak
-from models.section_elective import SectionElective
 from models.section_subject import SectionSubject
 from models.section_time_window import SectionTimeWindow
 from models.subject import Subject
@@ -10,6 +9,8 @@ from models.teacher import Teacher
 from models.teacher_subject_section import TeacherSubjectSection
 from models.combined_subject_group import CombinedSubjectGroup
 from models.combined_subject_section import CombinedSubjectSection
+from models.combined_group import CombinedGroup
+from models.combined_group_section import CombinedGroupSection
 from models.timetable_conflict import TimetableConflict
 from models.timetable_entry import TimetableEntry
 from models.timetable_run import TimetableRun
@@ -26,7 +27,6 @@ __all__ = [
 	"Room",
 	"Section",
 	"SectionBreak",
-	"SectionElective",
 	"SectionSubject",
 	"SectionTimeWindow",
 	"Subject",
@@ -34,6 +34,8 @@ __all__ = [
 	"TeacherSubjectSection",
 	"CombinedSubjectGroup",
 	"CombinedSubjectSection",
+	"CombinedGroup",
+	"CombinedGroupSection",
 	"TimetableConflict",
 	"TimetableEntry",
 	"TimetableRun",
