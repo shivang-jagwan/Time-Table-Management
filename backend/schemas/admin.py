@@ -37,6 +37,14 @@ class MapProgramDataToYearResponse(BaseModel):
     message: str | None = None
 
 
+class AdminActionResult(BaseModel):
+    ok: bool = True
+    created: int = 0
+    updated: int = 0
+    deleted: int = 0
+    message: str | None = None
+
+
 class CombinedSubjectGroupSectionOut(BaseModel):
     section_id: UUID
     section_code: str
