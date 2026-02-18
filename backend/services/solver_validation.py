@@ -85,6 +85,31 @@ def validate_prereqs(
         solve_year_ids = [academic_year_id]
 
     section_ids = [s.id for s in sections]
+
+    # Assignment lookup used by multiple validations (including combined-group teacher inference).
+    # Must be initialized even when no fixed entries / special allotments exist.
+    assigned_teacher_by_section_subject: dict[tuple[Any, Any], Any] = {}
+    if section_ids:
+        assign_rows = (
+            db.execute(
+                where_tenant(
+                    select(
+                        TeacherSubjectSection.section_id,
+                        TeacherSubjectSection.subject_id,
+                        TeacherSubjectSection.teacher_id,
+                    )
+                    .where(TeacherSubjectSection.section_id.in_(section_ids))
+                    .where(TeacherSubjectSection.is_active.is_(True)),
+                    TeacherSubjectSection,
+                    tenant_id,
+                )
+            )
+            .all()
+        )
+        for sec_id, subj_id, teacher_id in assign_rows:
+            # If duplicates exist, the strict assignment validation should report it.
+            assigned_teacher_by_section_subject.setdefault((sec_id, subj_id), teacher_id)
+
     mapped_subject_ids_by_section = defaultdict(list)
     if section_ids:
         q_sec_subj = select(SectionSubject.section_id, SectionSubject.subject_id).where(
