@@ -75,6 +75,23 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
       if (data) {
         const detail = data?.detail
 
+        // Solver/API errors often return structured details with a run_id for debugging.
+        // Example: { detail: { error: 'SOLVER_DB_INTEGRITY_ERROR', message: '...', run_id: '...' } }
+        if (detail && typeof detail === 'object' && !Array.isArray(detail)) {
+          const runId = typeof (detail as any).run_id === 'string' ? (detail as any).run_id : null
+          const err = typeof (detail as any).error === 'string' ? (detail as any).error : null
+          const typ = typeof (detail as any).type === 'string' ? (detail as any).type : null
+          const msg = typeof (detail as any).message === 'string' ? (detail as any).message : null
+
+          if (runId || err || msg || typ) {
+            const head = [err, typ].filter(Boolean).join(': ')
+            const body = msg && msg.trim() ? msg.trim() : null
+            const base = [head, body].filter(Boolean).join(' - ')
+            const finalMsg = `${base || 'Request failed'}${runId ? ` (run_id: ${runId})` : ''}`
+            throw new Error(finalMsg)
+          }
+        }
+
         // New service-level style: { code: string, message: string }
         if (typeof data?.code === 'string') {
           const msg = typeof data?.message === 'string' && data.message.trim() ? data.message : data.code

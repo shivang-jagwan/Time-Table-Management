@@ -4,7 +4,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, literal
 from sqlalchemy.orm import Session
 
 from api.tenant import where_tenant
@@ -702,10 +702,83 @@ def validate_prereqs(
             subj_by_id = {s.id: s for s in subject_rows}
             teacher_by_id = {t.id: t for t in teacher_rows}
 
+            # Combined THEORY groups should count once per group for teacher load.
+            # Otherwise, a combined class across N sections gets incorrectly counted as N× hours.
+            solve_section_ids = set(section_ids)
+            combined_gid_by_sec_subj: dict[tuple[Any, Any], Any] = {}
+            combined_group_sections: dict[Any, list[Any]] = defaultdict(list)  # gid -> [section_id]
+            combined_group_subject: dict[Any, Any] = {}  # gid -> subject_id
+            combined_group_teacher: dict[Any, Any | None] = {}  # gid -> teacher_id (optional)
+
+            use_v2_combined = table_exists(db, "combined_groups") and table_exists(db, "combined_group_sections")
+            if solve_section_ids:
+                if use_v2_combined:
+                    q_combined = (
+                        select(
+                            CombinedGroup.id,
+                            CombinedGroup.subject_id,
+                            CombinedGroup.teacher_id,
+                            CombinedGroupSection.section_id,
+                        )
+                        .join(CombinedGroupSection, CombinedGroupSection.combined_group_id == CombinedGroup.id)
+                        .join(Subject, Subject.id == CombinedGroup.subject_id)
+                        .where(Subject.program_id == program_id)
+                        .where(Subject.is_active.is_(True))
+                    )
+                    if solve_year_ids:
+                        q_combined = q_combined.where(CombinedGroup.academic_year_id.in_(solve_year_ids)).where(
+                            Subject.academic_year_id.in_(solve_year_ids)
+                        )
+                    q_combined = where_tenant(q_combined, CombinedGroup, tenant_id)
+                    q_combined = where_tenant(q_combined, CombinedGroupSection, tenant_id)
+                    q_combined = where_tenant(q_combined, Subject, tenant_id)
+                    combined_rows = db.execute(q_combined).all()
+                else:
+                    q_combined = (
+                        select(
+                            CombinedSubjectGroup.id,
+                            CombinedSubjectGroup.subject_id,
+                            literal(None).label("teacher_id"),
+                            CombinedSubjectSection.section_id,
+                        )
+                        .join(CombinedSubjectSection, CombinedSubjectSection.combined_group_id == CombinedSubjectGroup.id)
+                        .join(Subject, Subject.id == CombinedSubjectGroup.subject_id)
+                        .where(Subject.program_id == program_id)
+                        .where(Subject.is_active.is_(True))
+                    )
+                    if solve_year_ids:
+                        q_combined = q_combined.where(CombinedSubjectGroup.academic_year_id.in_(solve_year_ids)).where(
+                            Subject.academic_year_id.in_(solve_year_ids)
+                        )
+                    q_combined = where_tenant(q_combined, CombinedSubjectGroup, tenant_id)
+                    q_combined = where_tenant(q_combined, CombinedSubjectSection, tenant_id)
+                    q_combined = where_tenant(q_combined, Subject, tenant_id)
+                    combined_rows = db.execute(q_combined).all()
+
+                for gid, subj_id, teacher_id, sec_id in combined_rows:
+                    if sec_id not in solve_section_ids:
+                        continue
+                    subj = subj_by_id.get(subj_id)
+                    if subj is None or str(getattr(subj, "subject_type", "")) != "THEORY":
+                        continue
+                    combined_group_sections[gid].append(sec_id)
+                    combined_group_subject[gid] = subj_id
+                    if gid not in combined_group_teacher:
+                        combined_group_teacher[gid] = teacher_id
+                    combined_gid_by_sec_subj[(sec_id, subj_id)] = gid
+
             teacher_required_slots = defaultdict(int)  # teacher_id -> total occupied slots/week
             teacher_affected_sections: dict[Any, set[Any]] = defaultdict(set)
             teacher_affected_subjects: dict[Any, set[Any]] = defaultdict(set)
+
+            # 1) Count non-combined required pairs normally.
+            combined_gids_seen: set[Any] = set()
             for sec_id, subj_id in required_pairs:
+                gid = combined_gid_by_sec_subj.get((sec_id, subj_id))
+                if gid is not None:
+                    combined_gids_seen.add(gid)
+                    continue
+
                 teachers = teachers_by_section_subject.get((sec_id, subj_id), set())
                 if len(teachers) != 1:
                     continue
@@ -721,6 +794,42 @@ def validate_prereqs(
                     teacher_required_slots[teacher_id] += spw * max(block, 1)
                 else:
                     teacher_required_slots[teacher_id] += spw
+
+            # 2) Count combined THEORY groups once per group.
+            for gid in sorted(list(combined_gids_seen), key=lambda x: str(x)):
+                sec_ids = combined_group_sections.get(gid, [])
+                if len(sec_ids) < 2:
+                    continue
+                subj_id = combined_group_subject.get(gid)
+                subj = subj_by_id.get(subj_id)
+                if subj is None or str(getattr(subj, "subject_type", "")) != "THEORY":
+                    continue
+                spw = int(getattr(subj, "sessions_per_week", 0) or 0)
+                if spw <= 0:
+                    continue
+
+                teacher_id = combined_group_teacher.get(gid)
+                if teacher_id is None:
+                    # Legacy fallback: strict rule (all sections must have the same single teacher).
+                    teacher_id = None
+                    for sid in sec_ids:
+                        teachers = teachers_by_section_subject.get((sid, subj_id), set())
+                        if len(teachers) != 1:
+                            teacher_id = None
+                            break
+                        tid = next(iter(teachers))
+                        if teacher_id is None:
+                            teacher_id = tid
+                        elif teacher_id != tid:
+                            teacher_id = None
+                            break
+                if teacher_id is None:
+                    continue
+
+                teacher_required_slots[teacher_id] += int(spw)
+                for sid in sec_ids:
+                    teacher_affected_sections[teacher_id].add(sid)
+                teacher_affected_subjects[teacher_id].add(subj_id)
 
             for teacher_id, required in teacher_required_slots.items():
                 teacher = teacher_by_id.get(teacher_id)
