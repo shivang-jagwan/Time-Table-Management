@@ -274,7 +274,13 @@ def _solve_program(
     block_subject_pairs_by_block = defaultdict(list)  # block_id -> [(subject_id, teacher_id)]
     elective_block_by_section_subject: dict[tuple[str, str], str] = {}  # (section_id, subject_id) -> block_id
 
-    if sections:
+    use_elective_blocks = (
+        table_exists(db, "elective_blocks")
+        and table_exists(db, "elective_block_subjects")
+        and table_exists(db, "section_elective_blocks")
+    )
+
+    if use_elective_blocks and sections:
         sec_block_rows = (
             db.execute(
                 where_tenant(

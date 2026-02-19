@@ -86,6 +86,12 @@ def validate_prereqs(
 
     section_ids = [s.id for s in sections]
 
+    use_elective_blocks = (
+        table_exists(db, "elective_blocks")
+        and table_exists(db, "elective_block_subjects")
+        and table_exists(db, "section_elective_blocks")
+    )
+
     # Assignment lookup used by multiple validations (including combined-group teacher inference).
     # Must be initialized even when no fixed entries / special allotments exist.
     assigned_teacher_by_section_subject: dict[tuple[Any, Any], Any] = {}
@@ -337,7 +343,7 @@ def validate_prereqs(
     # Note: blocks can also be used for a single elective (legacy conversion); we warn
     # when a block has fewer than 2 assignments.
     blocks_by_section: dict[Any, list[Any]] = defaultdict(list)
-    if section_ids:
+    if use_elective_blocks and section_ids:
         sec_block_rows = (
             db.execute(
                 where_tenant(
@@ -376,8 +382,12 @@ def validate_prereqs(
         if elective_subject_ids and not blocks_by_section.get(section.id):
             conflicts.append(
                 ValidationConflict(
-                    conflict_type="MISSING_ELECTIVE_BLOCKS",
-                    message="Section has elective options configured but is not mapped to any elective blocks.",
+                    conflict_type=("MISSING_ELECTIVE_BLOCKS" if use_elective_blocks else "ELECTIVE_BLOCK_TABLES_MISSING"),
+                    message=(
+                        "Section has elective options configured but is not mapped to any elective blocks."
+                        if use_elective_blocks
+                        else "Electives are configured but elective-block tables are missing. Apply DB migrations to enable elective blocks."
+                    ),
                     section_id=section.id,
                     metadata={"track": str(section.track), "academic_year_id": str(effective_year_id)},
                 )
@@ -387,47 +397,50 @@ def validate_prereqs(
     # We validate against the curriculum per section (mapping override else track + electives).
     if section_ids:
         # Elective blocks mapped to sections in this solve.
-        section_blocks_rows = (
-            db.execute(
-                where_tenant(
-                    select(SectionElectiveBlock.section_id, SectionElectiveBlock.block_id)
-                    .where(SectionElectiveBlock.section_id.in_(section_ids)),
-                    SectionElectiveBlock,
-                    tenant_id,
-                )
-            )
-            .all()
-        )
-        block_ids = sorted({bid for _sid, bid in section_blocks_rows})
-        blocks_by_section: dict[Any, list[Any]] = defaultdict(list)
-        for sid, bid in section_blocks_rows:
-            blocks_by_section[sid].append(bid)
-
+        block_ids: list[Any] = []
+        blocks_by_section = defaultdict(list)
         blocks_by_id: dict[Any, ElectiveBlock] = {}
-        if block_ids:
-            block_rows = (
-                db.execute(where_tenant(select(ElectiveBlock).where(ElectiveBlock.id.in_(block_ids)), ElectiveBlock, tenant_id))
-                .scalars()
+        block_subjects_by_block: dict[Any, list[tuple[Any, Any]]] = defaultdict(list)  # block_id -> [(subject_id, teacher_id)]
+
+        if use_elective_blocks:
+            section_blocks_rows = (
+                db.execute(
+                    where_tenant(
+                        select(SectionElectiveBlock.section_id, SectionElectiveBlock.block_id)
+                        .where(SectionElectiveBlock.section_id.in_(section_ids)),
+                        SectionElectiveBlock,
+                        tenant_id,
+                    )
+                )
                 .all()
             )
-            blocks_by_id = {b.id: b for b in block_rows}
+            block_ids = sorted({bid for _sid, bid in section_blocks_rows})
+            for sid, bid in section_blocks_rows:
+                blocks_by_section[sid].append(bid)
 
-        block_subject_rows = []
-        if block_ids:
-            block_subject_rows = db.execute(
-                where_tenant(
-                    select(
-                        ElectiveBlockSubject.block_id,
-                        ElectiveBlockSubject.subject_id,
-                        ElectiveBlockSubject.teacher_id,
-                    ).where(ElectiveBlockSubject.block_id.in_(block_ids)),
-                    ElectiveBlockSubject,
-                    tenant_id,
+            if block_ids:
+                block_rows = (
+                    db.execute(
+                        where_tenant(select(ElectiveBlock).where(ElectiveBlock.id.in_(block_ids)), ElectiveBlock, tenant_id)
+                    )
+                    .scalars()
+                    .all()
                 )
-            ).all()
-        block_subjects_by_block: dict[Any, list[tuple[Any, Any]]] = defaultdict(list)  # block_id -> [(subject_id, teacher_id)]
-        for bid, subj_id, teacher_id in block_subject_rows:
-            block_subjects_by_block[bid].append((subj_id, teacher_id))
+                blocks_by_id = {b.id: b for b in block_rows}
+
+                block_subject_rows = db.execute(
+                    where_tenant(
+                        select(
+                            ElectiveBlockSubject.block_id,
+                            ElectiveBlockSubject.subject_id,
+                            ElectiveBlockSubject.teacher_id,
+                        ).where(ElectiveBlockSubject.block_id.in_(block_ids)),
+                        ElectiveBlockSubject,
+                        tenant_id,
+                    )
+                ).all()
+                for bid, subj_id, teacher_id in block_subject_rows:
+                    block_subjects_by_block[bid].append((subj_id, teacher_id))
 
         # Allowed subject ids per section (mapping override else track curriculum).
         allowed_subject_ids_by_section: dict[Any, set[Any]] = {}

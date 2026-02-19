@@ -232,24 +232,31 @@ def _validate_special_allotment_refs(
         raise HTTPException(status_code=400, detail="SPECIAL_ALLOTMENT_ROOM_NOT_SPECIAL")
 
     # Not supported: special locks for elective blocks (would need to lock the entire block).
-    in_block = (
-        db.execute(
-            where_tenant(
-                where_tenant(
-                    select(SectionElectiveBlock.id)
-                    .join(ElectiveBlockSubject, ElectiveBlockSubject.block_id == SectionElectiveBlock.block_id)
-                    .where(SectionElectiveBlock.section_id == section.id)
-                    .where(ElectiveBlockSubject.subject_id == subject.id)
-                    .limit(1),
-                    SectionElectiveBlock,
-                    tenant_id,
-                ),
-                ElectiveBlockSubject,
-                tenant_id,
-            )
-        ).first()
-        is not None
+    use_elective_blocks = (
+        table_exists(db, "elective_blocks")
+        and table_exists(db, "elective_block_subjects")
+        and table_exists(db, "section_elective_blocks")
     )
+    in_block = False
+    if use_elective_blocks:
+        in_block = (
+            db.execute(
+                where_tenant(
+                    where_tenant(
+                        select(SectionElectiveBlock.id)
+                        .join(ElectiveBlockSubject, ElectiveBlockSubject.block_id == SectionElectiveBlock.block_id)
+                        .where(SectionElectiveBlock.section_id == section.id)
+                        .where(ElectiveBlockSubject.subject_id == subject.id)
+                        .limit(1),
+                        SectionElectiveBlock,
+                        tenant_id,
+                    ),
+                    ElectiveBlockSubject,
+                    tenant_id,
+                )
+            ).first()
+            is not None
+        )
     if in_block:
         raise HTTPException(status_code=400, detail="SUBJECT_IN_ELECTIVE_BLOCK_NOT_SUPPORTED")
 
