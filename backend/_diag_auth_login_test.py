@@ -109,6 +109,25 @@ def main() -> None:
             else:
                 print("solve-global", r3.status_code, (r3.text[:2000] + "...") if len(r3.text) > 2000 else r3.text)
 
+            if os.environ.get("DO_GET_LATEST_RUN", "").strip() in {"1", "true", "TRUE", "yes", "YES"}:
+                rr3 = client.get(f"/api/solver/runs?program_code={program_code}&limit=1", timeout=30)
+                jr3 = _safe_json(rr3.text)
+                latest_run_id = None
+                if isinstance(jr3, dict):
+                    runs = jr3.get("runs")
+                    if isinstance(runs, list) and runs:
+                        latest_run_id = runs[0].get("id")
+                print("runs(latest)", rr3.status_code, _redact(jr3) if jr3 is not None else rr3.text[:1000])
+
+                if latest_run_id:
+                    rd = client.get(f"/api/solver/runs/{latest_run_id}", timeout=30)
+                    jd = _safe_json(rd.text)
+                    print("run(detail)", rd.status_code, _redact(jd) if jd is not None else rd.text[:2000])
+
+                    rc = client.get(f"/api/solver/runs/{latest_run_id}/conflicts", timeout=30)
+                    jc = _safe_json(rc.text)
+                    print("run(conflicts)", rc.status_code, _redact(jc) if jc is not None else rc.text[:2000])
+
             if os.environ.get("DO_LIST_RUNS", "").strip() in {"1", "true", "TRUE", "yes", "YES"}:
                 rr2 = client.get(f"/api/solver/runs?program_code={program_code}&limit=5", timeout=30)
                 jr2 = _safe_json(rr2.text)

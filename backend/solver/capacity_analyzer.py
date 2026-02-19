@@ -83,13 +83,14 @@ def build_capacity_data(
         rooms_by_type[t].append(r)
 
     # Time slots and windows
-    slot_rows = db.execute(
-        where_tenant(select(TimeSlot.day_of_week, TimeSlot.slot_index, TimeSlot.id), TimeSlot, tenant_id)
-    ).all()
     slots = db.execute(where_tenant(select(TimeSlot), TimeSlot, tenant_id)).scalars().all()
-    active_days = sorted({int(d) for d, _i, _id in slot_rows})
-    slot_by_day_index: dict[tuple[int, int], Any] = {(int(d), int(i)): sid for d, i, sid in slot_rows}
-    slot_info: dict[Any, tuple[int, int]] = {sid: (int(d), int(i)) for d, i, sid in slot_rows}
+    active_days = sorted({int(getattr(s, "day_of_week")) for s in slots})
+    slot_by_day_index: dict[tuple[int, int], Any] = {
+        (int(getattr(s, "day_of_week")), int(getattr(s, "slot_index"))): s.id for s in slots
+    }
+    slot_info: dict[Any, tuple[int, int]] = {
+        s.id: (int(getattr(s, "day_of_week")), int(getattr(s, "slot_index"))) for s in slots
+    }
 
     windows = []
     if section_ids:
