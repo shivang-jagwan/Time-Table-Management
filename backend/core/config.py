@@ -66,6 +66,13 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("frontend_origin", "FRONTEND_ORIGIN"),
     )
 
+    # Solver
+    # When enabled, the solver fails fast instead of persisting conflicting room assignments.
+    solver_strict_mode: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("solver_strict_mode", "SOLVER_STRICT_MODE"),
+    )
+
     # Multi-tenant / data isolation
     # - shared: all admins see the same data (current behavior)
     # - per_user: data is scoped to the current user's tenant (default: user.id)

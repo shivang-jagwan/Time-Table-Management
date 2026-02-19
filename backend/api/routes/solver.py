@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select, cast
 from sqlalchemy.types import String
 from sqlalchemy.exc import OperationalError as SAOperationalError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from api.deps import get_tenant_id, require_admin
@@ -67,7 +68,7 @@ from schemas.solver import (
 )
 from schemas.subject import SubjectOut
 from services.solver_validation import validate_prereqs
-from solver.cp_sat_solver import solve_program_global, solve_program_year
+from solver.cp_sat_solver import SolverInvariantError, solve_program_global, solve_program_year
 from solver.capacity_analyzer import build_capacity_data, analyze_capacity
 
 
@@ -1480,15 +1481,36 @@ def solve_timetable(
             )
 
         # Pre-solve capacity analysis and bottleneck reporting
-        cap_data = build_capacity_data(
-            db,
-            program_id=program.id,
-            academic_year_id=ay.id,
-            sections=sections,
-            tenant_id=tenant_id,
-        )
-        cap = analyze_capacity(cap_data, debug=getattr(payload, "debug_capacity_mode", False))
-        capacity_diagnostics = ([{"type": "CAPACITY_SUMMARY", "data": cap.get("summary", {})}] if cap.get("debug") else [])
+        # Capacity analysis is diagnostic + early validation, but it should not be allowed to hard-crash solving.
+        cap: dict = {"issues": [], "debug": False, "summary": {}, "minimal_relaxation": []}
+        capacity_diagnostics: list[dict] = []
+        try:
+            cap_data = build_capacity_data(
+                db,
+                program_id=program.id,
+                academic_year_id=ay.id,
+                sections=sections,
+                tenant_id=tenant_id,
+            )
+            cap = analyze_capacity(cap_data, debug=getattr(payload, "debug_capacity_mode", False))
+            capacity_diagnostics = (
+                ([{"type": "CAPACITY_SUMMARY", "data": cap.get("summary", {})}] if cap.get("debug") else [])
+            )
+        except Exception as e:
+            db.add(
+                TimetableConflict(
+                    tenant_id=tenant_id,
+                    run_id=run.id,
+                    severity="WARN",
+                    conflict_type="CAPACITY_ANALYSIS_FAILED",
+                    message=(
+                        "Capacity analysis failed; continuing solve. "
+                        + f"{type(e).__name__}: {str(e)[:500]}"
+                    ),
+                    metadata_json={"error_type": type(e).__name__},
+                )
+            )
+            db.flush()
 
         issue_types = {i.get("type") for i in cap.get("issues", [])}
         only_teacher_overload = bool(issue_types) and issue_types.issubset({"CAPACITY_OVERLOAD"})
@@ -1644,6 +1666,52 @@ def solve_timetable(
         if is_transient_db_connectivity_error(exc):
             raise DatabaseUnavailableError("Database temporarily unavailable") from exc
         raise
+    except SolverInvariantError as exc:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        run_id = (run.id if run is not None else uuid.uuid4())
+        if run is not None:
+            try:
+                run.status = "ERROR"
+                run.notes = (f"SolverInvariantError({exc.code}): {str(exc)}")[:500]
+                db.add(run)
+                db.commit()
+            except Exception:
+                pass
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "SOLVER_INTEGRITY_ERROR",
+                "type": str(exc.code),
+                "message": str(exc),
+                "run_id": str(run_id),
+                "details": getattr(exc, "details", {}) or {},
+            },
+        )
+    except IntegrityError as exc:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        run_id = (run.id if run is not None else uuid.uuid4())
+        if run is not None:
+            try:
+                run.status = "ERROR"
+                run.notes = (f"IntegrityError: {str(exc.orig) if getattr(exc, 'orig', None) else str(exc)}")[:500]
+                db.add(run)
+                db.commit()
+            except Exception:
+                pass
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "SOLVER_DB_INTEGRITY_ERROR",
+                "message": "Database integrity constraint violated while saving solver results.",
+                "run_id": str(run_id),
+            },
+        )
     except Exception as exc:
         # Prefer returning a structured response (frontend can display run_id) over a raw 500.
         try:
@@ -1783,15 +1851,36 @@ def solve_timetable_global(
             )
 
         # Pre-solve capacity analysis and bottleneck reporting (global)
-        cap_data = build_capacity_data(
-            db,
-            program_id=program.id,
-            academic_year_id=None,
-            sections=sections,
-            tenant_id=tenant_id,
-        )
-        cap = analyze_capacity(cap_data, debug=getattr(payload, "debug_capacity_mode", False))
-        capacity_diagnostics = ([{"type": "CAPACITY_SUMMARY", "data": cap.get("summary", {})}] if cap.get("debug") else [])
+        # Capacity analysis is diagnostic + early validation, but it should not be allowed to hard-crash solving.
+        cap: dict = {"issues": [], "debug": False, "summary": {}, "minimal_relaxation": []}
+        capacity_diagnostics: list[dict] = []
+        try:
+            cap_data = build_capacity_data(
+                db,
+                program_id=program.id,
+                academic_year_id=None,
+                sections=sections,
+                tenant_id=tenant_id,
+            )
+            cap = analyze_capacity(cap_data, debug=getattr(payload, "debug_capacity_mode", False))
+            capacity_diagnostics = (
+                ([{"type": "CAPACITY_SUMMARY", "data": cap.get("summary", {})}] if cap.get("debug") else [])
+            )
+        except Exception as e:
+            db.add(
+                TimetableConflict(
+                    tenant_id=tenant_id,
+                    run_id=run.id,
+                    severity="WARN",
+                    conflict_type="CAPACITY_ANALYSIS_FAILED",
+                    message=(
+                        "Capacity analysis failed; continuing solve. "
+                        + f"{type(e).__name__}: {str(e)[:500]}"
+                    ),
+                    metadata_json={"error_type": type(e).__name__},
+                )
+            )
+            db.flush()
 
         issue_types = {i.get("type") for i in cap.get("issues", [])}
         only_teacher_overload = bool(issue_types) and issue_types.issubset({"CAPACITY_OVERLOAD"})
@@ -1940,6 +2029,52 @@ def solve_timetable_global(
         if is_transient_db_connectivity_error(exc):
             raise DatabaseUnavailableError("Database temporarily unavailable") from exc
         raise
+    except SolverInvariantError as exc:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        run_id = (run.id if run is not None else uuid.uuid4())
+        if run is not None:
+            try:
+                run.status = "ERROR"
+                run.notes = (f"SolverInvariantError({exc.code}): {str(exc)}")[:500]
+                db.add(run)
+                db.commit()
+            except Exception:
+                pass
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "SOLVER_INTEGRITY_ERROR",
+                "type": str(exc.code),
+                "message": str(exc),
+                "run_id": str(run_id),
+                "details": getattr(exc, "details", {}) or {},
+            },
+        )
+    except IntegrityError as exc:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        run_id = (run.id if run is not None else uuid.uuid4())
+        if run is not None:
+            try:
+                run.status = "ERROR"
+                run.notes = (f"IntegrityError: {str(exc.orig) if getattr(exc, 'orig', None) else str(exc)}")[:500]
+                db.add(run)
+                db.commit()
+            except Exception:
+                pass
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "SOLVER_DB_INTEGRITY_ERROR",
+                "message": "Database integrity constraint violated while saving solver results.",
+                "run_id": str(run_id),
+            },
+        )
     except Exception as exc:
         try:
             db.rollback()

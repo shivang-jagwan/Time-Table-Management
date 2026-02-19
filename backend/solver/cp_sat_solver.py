@@ -6,6 +6,7 @@ from typing import Any
 
 from ortools.sat.python import cp_model
 from sqlalchemy import delete, literal, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from api.tenant import where_tenant
@@ -32,6 +33,15 @@ from models.time_slot import TimeSlot
 from models.track_subject import TrackSubject
 from models.fixed_timetable_entry import FixedTimetableEntry
 from models.special_allotment import SpecialAllotment
+
+from core.config import settings
+
+
+class SolverInvariantError(RuntimeError):
+    def __init__(self, code: str, message: str, *, details: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.code = code
+        self.details = details or {}
 
 
 class SolveResult:
@@ -1338,7 +1348,16 @@ def _solve_program(
     for (_sec, _sid, slot_id), xv in x.items():
         _d, idx = slot_info.get(slot_id, (0, 0))
         obj_terms.append(xv * (idx + 1) * PRIMARY_WEIGHT)
-    for (_sec, _bid, slot_id), zv in z.items():
+    for z_key, zv in z.items():
+        # z keys are (block_id, slot_id) (legacy variants may include section_id too).
+        slot_id = None
+        if isinstance(z_key, tuple):
+            if len(z_key) == 2:
+                _bid, slot_id = z_key
+            elif len(z_key) == 3:
+                _sec, _bid, slot_id = z_key
+        if slot_id is None:
+            continue
         _d, idx = slot_info.get(slot_id, (0, 0))
         obj_terms.append(zv * (idx + 1) * PRIMARY_WEIGHT)
     for (_sec, _sid, _day, start_idx), sv in lab_start.items():
@@ -1530,6 +1549,14 @@ def _solve_program(
     # Greedy room assignment after solver (keeps CP-SAT model tractable).
     used_rooms_by_slot = defaultdict(set)  # slot_id -> set(room_id)
 
+    # Fail-fast invariants (avoid relying on DB constraint errors).
+    # DB rules (see migrations):
+    # - room-slot uniqueness is enforced only for rows with combined_class_id IS NULL
+    # - section-slot uniqueness is enforced only for rows with elective_block_id IS NULL
+    seen_uncombined_room_slot: set[tuple[str, str]] = set()  # (room_id, slot_id)
+    seen_non_elective_section_slot: set[tuple[str, str]] = set()  # (section_id, slot_id)
+    seen_teacher_slot_event: dict[tuple[str, str], str | None] = {}  # (teacher_id, slot_id) -> combined_class_id
+
     def _sid(slot_id) -> str:
         return str(slot_id)
 
@@ -1540,6 +1567,57 @@ def _solve_program(
         # Used only to bypass the partial unique index on (run_id, room_id, slot_id)
         # for non-combined entries when we must persist room conflicts as warnings.
         return uuid.uuid5(uuid.NAMESPACE_OID, f"ROOM_CONFLICT:{run.id}:{room_id}:{slot_id}")
+
+    def _elective_group_id(*, block_id, subject_id, slot_id) -> uuid.UUID:
+        # Elective blocks intentionally create multiple timetable_entries with the same (run, room, slot)
+        # (one per mapped section) for the SAME physical event. Mark these rows as "combined" so they
+        # bypass the uncombined room-slot unique index.
+        return uuid.uuid5(uuid.NAMESPACE_OID, f"ELECTIVE_BLOCK:{run.id}:{block_id}:{subject_id}:{slot_id}")
+
+    def _assert_entry_invariants(entry: TimetableEntry) -> None:
+        sec_id = str(entry.section_id)
+        teacher_id = str(entry.teacher_id)
+        room_id = str(entry.room_id)
+        slot_id = str(entry.slot_id)
+        combined_id = str(entry.combined_class_id) if entry.combined_class_id is not None else None
+
+        if entry.elective_block_id is None:
+            k = (sec_id, slot_id)
+            if k in seen_non_elective_section_slot:
+                raise SolverInvariantError(
+                    "SECTION_SLOT_DUPLICATE",
+                    "Generated duplicate non-elective section+slot entry before DB insert.",
+                    details={"section_id": sec_id, "slot_id": slot_id, "run_id": str(run.id)},
+                )
+            seen_non_elective_section_slot.add(k)
+
+        if entry.combined_class_id is None:
+            k = (room_id, slot_id)
+            if k in seen_uncombined_room_slot:
+                raise SolverInvariantError(
+                    "ROOM_SLOT_DUPLICATE",
+                    "Generated duplicate uncombined room+slot entry before DB insert.",
+                    details={"room_id": room_id, "slot_id": slot_id, "run_id": str(run.id)},
+                )
+            seen_uncombined_room_slot.add(k)
+
+        tk = (teacher_id, slot_id)
+        if tk not in seen_teacher_slot_event:
+            seen_teacher_slot_event[tk] = combined_id
+        else:
+            prev = seen_teacher_slot_event[tk]
+            if prev != combined_id:
+                raise SolverInvariantError(
+                    "TEACHER_DOUBLE_BOOKING",
+                    "Generated teacher slot conflict before DB insert.",
+                    details={
+                        "teacher_id": teacher_id,
+                        "slot_id": slot_id,
+                        "run_id": str(run.id),
+                        "combined_class_id_prev": prev,
+                        "combined_class_id_new": combined_id,
+                    },
+                )
 
     conflicting_special_room_slots: set[tuple[str, str]] = set()  # (section_id, slot_id)
     conflicting_fixed_room_slots: set[tuple[str, str]] = set()  # (section_id, slot_id)
@@ -1591,19 +1669,19 @@ def _solve_program(
         combined_conflict_id = None
         if (str(sec_id), str(slot_id)) in conflicting_special_room_slots:
             combined_conflict_id = _room_conflict_group_id(room_id=room_id, slot_id=slot_id)
-        db.add(
-            TimetableEntry(
-                tenant_id=tenant_id,
-                run_id=run.id,
-                academic_year_id=section_year_by_id.get(sec_id) or run.academic_year_id,
-                section_id=sec_id,
-                subject_id=subj_id,
-                teacher_id=teacher_id,
-                room_id=room_id,
-                slot_id=slot_id,
-                combined_class_id=combined_conflict_id,
-            )
+        entry = TimetableEntry(
+            tenant_id=tenant_id,
+            run_id=run.id,
+            academic_year_id=section_year_by_id.get(sec_id) or run.academic_year_id,
+            section_id=sec_id,
+            subject_id=subj_id,
+            teacher_id=teacher_id,
+            room_id=room_id,
+            slot_id=slot_id,
+            combined_class_id=combined_conflict_id,
         )
+        _assert_entry_invariants(entry)
+        db.add(entry)
         entries_written += 1
 
     # Write pre-locked fixed entries into the run output.
@@ -1611,19 +1689,19 @@ def _solve_program(
         combined_conflict_id = None
         if (str(sec_id), str(slot_id)) in conflicting_fixed_room_slots:
             combined_conflict_id = _room_conflict_group_id(room_id=room_id, slot_id=slot_id)
-        db.add(
-            TimetableEntry(
-                tenant_id=tenant_id,
-                run_id=run.id,
-                academic_year_id=section_year_by_id.get(sec_id) or run.academic_year_id,
-                section_id=sec_id,
-                subject_id=subj_id,
-                teacher_id=teacher_id,
-                room_id=room_id,
-                slot_id=slot_id,
-                combined_class_id=combined_conflict_id,
-            )
+        entry = TimetableEntry(
+            tenant_id=tenant_id,
+            run_id=run.id,
+            academic_year_id=section_year_by_id.get(sec_id) or run.academic_year_id,
+            section_id=sec_id,
+            subject_id=subj_id,
+            teacher_id=teacher_id,
+            room_id=room_id,
+            slot_id=slot_id,
+            combined_class_id=combined_conflict_id,
         )
+        _assert_entry_invariants(entry)
+        db.add(entry)
         entries_written += 1
 
     def pick_room(slot_id, subject_type: str) -> tuple[str | None, bool]:
@@ -1644,6 +1722,12 @@ def _solve_program(
                 return room.id, True
 
         # None free; return first with conflict
+        if getattr(settings, "solver_strict_mode", False):
+            raise SolverInvariantError(
+                "NO_ROOM_AVAILABLE",
+                "No free room available for this slot.",
+                details={"slot_id": str(slot_id), "subject_type": str(subject_type), "run_id": str(run.id)},
+            )
         used_rooms_by_slot[sid].add(_rid(candidates[0].id))
         return candidates[0].id, False
 
@@ -1660,6 +1744,12 @@ def _solve_program(
                 used_rooms_by_slot[sid].add(rid)
                 return room.id, True
         used_rooms_by_slot[sid].add(_rid(candidates[0].id))
+        if getattr(settings, "solver_strict_mode", False):
+            raise SolverInvariantError(
+                "NO_ROOM_AVAILABLE",
+                "No free LT/CLASSROOM available for this slot.",
+                details={"slot_id": str(slot_id), "room_pool": "LT+CLASSROOM", "run_id": str(run.id)},
+            )
         return candidates[0].id, False
 
     def pick_room_for_block(slot_ids: list[str]) -> tuple[str | None, bool]:
@@ -1676,6 +1766,12 @@ def _solve_program(
                 return room.id, True
 
         # None free for the whole block; pick the first and mark conflicts.
+        if getattr(settings, "solver_strict_mode", False):
+            raise SolverInvariantError(
+                "NO_ROOM_AVAILABLE",
+                "No single lab room available for the full lab block.",
+                details={"slot_ids": list(slot_ids), "room_pool": "LAB", "run_id": str(run.id)},
+            )
         room_id = candidates[0].id
         for sid in slot_ids:
             used_rooms_by_slot[_sid(sid)].add(_rid(room_id))
@@ -1717,19 +1813,19 @@ def _solve_program(
                     metadata_json={"subject_type": str(subj.subject_type)},
                 )
             )
-        db.add(
-            TimetableEntry(
-                tenant_id=tenant_id,
-                run_id=run.id,
-                academic_year_id=section_year_by_id.get(sec_id) or run.academic_year_id,
-                section_id=sec_id,
-                subject_id=subj_id,
-                teacher_id=teacher_id,
-                room_id=room_id,
-                slot_id=slot_id,
-                combined_class_id=combined_conflict_id,
-            )
+        entry = TimetableEntry(
+            tenant_id=tenant_id,
+            run_id=run.id,
+            academic_year_id=section_year_by_id.get(sec_id) or run.academic_year_id,
+            section_id=sec_id,
+            subject_id=subj_id,
+            teacher_id=teacher_id,
+            room_id=room_id,
+            slot_id=slot_id,
+            combined_class_id=combined_conflict_id,
         )
+        _assert_entry_invariants(entry)
+        db.add(entry)
         entries_written += 1
 
     # Elective block entries (one per subject-teacher pair; grouped by elective_block_id)
@@ -1748,8 +1844,17 @@ def _solve_program(
                 continue
             forced = forced_room_by_block_subject_slot.get((block_id, subj_id, slot_id))
             if forced is not None:
-                used_rooms_by_slot[_sid(slot_id)].add(_rid(forced))
-                chosen_room_by_block_slot_subject[(block_id, slot_id, subj_id)] = (forced, True)
+                sid = _sid(slot_id)
+                rid = _rid(forced)
+                ok_room = rid not in used_rooms_by_slot[sid]
+                used_rooms_by_slot[sid].add(rid)
+                if (not ok_room) and getattr(settings, "solver_strict_mode", False):
+                    raise SolverInvariantError(
+                        "NO_ROOM_AVAILABLE",
+                        "Forced elective room is already occupied in this slot.",
+                        details={"slot_id": str(slot_id), "room_id": str(forced), "run_id": str(run.id)},
+                    )
+                chosen_room_by_block_slot_subject[(block_id, slot_id, subj_id)] = (forced, ok_room)
                 continue
 
             room_id, ok_room = pick_lt_room(slot_id)
@@ -1763,7 +1868,11 @@ def _solve_program(
                 if picked is None:
                     continue
                 room_id, ok_room = picked
-                combined_conflict_id = None if ok_room else _room_conflict_group_id(room_id=room_id, slot_id=slot_id)
+                combined_conflict_id = (
+                    _elective_group_id(block_id=block_id, subject_id=subj_id, slot_id=slot_id)
+                    if ok_room
+                    else _room_conflict_group_id(room_id=room_id, slot_id=slot_id)
+                )
 
                 if not ok_room:
                     db.add(
@@ -1781,21 +1890,20 @@ def _solve_program(
                             metadata_json={"elective_block_id": str(block_id)},
                         )
                     )
-
-                db.add(
-                    TimetableEntry(
-                        tenant_id=tenant_id,
-                        run_id=run.id,
-                        academic_year_id=section_year_by_id.get(sec_id) or run.academic_year_id,
-                        section_id=sec_id,
-                        subject_id=subj_id,
-                        teacher_id=teacher_id,
-                        room_id=room_id,
-                        slot_id=slot_id,
-                        combined_class_id=combined_conflict_id,
-                        elective_block_id=block_id,
-                    )
+                entry = TimetableEntry(
+                    tenant_id=tenant_id,
+                    run_id=run.id,
+                    academic_year_id=section_year_by_id.get(sec_id) or run.academic_year_id,
+                    section_id=sec_id,
+                    subject_id=subj_id,
+                    teacher_id=teacher_id,
+                    room_id=room_id,
+                    slot_id=slot_id,
+                    combined_class_id=combined_conflict_id,
+                    elective_block_id=block_id,
                 )
+                _assert_entry_invariants(entry)
+                db.add(entry)
                 entries_written += 1
 
     # Emit locked block occurrences first.
@@ -1859,19 +1967,19 @@ def _solve_program(
             )
 
         for sec_id in group_sections.get(group_id, []):
-            db.add(
-                TimetableEntry(
-                    tenant_id=tenant_id,
-                    run_id=run.id,
-                    academic_year_id=section_year_by_id.get(sec_id) or run.academic_year_id,
-                    section_id=sec_id,
-                    subject_id=subj_id,
-                    teacher_id=chosen_t,
-                    room_id=fixed_room_by_section_slot.get((sec_id, slot_id)) or room_id,
-                    slot_id=slot_id,
-                    combined_class_id=group_id,
-                )
+            entry = TimetableEntry(
+                tenant_id=tenant_id,
+                run_id=run.id,
+                academic_year_id=section_year_by_id.get(sec_id) or run.academic_year_id,
+                section_id=sec_id,
+                subject_id=subj_id,
+                teacher_id=chosen_t,
+                room_id=fixed_room_by_section_slot.get((sec_id, slot_id)) or room_id,
+                slot_id=slot_id,
+                combined_class_id=group_id,
             )
+            _assert_entry_invariants(entry)
+            db.add(entry)
             entries_written += 1
 
     # Labs
@@ -1928,19 +2036,19 @@ def _solve_program(
                         metadata_json={"subject_type": "LAB"},
                     )
                 )
-            db.add(
-                TimetableEntry(
-                    tenant_id=tenant_id,
-                    run_id=run.id,
-                    academic_year_id=section_year_by_id.get(sec_id) or run.academic_year_id,
-                    section_id=sec_id,
-                    subject_id=subj_id,
-                    teacher_id=chosen_t,
-                    room_id=room_id,
-                    slot_id=ts.id,
-                    combined_class_id=combined_conflict_id,
-                )
+            entry = TimetableEntry(
+                tenant_id=tenant_id,
+                run_id=run.id,
+                academic_year_id=section_year_by_id.get(sec_id) or run.academic_year_id,
+                section_id=sec_id,
+                subject_id=subj_id,
+                teacher_id=chosen_t,
+                room_id=room_id,
+                slot_id=ts.id,
+                combined_class_id=combined_conflict_id,
             )
+            _assert_entry_invariants(entry)
+            db.add(entry)
             entries_written += 1
 
     if status == cp_model.OPTIMAL:
@@ -1964,7 +2072,14 @@ def _solve_program(
     else:
         run.status = "FEASIBLE"
     run.solver_version = "cp-sat-v1"
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        raise
     return SolveResult(
         status=str(run.status),
         entries_written=entries_written,
