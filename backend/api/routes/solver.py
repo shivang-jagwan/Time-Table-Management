@@ -1718,10 +1718,12 @@ def solve_timetable(
             db.rollback()
         except Exception:
             pass
+        notes: str | None = None
         if run is not None:
             try:
                 run.status = "ERROR"
                 run.notes = (f"{type(exc).__name__}: {str(exc)}")[:500]
+                notes = run.notes
                 db.add(run)
                 db.commit()
             except Exception:
@@ -1735,7 +1737,11 @@ def solve_timetable(
                 SolverConflict(
                     severity="ERROR",
                     conflict_type="INTERNAL_ERROR",
-                    message="Internal error while solving. Check server logs for details.",
+                    message="Internal error while solving.",
+                    details={
+                        "run_id": str(run.id) if run is not None else None,
+                        "error": notes,
+                    },
                     metadata={"run_id": str(run.id) if run is not None else None},
                 )
             ],
@@ -2080,10 +2086,12 @@ def solve_timetable_global(
             db.rollback()
         except Exception:
             pass
+        notes: str | None = None
         if run is not None:
             try:
                 run.status = "ERROR"
                 run.notes = (f"{type(exc).__name__}: {str(exc)}")[:500]
+                notes = run.notes
                 db.add(run)
                 db.commit()
             except Exception:
@@ -2097,7 +2105,11 @@ def solve_timetable_global(
                 SolverConflict(
                     severity="ERROR",
                     conflict_type="INTERNAL_ERROR",
-                    message="Internal error while solving. Check server logs for details.",
+                    message="Internal error while solving.",
+                    details={
+                        "run_id": str(run.id) if run is not None else None,
+                        "error": notes,
+                    },
                     metadata={"run_id": str(run.id) if run is not None else None},
                 )
             ],

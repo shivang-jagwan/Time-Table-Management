@@ -577,6 +577,22 @@ export function Conflicts() {
             </div>
           </div>
 
+          {detail ? (
+            <div className="mt-4 grid gap-3 sm:grid-cols-2">
+              <div className="rounded-2xl border bg-slate-50 p-3">
+                <div className="text-xs font-semibold text-slate-600">Status</div>
+                <div className="mt-1 text-sm font-semibold text-slate-900">{detail.status}</div>
+                <div className="mt-1 text-xs text-slate-500">Created: {fmtDate(detail.created_at)}</div>
+              </div>
+              <div className="rounded-2xl border bg-slate-50 p-3">
+                <div className="text-xs font-semibold text-slate-600">Notes</div>
+                <div className="mt-1 text-xs text-slate-700 whitespace-pre-wrap break-words">
+                  {detail.notes && String(detail.notes).trim() ? String(detail.notes) : '—'}
+                </div>
+              </div>
+            </div>
+          ) : null}
+
           {tab === 'conflicts' ? (
             <div className="mt-4">
               {conflicts.length === 0 ? (

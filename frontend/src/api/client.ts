@@ -15,9 +15,9 @@ function normalizeApiBase(raw: string): string {
   }
 }
 
-// Production should use same-origin (Vercel proxy) to avoid third-party cookie issues.
-// Use VITE_API_BASE only in dev/local setups.
-const API_BASE = import.meta.env.DEV ? normalizeApiBase(RAW_API_BASE) : ''
+// Default: same-origin requests (works when the frontend is reverse-proxied to the backend).
+// If VITE_API_BASE is provided (e.g. Render static frontend + separate backend service), use it in ALL modes.
+const API_BASE = RAW_API_BASE ? normalizeApiBase(RAW_API_BASE) : ''
 
 function getAccessToken(): string | null {
   try {
