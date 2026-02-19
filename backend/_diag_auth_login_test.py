@@ -73,6 +73,31 @@ def main() -> None:
                 "relax_teacher_load_limits": relax_teacher_load_limits,
                 "require_optimal": require_optimal,
             }
+
+            if os.environ.get("DO_LIST_RUNS", "").strip() in {"1", "true", "TRUE", "yes", "YES"}:
+                rr = client.get(f"/api/solver/runs?program_code={program_code}&limit=5", timeout=30)
+                jr = _safe_json(rr.text)
+                if jr is not None:
+                    print("runs(before)", rr.status_code, _redact(jr))
+                else:
+                    print("runs(before)", rr.status_code, rr.text[:1000])
+
+            if os.environ.get("DO_GENERATE_GLOBAL", "").strip() in {"1", "true", "TRUE", "yes", "YES"}:
+                r0 = client.post(
+                    "/api/solver/generate-global",
+                    json={"program_code": program_code},
+                    timeout=60,
+                )
+                payload0 = _safe_json(r0.text)
+                if payload0 is not None:
+                    print("generate-global", r0.status_code, _redact(payload0))
+                else:
+                    print(
+                        "generate-global",
+                        r0.status_code,
+                        (r0.text[:2000] + "...") if len(r0.text) > 2000 else r0.text,
+                    )
+
             r3 = client.post(
                 "/api/solver/solve-global",
                 json=solve_payload,
@@ -83,6 +108,14 @@ def main() -> None:
                 print("solve-global", r3.status_code, _redact(payload3))
             else:
                 print("solve-global", r3.status_code, (r3.text[:2000] + "...") if len(r3.text) > 2000 else r3.text)
+
+            if os.environ.get("DO_LIST_RUNS", "").strip() in {"1", "true", "TRUE", "yes", "YES"}:
+                rr2 = client.get(f"/api/solver/runs?program_code={program_code}&limit=5", timeout=30)
+                jr2 = _safe_json(rr2.text)
+                if jr2 is not None:
+                    print("runs(after)", rr2.status_code, _redact(jr2))
+                else:
+                    print("runs(after)", rr2.status_code, rr2.text[:1000])
 
 
 if __name__ == "__main__":

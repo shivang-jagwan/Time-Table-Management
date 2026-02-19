@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -71,6 +72,8 @@ from solver.capacity_analyzer import build_capacity_data, analyze_capacity
 
 
 router = APIRouter()
+
+logger = logging.getLogger(__name__)
 
 
 def _required_subject_ids_for_section(
@@ -1375,6 +1378,7 @@ def solve_timetable(
     db: Session = Depends(get_db),
     tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
+    run: TimetableRun | None = None
     try:
         max_time_seconds = float(payload.max_time_seconds)
         if settings.environment.lower() == "production":
@@ -1402,6 +1406,8 @@ def solve_timetable(
         )
         db.add(run)
         db.flush()
+        # Ensure we have a persistent run_id even if the solve crashes later.
+        db.commit()
 
         q_program = where_tenant(select(Program).where(Program.code == payload.program_code), Program, tenant_id)
         program = db.execute(q_program).scalar_one_or_none()
@@ -1638,6 +1644,34 @@ def solve_timetable(
         if is_transient_db_connectivity_error(exc):
             raise DatabaseUnavailableError("Database temporarily unavailable") from exc
         raise
+    except Exception as exc:
+        # Prefer returning a structured response (frontend can display run_id) over a raw 500.
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        if run is not None:
+            try:
+                run.status = "ERROR"
+                run.notes = (f"{type(exc).__name__}: {str(exc)}")[:500]
+                db.add(run)
+                db.commit()
+            except Exception:
+                pass
+        logger.exception("/api/solver/solve crashed")
+        return SolveTimetableResponse(
+            run_id=(run.id if run is not None else uuid.uuid4()),
+            status="ERROR",
+            entries_written=0,
+            conflicts=[
+                SolverConflict(
+                    severity="ERROR",
+                    conflict_type="INTERNAL_ERROR",
+                    message="Internal error while solving. Check server logs for details.",
+                    metadata={"run_id": str(run.id) if run is not None else None},
+                )
+            ],
+        )
 
 
 @router.post("/solve-global", response_model=SolveTimetableResponse)
@@ -1647,6 +1681,7 @@ def solve_timetable_global(
     db: Session = Depends(get_db),
     tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
+    run: TimetableRun | None = None
     """Program-wide solve endpoint.
 
     Builds ONE CP-SAT model that schedules all active sections for the program across all academic years.
@@ -1674,6 +1709,8 @@ def solve_timetable_global(
         )
         db.add(run)
         db.flush()
+        # Ensure we have a persistent run_id even if the solve crashes later.
+        db.commit()
 
         q_program = where_tenant(select(Program).where(Program.code == payload.program_code), Program, tenant_id)
         program = db.execute(q_program).scalar_one_or_none()
@@ -1903,5 +1940,32 @@ def solve_timetable_global(
         if is_transient_db_connectivity_error(exc):
             raise DatabaseUnavailableError("Database temporarily unavailable") from exc
         raise
+    except Exception as exc:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        if run is not None:
+            try:
+                run.status = "ERROR"
+                run.notes = (f"{type(exc).__name__}: {str(exc)}")[:500]
+                db.add(run)
+                db.commit()
+            except Exception:
+                pass
+        logger.exception("/api/solver/solve-global crashed")
+        return SolveTimetableResponse(
+            run_id=(run.id if run is not None else uuid.uuid4()),
+            status="ERROR",
+            entries_written=0,
+            conflicts=[
+                SolverConflict(
+                    severity="ERROR",
+                    conflict_type="INTERNAL_ERROR",
+                    message="Internal error while solving. Check server logs for details.",
+                    metadata={"run_id": str(run.id) if run is not None else None},
+                )
+            ],
+        )
 
 
