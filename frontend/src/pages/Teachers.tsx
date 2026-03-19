@@ -34,13 +34,23 @@ const DEFAULT_FORM: FormState = {
   is_active: true,
 }
 
+function getDefaultFormForYear(academicYearNumber: number): FormState {
+  if (Number(academicYearNumber) === 3) {
+    return {
+      ...DEFAULT_FORM,
+      weekly_off_day: '5',
+    }
+  }
+  return { ...DEFAULT_FORM }
+}
+
 export function Teachers() {
   const { programCode, academicYearNumber } = useLayoutContext()
   const [toast, setToast] = React.useState('')
   const [items, setItems] = React.useState<Teacher[]>([])
   const [loading, setLoading] = React.useState(false)
   const [query, setQuery] = React.useState('')
-  const [form, setForm] = React.useState<FormState>(DEFAULT_FORM)
+  const [form, setForm] = React.useState<FormState>(() => getDefaultFormForYear(academicYearNumber))
 
   const [tab, setTab] = React.useState<'manage' | 'assignments'>('manage')
 
@@ -133,6 +143,16 @@ export function Teachers() {
     // reset assignment picker when year changes
     setAssignSubjectId('')
     setAssignSelectedSections(new Set())
+  }, [academicYearNumber])
+
+  React.useEffect(() => {
+    // Keep add-form default leave aligned with selected year context.
+    setForm((prev) => {
+      if (prev.code.trim() || prev.full_name.trim()) return prev
+      const target = Number(academicYearNumber) === 3 ? '5' : ''
+      if (prev.weekly_off_day === target) return prev
+      return { ...prev, weekly_off_day: target }
+    })
   }, [academicYearNumber])
 
   async function refreshAssignmentData() {
@@ -230,7 +250,7 @@ export function Teachers() {
         is_active: Boolean(form.is_active),
       })
       showToast('Teacher saved')
-      setForm((f) => ({ ...f, code: '', full_name: '' }))
+      setForm(getDefaultFormForYear(academicYearNumber))
       await refresh()
     } catch (e: any) {
       showToast(`Save failed: ${String(e?.message ?? e)}`, 3500)
@@ -677,7 +697,7 @@ export function Teachers() {
 
             <button
               className="btn-secondary text-sm font-medium text-slate-800 disabled:opacity-50"
-              onClick={() => setForm(DEFAULT_FORM)}
+              onClick={() => setForm(getDefaultFormForYear(academicYearNumber))}
               disabled={loading}
             >
               Reset
