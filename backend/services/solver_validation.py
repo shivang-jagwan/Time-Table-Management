@@ -88,6 +88,9 @@ def validate_prereqs(
 
     section_ids = [s.id for s in sections]
 
+    def _norm_track(track: Any) -> str:
+        return str(track or "").strip().upper()
+
     use_elective_blocks = (
         table_exists(db, "elective_blocks")
         and table_exists(db, "elective_block_subjects")
@@ -128,21 +131,33 @@ def validate_prereqs(
             mapped_subject_ids_by_section[sec_id].append(subj_id)
 
     use_curriculum_subjects = table_exists(db, "curriculum_subjects")
+    use_track_subjects = table_exists(db, "track_subjects")
     curriculum_by_year_track: dict[tuple[Any, str], list[Any]] = defaultdict(list)
+    curriculum_keys_from_curriculum: set[tuple[Any, str]] = set()
     if use_curriculum_subjects:
         q_curr = select(CurriculumSubject).where(CurriculumSubject.program_id == program_id)
         if solve_year_ids:
             q_curr = q_curr.where(CurriculumSubject.academic_year_id.in_(solve_year_ids))
         q_curr = where_tenant(q_curr, CurriculumSubject, tenant_id)
         for row in db.execute(q_curr).scalars().all():
-            curriculum_by_year_track[(row.academic_year_id, str(row.track))].append(row)
-    else:
+            key = (row.academic_year_id, _norm_track(row.track))
+            curriculum_by_year_track[key].append(row)
+            curriculum_keys_from_curriculum.add(key)
+
+    if use_track_subjects:
         q_track = select(TrackSubject).where(TrackSubject.program_id == program_id)
         if solve_year_ids:
             q_track = q_track.where(TrackSubject.academic_year_id.in_(solve_year_ids))
         q_track = where_tenant(q_track, TrackSubject, tenant_id)
         for row in db.execute(q_track).scalars().all():
-            curriculum_by_year_track[(row.academic_year_id, str(row.track))].append(row)
+            key = (row.academic_year_id, _norm_track(row.track))
+            # Prefer refactored curriculum_subjects when present for the same year+track.
+            if key in curriculum_keys_from_curriculum:
+                continue
+            curriculum_by_year_track[key].append(row)
+
+    has_curriculum_rows = bool(curriculum_keys_from_curriculum)
+    prefer_curriculum_messages = bool(use_curriculum_subjects and has_curriculum_rows)
 
     # Time slots are required.
     if db.execute(where_tenant(select(TimeSlot.id).limit(1), TimeSlot, tenant_id)).first() is None:
@@ -385,7 +400,7 @@ def validate_prereqs(
             continue
 
         effective_year_id = academic_year_id if academic_year_id is not None else section.academic_year_id
-        rows = curriculum_by_year_track.get((effective_year_id, str(section.track)), [])
+        rows = curriculum_by_year_track.get((effective_year_id, _norm_track(section.track)), [])
         has_any_track = bool(rows)
         if not has_any_track:
             conflicts.append(
@@ -393,7 +408,7 @@ def validate_prereqs(
                     conflict_type="MISSING_TRACK_CURRICULUM",
                     message=(
                         f"No curriculum_subjects configured for track '{section.track}'."
-                        if use_curriculum_subjects
+                        if prefer_curriculum_messages
                         else f"No track_subjects configured for track '{section.track}'."
                     ),
                     section_id=section.id,
@@ -429,7 +444,7 @@ def validate_prereqs(
             continue
 
         effective_year_id = academic_year_id if academic_year_id is not None else section.academic_year_id
-        rows = curriculum_by_year_track.get((effective_year_id, str(section.track)), [])
+        rows = curriculum_by_year_track.get((effective_year_id, _norm_track(section.track)), [])
         elective_subject_ids = [r.subject_id for r in rows if bool(getattr(r, "is_elective", False))]
 
         if elective_subject_ids and not blocks_by_section.get(section.id):
@@ -505,7 +520,7 @@ def validate_prereqs(
                 continue
 
             effective_year_id = academic_year_id if academic_year_id is not None else section.academic_year_id
-            rows = curriculum_by_year_track.get((effective_year_id, str(section.track)), [])
+            rows = curriculum_by_year_track.get((effective_year_id, _norm_track(section.track)), [])
             mandatory = [r for r in rows if not bool(getattr(r, "is_elective", False))]
             allowed = {r.subject_id for r in mandatory}
             allowed_subject_ids_by_section[section.id] = allowed
@@ -662,7 +677,7 @@ def validate_prereqs(
 
                         # Subject must be marked as elective in curriculum for this section's track.
                         effective_year_id = academic_year_id if academic_year_id is not None else section.academic_year_id
-                        track_rows = curriculum_by_year_track.get((effective_year_id, str(section.track)), [])
+                        track_rows = curriculum_by_year_track.get((effective_year_id, _norm_track(section.track)), [])
                         elective_ids_for_track = {r.subject_id for r in track_rows if bool(getattr(r, "is_elective", False))}
                         if elective_ids_for_track and subj_id not in elective_ids_for_track:
                             conflicts.append(
@@ -670,7 +685,7 @@ def validate_prereqs(
                                     conflict_type="ELECTIVE_BLOCK_SUBJECT_NOT_ELECTIVE",
                                     message=(
                                         "Elective block contains a subject that is not marked as elective in curriculum_subjects for this section's track."
-                                        if use_curriculum_subjects
+                                        if prefer_curriculum_messages
                                         else "Elective block contains a subject that is not marked as elective in track_subjects for this section's track."
                                     ),
                                     section_id=section.id,
