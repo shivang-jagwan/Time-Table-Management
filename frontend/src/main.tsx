@@ -34,10 +34,9 @@ import { RequireAuth } from './routes/RequireAuth'
 import { RedirectIfAuth } from './routes/RedirectIfAuth'
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
-  <React.StrictMode>
-    <AuthProvider>
-      <BrowserRouter>
-        <Routes>
+  <AuthProvider>
+    <BrowserRouter>
+      <Routes>
           <Route
             path="/login"
             element={
@@ -94,8 +93,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
           </Route>
 
           <Route path="*" element={<Navigate to="/dashboard" replace />} />
-        </Routes>
-      </BrowserRouter>
-    </AuthProvider>
-  </React.StrictMode>,
+      </Routes>
+    </BrowserRouter>
+  </AuthProvider>,
 )

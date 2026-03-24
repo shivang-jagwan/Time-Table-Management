@@ -8,5 +8,15 @@ services:
       DATABASE_URL: ${DATABASE_URL}
       JWT_SECRET: ${JWT_SECRET:-dev-secret}
       FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:5173}
+      REDIS_ENABLED: ${REDIS_ENABLED:-true}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-120}
     ports:
       - "8000:8000"
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"

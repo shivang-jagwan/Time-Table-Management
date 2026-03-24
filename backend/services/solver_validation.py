@@ -87,6 +87,7 @@ def validate_prereqs(
         solve_year_ids = [academic_year_id]
 
     section_ids = [s.id for s in sections]
+    section_by_id = {s.id: s for s in sections}
 
     def _norm_track(track: Any) -> str:
         return str(track or "").strip().upper()
@@ -530,6 +531,22 @@ def validate_prereqs(
             for sid in subj_ids:
                 required_pairs.append((sec_id, sid))
 
+        required_subject_ids = sorted({sid for _sec_id, sid in required_pairs})
+        required_subject_rows = []
+        if required_subject_ids:
+            required_subject_rows = (
+                db.execute(
+                    where_tenant(
+                        select(Subject).where(Subject.id.in_(required_subject_ids)),
+                        Subject,
+                        tenant_id,
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        required_subject_by_id = {s.id: s for s in required_subject_rows}
+
         # Load active assignments for the sections in this solve.
         assignment_rows = (
             db.execute(
@@ -732,13 +749,27 @@ def validate_prereqs(
         # Exactly one teacher per section+subject.
         for sec_id, subj_id in required_pairs:
             teachers = teachers_by_section_subject.get((sec_id, subj_id), set())
+            sec = section_by_id.get(sec_id)
+            subj = required_subject_by_id.get(subj_id)
+            sec_code = str(getattr(sec, "code", "") or "")
+            subj_code = str(getattr(subj, "code", "") or "")
             if not teachers:
                 conflicts.append(
                     ValidationConflict(
                         conflict_type="MISSING_TEACHER_ASSIGNMENT",
-                        message="No teacher assigned for this section+subject (teacher_subject_sections).",
+                        message=(
+                            "No teacher assigned for this section+subject (teacher_subject_sections)."
+                            + (f" Section={sec_code}" if sec_code else "")
+                            + (f", Subject={subj_code}" if subj_code else "")
+                        ),
                         section_id=sec_id,
                         subject_id=subj_id,
+                        metadata={
+                            "section_id": str(sec_id),
+                            "section_code": sec_code or None,
+                            "subject_id": str(subj_id),
+                            "subject_code": subj_code or None,
+                        },
                     )
                 )
             elif len(teachers) > 1:
@@ -1170,13 +1201,26 @@ def validate_prereqs(
                 else:
                     assigned_tid = assigned_teacher_by_section_subject.get((fe.section_id, fe.subject_id))
                     if assigned_tid is None:
+                        sec = section_by_id.get(fe.section_id)
+                        sec_code = str(getattr(sec, "code", "") or "")
+                        subj_code = str(getattr(subj, "code", "") or "")
                         conflicts.append(
                             ValidationConflict(
                                 conflict_type="MISSING_TEACHER_ASSIGNMENT",
-                                message="No teacher assigned for this section+subject; fixed entry cannot be satisfied.",
+                                message=(
+                                    "No teacher assigned for this section+subject; fixed entry cannot be satisfied."
+                                    + (f" Section={sec_code}" if sec_code else "")
+                                    + (f", Subject={subj_code}" if subj_code else "")
+                                ),
                                 section_id=fe.section_id,
                                 subject_id=fe.subject_id,
                                 slot_id=fe.slot_id,
+                                metadata={
+                                    "section_id": str(fe.section_id),
+                                    "section_code": sec_code or None,
+                                    "subject_id": str(fe.subject_id),
+                                    "subject_code": subj_code or None,
+                                },
                             )
                         )
                     elif fe.teacher_id != assigned_tid:
@@ -1560,13 +1604,26 @@ def validate_prereqs(
                 else:
                     assigned_tid = assigned_teacher_by_section_subject.get((sa.section_id, sa.subject_id))
                     if assigned_tid is None:
+                        sec = section_by_id.get(sa.section_id)
+                        sec_code = str(getattr(sec, "code", "") or "")
+                        subj_code = str(getattr(subj, "code", "") or "")
                         conflicts.append(
                             ValidationConflict(
                                 conflict_type="MISSING_TEACHER_ASSIGNMENT",
-                                message="No teacher assigned for this section+subject; special allotment cannot be satisfied.",
+                                message=(
+                                    "No teacher assigned for this section+subject; special allotment cannot be satisfied."
+                                    + (f" Section={sec_code}" if sec_code else "")
+                                    + (f", Subject={subj_code}" if subj_code else "")
+                                ),
                                 section_id=sa.section_id,
                                 subject_id=sa.subject_id,
                                 slot_id=sa.slot_id,
+                                metadata={
+                                    "section_id": str(sa.section_id),
+                                    "section_code": sec_code or None,
+                                    "subject_id": str(sa.subject_id),
+                                    "subject_code": subj_code or None,
+                                },
                             )
                         )
                     elif sa.teacher_id != assigned_tid:

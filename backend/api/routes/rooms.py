@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 from api.deps import get_tenant_id, require_admin
 from api.tenant import get_by_id, where_tenant
+from core.cache import cache_delete_prefix, cache_get_json, cache_set_json
 from core.db import get_db
 from models.fixed_timetable_entry import FixedTimetableEntry
 from models.room import Room
@@ -25,6 +26,10 @@ logger = logging.getLogger(__name__)
 
 
 router = APIRouter()
+
+
+def _tenant_scope_key(tenant_id: uuid.UUID | None) -> str:
+    return str(tenant_id) if tenant_id is not None else "shared"
 
 
 class RoomExclusiveSubjectUpdate(BaseModel):
@@ -95,9 +100,15 @@ def list_rooms(
     db: Session = Depends(get_db),
     tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> list[RoomOut]:
+    cache_key = f"rooms:list:{_tenant_scope_key(tenant_id)}"
+    cached = cache_get_json(cache_key)
+    if isinstance(cached, list):
+        return [RoomOut.model_validate(item) for item in cached]
+
     q = where_tenant(select(Room).where(Room.is_active.is_(True)), Room, tenant_id).order_by(Room.code.asc())
     rooms = db.execute(q).scalars().all()
     if not rooms:
+        cache_set_json(cache_key, [])
         return []
 
     room_ids = [r.id for r in rooms]
@@ -114,6 +125,7 @@ def list_rooms(
 
     for room in rooms:
         setattr(room, "exclusive_subject_id", exclusive_subject_by_room.get(room.id))
+    cache_set_json(cache_key, [RoomOut.model_validate(r).model_dump(mode="json") for r in rooms])
     return rooms
 
 
@@ -157,6 +169,7 @@ def create_room(
         db.rollback()
         raise HTTPException(status_code=409, detail="ROOM_CODE_ALREADY_EXISTS")
     db.refresh(room)
+    cache_delete_prefix(f"rooms:list:{_tenant_scope_key(tenant_id)}")
     return room
 
 
@@ -238,6 +251,7 @@ def put_room(
         db.rollback()
         raise HTTPException(status_code=409, detail="ROOM_CODE_ALREADY_EXISTS")
     db.refresh(room)
+    cache_delete_prefix(f"rooms:list:{_tenant_scope_key(tenant_id)}")
     return room
 
 
@@ -315,6 +329,7 @@ def update_room(
         db.rollback()
         raise HTTPException(status_code=409, detail="CONFLICT")
     db.refresh(room)
+    cache_delete_prefix(f"rooms:list:{_tenant_scope_key(tenant_id)}")
     return room
 
 
@@ -366,6 +381,7 @@ def delete_room(
 
         db.delete(room)
         db.commit()
+        cache_delete_prefix(f"rooms:list:{_tenant_scope_key(tenant_id)}")
         return {"ok": True, "force": True, "deleted": deleted}
 
     q_room_links = where_tenant(select(SubjectAllowedRoom).where(SubjectAllowedRoom.room_id == room_id), SubjectAllowedRoom, tenant_id)
@@ -374,6 +390,7 @@ def delete_room(
 
     room.is_active = False
     db.commit()
+    cache_delete_prefix(f"rooms:list:{_tenant_scope_key(tenant_id)}")
     return {"ok": True, "force": False}
 
 
@@ -450,4 +467,5 @@ def put_room_exclusive_subject(
             link.is_exclusive = True
 
     db.commit()
+    cache_delete_prefix(f"rooms:list:{_tenant_scope_key(tenant_id)}")
     return RoomExclusiveSubjectResponse(room_id=room_id, subject_id=subject_id)

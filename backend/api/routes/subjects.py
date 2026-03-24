@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from api.deps import get_tenant_id, require_admin
 from api.tenant import get_by_id, where_tenant
+from core.cache import cache_delete_prefix, cache_get_json, cache_set_json
 from core.db import get_db, table_exists
 from models.academic_year import AcademicYear
 from models.combined_group import CombinedGroup
@@ -37,6 +38,10 @@ from schemas.subject import (
 
 
 router = APIRouter()
+
+
+def _tenant_scope_key(tenant_id: uuid.UUID | None) -> str:
+    return str(tenant_id) if tenant_id is not None else "shared"
 
 
 def _subject_usage_flags(db: Session, *, subject_id: uuid.UUID, tenant_id: uuid.UUID | None) -> dict[str, bool]:
@@ -183,6 +188,14 @@ def list_subjects(
     db: Session = Depends(get_db),
     tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> list[SubjectOut]:
+    cache_key = (
+        f"subjects:list:{_tenant_scope_key(tenant_id)}:"
+        f"program={program_code or '*'}:year={academic_year_number or '*'}"
+    )
+    cached = cache_get_json(cache_key)
+    if isinstance(cached, list):
+        return [SubjectOut.model_validate(item) for item in cached]
+
     q = where_tenant(select(Subject).where(Subject.is_active.is_(True)), Subject, tenant_id).order_by(Subject.code.asc())
 
     if program_code is not None:
@@ -206,7 +219,9 @@ def list_subjects(
             return []
         q = q.where(Subject.academic_year_id == ay.id)
 
-    return db.execute(q).scalars().all()
+    rows = db.execute(q).scalars().all()
+    cache_set_json(cache_key, [SubjectOut.model_validate(r).model_dump(mode="json") for r in rows])
+    return rows
 
 
 @router.post("/", response_model=SubjectOut)
@@ -246,6 +261,7 @@ def create_subject(
         db.rollback()
         raise HTTPException(status_code=409, detail="CONFLICT")
     db.refresh(subject)
+    cache_delete_prefix(f"subjects:list:{_tenant_scope_key(tenant_id)}")
     return subject
 
 
@@ -284,6 +300,7 @@ def update_subject(
         db.rollback()
         raise HTTPException(status_code=409, detail="CONFLICT")
     db.refresh(subject)
+    cache_delete_prefix(f"subjects:list:{_tenant_scope_key(tenant_id)}")
     return subject
 
 
@@ -321,6 +338,7 @@ def put_subject(
         raise HTTPException(status_code=409, detail="CONFLICT")
 
     db.refresh(subject)
+    cache_delete_prefix(f"subjects:list:{_tenant_scope_key(tenant_id)}")
     return subject
 
 
@@ -415,10 +433,12 @@ def delete_subject(
 
         db.delete(subject)
         db.commit()
+        cache_delete_prefix(f"subjects:list:{_tenant_scope_key(tenant_id)}")
         return {"ok": True, "force": True, "deleted": deleted}
 
     subject.is_active = False
     db.commit()
+    cache_delete_prefix(f"subjects:list:{_tenant_scope_key(tenant_id)}")
     return {"ok": True, "force": False}
 
 

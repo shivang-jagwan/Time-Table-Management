@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from api.deps import get_tenant_id, require_admin
 from api.tenant import get_by_id, where_tenant
+from core.cache import cache_delete_prefix, cache_get_json, cache_set_json
 from core.db import get_db
 from models.academic_year import AcademicYear
 from models.combined_group_section import CombinedGroupSection
@@ -37,6 +38,10 @@ from schemas.subject import SubjectOut
 
 
 router = APIRouter()
+
+
+def _tenant_scope_key(tenant_id: uuid.UUID | None) -> str:
+    return str(tenant_id) if tenant_id is not None else "shared"
 
 
 logger = logging.getLogger(__name__)
@@ -193,6 +198,14 @@ def list_sections(
     db: Session = Depends(get_db),
     tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> list[SectionOut]:
+    cache_key = (
+        f"sections:list:{_tenant_scope_key(tenant_id)}:"
+        f"program={program_code or '*'}:year={academic_year_number or '*'}"
+    )
+    cached = cache_get_json(cache_key)
+    if isinstance(cached, list):
+        return [SectionOut.model_validate(item) for item in cached]
+
     q = where_tenant(select(Section).where(Section.is_active.is_(True)), Section, tenant_id).order_by(Section.code.asc())
 
     if program_code is not None:
@@ -213,7 +226,9 @@ def list_sections(
             return []
         q = q.where(Section.academic_year_id == ay.id)
 
-    return db.execute(q).scalars().all()
+    rows = db.execute(q).scalars().all()
+    cache_set_json(cache_key, [SectionOut.model_validate(r).model_dump(mode="json") for r in rows])
+    return rows
 
 
 @router.post("/", response_model=SectionOut)
@@ -253,6 +268,7 @@ def create_section(
         db.rollback()
         raise HTTPException(status_code=409, detail="CONFLICT")
     db.refresh(section)
+    cache_delete_prefix(f"sections:list:{_tenant_scope_key(tenant_id)}")
     return section
 
 
@@ -290,6 +306,7 @@ def update_section(
         db.rollback()
         raise HTTPException(status_code=409, detail="CONFLICT")
     db.refresh(section)
+    cache_delete_prefix(f"sections:list:{_tenant_scope_key(tenant_id)}")
     return section
 
 
@@ -330,6 +347,7 @@ def put_section(
         raise HTTPException(status_code=409, detail="CONFLICT")
 
     db.refresh(section)
+    cache_delete_prefix(f"sections:list:{_tenant_scope_key(tenant_id)}")
     return section
 
 
@@ -478,10 +496,12 @@ def delete_section(
 
         db.delete(section)
         db.commit()
+        cache_delete_prefix(f"sections:list:{_tenant_scope_key(tenant_id)}")
         return {"ok": True, "force": True, "deleted": deleted}
 
     section.is_active = False
     db.commit()
+    cache_delete_prefix(f"sections:list:{_tenant_scope_key(tenant_id)}")
     return {"ok": True, "force": False}
 
 

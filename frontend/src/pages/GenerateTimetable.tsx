@@ -37,7 +37,7 @@ function prettyDiagType(t: unknown): string {
 }
 
 export function GenerateTimetable() {
-  const { programCode } = useLayoutContext()
+  const { programCode, academicYearNumber } = useLayoutContext()
   const [toast, setToast] = React.useState('')
   const [loading, setLoading] = React.useState(false)
   const [slotCount, setSlotCount] = React.useState<number | null>(null)
@@ -88,7 +88,10 @@ export function GenerateTimetable() {
     setLastValidation(null)
     setLastRun(null)
     try {
-      const res = await validateTimetable({ program_code: pc })
+      const res = await validateTimetable({
+        program_code: pc,
+        academic_year_number: academicYearNumber,
+      })
       setLastValidation(res)
       setLastValidationConflicts([...res.errors, ...res.warnings])
       const issueCount = res.errors.length + res.capacity_issues.length

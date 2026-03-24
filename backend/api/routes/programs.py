@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from api.deps import get_tenant_id, require_admin
 from api.tenant import get_by_id, where_tenant
+from core.cache import cache_delete_prefix, cache_get_json, cache_set_json
 from core.db import get_db
 from models.program import Program
 from models.timetable_run import TimetableRun
@@ -18,12 +19,21 @@ from schemas.program import ProgramCreate, ProgramOut, ProgramUpdate
 router = APIRouter()
 
 
+def _tenant_scope_key(tenant_id: uuid.UUID | None) -> str:
+    return str(tenant_id) if tenant_id is not None else "shared"
+
+
 @router.get("/latest")
 def get_latest_program(
     db: Session = Depends(get_db),
     tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> dict:
     """Return the program_code of the most recently run timetable (any status)."""
+    cache_key = f"programs:latest:{_tenant_scope_key(tenant_id)}"
+    cached = cache_get_json(cache_key)
+    if isinstance(cached, dict) and cached.get("program_code"):
+        return {"program_code": str(cached["program_code"])}
+
     q = (
         where_tenant(select(TimetableRun), TimetableRun, tenant_id)
         .where(TimetableRun.parameters["program_code"].astext != None)  # noqa: E711
@@ -34,14 +44,18 @@ def get_latest_program(
     if run is not None:
         code = (run.parameters or {}).get("program_code")
         if code:
-            return {"program_code": code}
+            payload = {"program_code": code}
+            cache_set_json(cache_key, payload)
+            return payload
 
     # Fallback: first program alphabetically
     q2 = where_tenant(select(Program), Program, tenant_id).order_by(Program.code.asc()).limit(1)
     prog = db.execute(q2).scalars().first()
     if prog is None:
         raise HTTPException(status_code=404, detail="NO_PROGRAMS")
-    return {"program_code": prog.code}
+    payload = {"program_code": prog.code}
+    cache_set_json(cache_key, payload)
+    return payload
 
 
 @router.get("/", response_model=list[ProgramOut])
@@ -49,8 +63,16 @@ def list_programs(
     db: Session = Depends(get_db),
     tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ) -> list[ProgramOut]:
+    cache_key = f"programs:list:{_tenant_scope_key(tenant_id)}"
+    cached = cache_get_json(cache_key)
+    if isinstance(cached, list):
+        return [ProgramOut.model_validate(item) for item in cached]
+
     q = where_tenant(select(Program), Program, tenant_id).order_by(Program.code.asc())
-    return db.execute(q).scalars().all()
+    rows = db.execute(q).scalars().all()
+    payload = [ProgramOut.model_validate(r).model_dump(mode="json") for r in rows]
+    cache_set_json(cache_key, payload)
+    return rows
 
 
 @router.post("/", response_model=ProgramOut)
@@ -80,6 +102,9 @@ def create_program(
 
         raise HTTPException(status_code=409, detail="PROGRAM_CODE_ALREADY_EXISTS")
     db.refresh(program)
+    cache_delete_prefix(f"programs:{_tenant_scope_key(tenant_id)}")
+    cache_delete_prefix("programs:list:")
+    cache_delete_prefix("programs:latest:")
     return program
 
 
@@ -106,6 +131,9 @@ def update_program(
         raise HTTPException(status_code=409, detail="CONFLICT")
 
     db.refresh(program)
+    cache_delete_prefix(f"programs:{_tenant_scope_key(tenant_id)}")
+    cache_delete_prefix("programs:list:")
+    cache_delete_prefix("programs:latest:")
     return program
 
 
@@ -121,4 +149,7 @@ def delete_program(
         raise HTTPException(status_code=404, detail="PROGRAM_NOT_FOUND")
     db.delete(program)
     db.commit()
+    cache_delete_prefix(f"programs:{_tenant_scope_key(tenant_id)}")
+    cache_delete_prefix("programs:list:")
+    cache_delete_prefix("programs:latest:")
     return {"ok": True}

@@ -100,6 +100,20 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("tenant_mode", "TENANT_MODE"),
     )
 
+    # Cache (optional)
+    redis_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("redis_enabled", "REDIS_ENABLED"),
+    )
+    redis_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("redis_url", "REDIS_URL"),
+    )
+    cache_ttl_seconds: int = Field(
+        default=120,
+        validation_alias=AliasChoices("cache_ttl_seconds", "CACHE_TTL_SECONDS"),
+    )
+
     @field_validator("frontend_origin")
     @classmethod
     def _normalize_frontend_origin(cls, v: str) -> str:

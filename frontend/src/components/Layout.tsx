@@ -6,6 +6,7 @@ import { Sidebar } from './Sidebar'
 import { getLatestProgram } from '../api/programs'
 
 const STORAGE_KEY = 'selected_program_code'
+const YEAR_STORAGE_KEY = 'selected_academic_year_number'
 
 type LayoutContextValue = {
   programCode: string
@@ -30,11 +31,25 @@ export function Layout() {
   const [programCode, setProgramCodeState] = React.useState<string>(() => {
     try { return localStorage.getItem(STORAGE_KEY) ?? '' } catch { return '' }
   })
-  const [academicYearNumber, setAcademicYearNumber] = React.useState(1)
+  const [academicYearNumber, setAcademicYearNumberState] = React.useState<number>(() => {
+    try {
+      const raw = localStorage.getItem(YEAR_STORAGE_KEY)
+      const parsed = Number(raw)
+      if (Number.isInteger(parsed) && parsed >= 1 && parsed <= 4) return parsed
+    } catch {}
+    return 1
+  })
 
   const setProgramCode = React.useCallback((v: string) => {
     setProgramCodeState(v)
     try { localStorage.setItem(STORAGE_KEY, v) } catch {}
+  }, [])
+
+  const setAcademicYearNumber = React.useCallback((v: number) => {
+    const next = Number(v)
+    const safe = Number.isInteger(next) && next >= 1 && next <= 4 ? next : 1
+    setAcademicYearNumberState(safe)
+    try { localStorage.setItem(YEAR_STORAGE_KEY, String(safe)) } catch {}
   }, [])
 
   // On mount: if nothing stored, fetch the latest program
