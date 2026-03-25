@@ -214,6 +214,10 @@ class SpecialAllotmentOut(BaseModel):
     section_id: uuid.UUID
     section_code: str
     section_name: str
+    combined_group_id: uuid.UUID | None = None
+    target_kind: Literal["SECTION", "COMBINED_GROUP"] = "SECTION"
+    target_label: str | None = None
+    target_section_codes: list[str] = Field(default_factory=list)
 
     subject_id: uuid.UUID
     subject_code: str
@@ -245,7 +249,8 @@ class ListSpecialAllotmentsResponse(BaseModel):
 
 
 class UpsertSpecialAllotmentRequest(BaseModel):
-    section_id: uuid.UUID
+    section_id: uuid.UUID | None = None
+    combined_group_id: uuid.UUID | None = None
     subject_id: uuid.UUID
     teacher_id: uuid.UUID
     room_id: uuid.UUID

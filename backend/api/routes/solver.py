@@ -238,6 +238,8 @@ def _validate_special_allotment_refs(
     slot: TimeSlot,
     tenant_id: uuid.UUID | None,
     existing_id: uuid.UUID | None = None,
+    allow_combined_subject: bool = False,
+    check_slot_conflicts: bool = True,
 ) -> None:
     # Basic reference and feasibility checks are identical to fixed entries.
     _validate_fixed_entry_refs(
@@ -283,7 +285,8 @@ def _validate_special_allotment_refs(
     if in_block:
         raise HTTPException(status_code=400, detail="SUBJECT_IN_ELECTIVE_BLOCK_NOT_SUPPORTED")
 
-    # Not supported: special locks for combined-class subjects.
+    # Combined-class subjects are only allowed when the caller explicitly
+    # targets a combined group.
     use_v2 = table_exists(db, "combined_groups") and table_exists(db, "combined_group_sections")
     if use_v2:
         in_combined = (
@@ -326,7 +329,7 @@ def _validate_special_allotment_refs(
             ).first()
             is not None
         )
-    if in_combined:
+    if in_combined and not allow_combined_subject:
         raise HTTPException(status_code=400, detail="SUBJECT_IN_COMBINED_CLASS_NOT_SUPPORTED")
 
     # Disallow placing a special allotment where a fixed entry already exists.
@@ -346,6 +349,9 @@ def _validate_special_allotment_refs(
     )
     if fixed_exists:
         raise HTTPException(status_code=400, detail="SLOT_HAS_FIXED_ENTRY")
+
+    if not check_slot_conflicts:
+        return
 
     # Teacher/room uniqueness across the whole program per-slot (active only).
     q_teacher = (
@@ -643,105 +649,29 @@ def delete_fixed_entry(
     return {"ok": True}
 
 
-@router.get("/special-allotments", response_model=ListSpecialAllotmentsResponse)
-def list_special_allotments(
+def _resolve_combined_group_for_section_subject(
+    db: Session,
+    *,
     section_id: uuid.UUID,
-    include_inactive: bool = Query(default=False),
-    _admin=Depends(require_admin),
-    db: Session = Depends(get_db),
-    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
-):
-    section = get_by_id(db, Section, section_id, tenant_id)
-    if section is None:
-        raise HTTPException(status_code=404, detail="SECTION_NOT_FOUND")
-
-    q = (
-        select(SpecialAllotment, Section, Subject, Teacher, Room, TimeSlot)
-        .join(Section, Section.id == SpecialAllotment.section_id)
-        .join(Subject, Subject.id == SpecialAllotment.subject_id)
-        .join(Teacher, Teacher.id == SpecialAllotment.teacher_id)
-        .join(Room, Room.id == SpecialAllotment.room_id)
-        .join(TimeSlot, TimeSlot.id == SpecialAllotment.slot_id)
-        .where(SpecialAllotment.section_id == section_id)
-    )
-    q = where_tenant(q, SpecialAllotment, tenant_id)
-    if not include_inactive:
-        q = q.where(SpecialAllotment.is_active.is_(True))
-    q = q.order_by(TimeSlot.day_of_week.asc(), TimeSlot.slot_index.asc())
-
-    rows = db.execute(q).all()
-    out: list[SpecialAllotmentOut] = []
-    for sa, sec, subj, teacher, room, slot in rows:
-        out.append(
-            SpecialAllotmentOut(
-                id=sa.id,
-                section_id=sec.id,
-                section_code=sec.code,
-                section_name=sec.name,
-                subject_id=subj.id,
-                subject_code=subj.code,
-                subject_name=subj.name,
-                subject_type=str(subj.subject_type),
-                teacher_id=teacher.id,
-                teacher_code=teacher.code,
-                teacher_name=teacher.full_name,
-                room_id=room.id,
-                room_code=room.code,
-                room_name=room.name,
-                room_type=str(room.room_type),
-                slot_id=slot.id,
-                day_of_week=int(slot.day_of_week),
-                slot_index=int(slot.slot_index),
-                start_time=slot.start_time.strftime("%H:%M"),
-                end_time=slot.end_time.strftime("%H:%M"),
-                reason=getattr(sa, "reason", None),
-                is_active=bool(sa.is_active),
-                created_at=sa.created_at,
-            )
-        )
-    return ListSpecialAllotmentsResponse(entries=out)
-
-
-@router.post("/special-allotments", response_model=SpecialAllotmentOut)
-def upsert_special_allotment(
-    payload: UpsertSpecialAllotmentRequest,
-    _admin=Depends(require_admin),
-    db: Session = Depends(get_db),
-    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
-):
-    section = get_by_id(db, Section, payload.section_id, tenant_id)
-    if section is None:
-        raise HTTPException(status_code=404, detail="SECTION_NOT_FOUND")
-    subject = get_by_id(db, Subject, payload.subject_id, tenant_id)
-    if subject is None:
-        raise HTTPException(status_code=404, detail="SUBJECT_NOT_FOUND")
-    teacher = get_by_id(db, Teacher, payload.teacher_id, tenant_id)
-    if teacher is None:
-        raise HTTPException(status_code=404, detail="TEACHER_NOT_FOUND")
-    room = get_by_id(db, Room, payload.room_id, tenant_id)
-    if room is None:
-        raise HTTPException(status_code=404, detail="ROOM_NOT_FOUND")
-    if not bool(getattr(room, "is_special", False)):
-        raise HTTPException(status_code=400, detail="SPECIAL_ALLOTMENT_ROOM_NOT_SPECIAL")
-    slot = get_by_id(db, TimeSlot, payload.slot_id, tenant_id)
-    if slot is None:
-        raise HTTPException(status_code=404, detail="SLOT_NOT_FOUND")
-
-    allowed_subject_ids = set(
-        _required_subject_ids_for_section(db, program_id=section.program_id, section=section, tenant_id=tenant_id)
-    )
-    if allowed_subject_ids and subject.id not in allowed_subject_ids:
-        raise HTTPException(status_code=400, detail="SUBJECT_NOT_ALLOWED_FOR_SECTION")
-
-    # Upsert by (section, slot)
-    existing = (
+    subject_id: uuid.UUID,
+    tenant_id: uuid.UUID | None,
+) -> CombinedGroup | None:
+    use_v2 = table_exists(db, "combined_groups") and table_exists(db, "combined_group_sections")
+    if not use_v2:
+        return None
+    return (
         db.execute(
             where_tenant(
-                select(SpecialAllotment)
-                .where(SpecialAllotment.section_id == payload.section_id)
-                .where(SpecialAllotment.slot_id == payload.slot_id)
-                .where(SpecialAllotment.is_active.is_(True)),
-                SpecialAllotment,
+                where_tenant(
+                    select(CombinedGroup)
+                    .join(CombinedGroupSection, CombinedGroupSection.combined_group_id == CombinedGroup.id)
+                    .where(CombinedGroup.subject_id == subject_id)
+                    .where(CombinedGroupSection.section_id == section_id)
+                    .limit(1),
+                    CombinedGroup,
+                    tenant_id,
+                ),
+                CombinedGroupSection,
                 tenant_id,
             )
         )
@@ -749,61 +679,33 @@ def upsert_special_allotment(
         .first()
     )
 
-    _validate_special_allotment_refs(
-        db,
-        section=section,
-        subject=subject,
-        teacher=teacher,
-        room=room,
-        slot=slot,
-        tenant_id=tenant_id,
-        existing_id=existing.id if existing is not None else None,
-    )
 
-    if existing is None:
-        existing = SpecialAllotment(
-            tenant_id=tenant_id,
-            section_id=payload.section_id,
-            subject_id=payload.subject_id,
-            teacher_id=payload.teacher_id,
-            room_id=payload.room_id,
-            slot_id=payload.slot_id,
-            reason=payload.reason,
-            is_active=True,
-        )
-        db.add(existing)
+def _special_allotment_out(
+    *,
+    sa: SpecialAllotment,
+    sec: Section,
+    subj: Subject,
+    teacher: Teacher,
+    room: Room,
+    slot: TimeSlot,
+    combined_group: CombinedGroup | None,
+    target_section_codes: list[str],
+) -> SpecialAllotmentOut:
+    target_kind = "COMBINED_GROUP" if combined_group is not None else "SECTION"
+    if combined_group is not None:
+        label = str(getattr(combined_group, "label", "") or "").strip() or f"{subj.code} ({', '.join(target_section_codes)})"
     else:
-        existing.subject_id = payload.subject_id
-        existing.teacher_id = payload.teacher_id
-        existing.room_id = payload.room_id
-        existing.reason = payload.reason
+        label = f"{sec.code} - {sec.name}"
 
-    db.commit()
-
-    row = (
-        db.execute(
-            where_tenant(
-                select(SpecialAllotment, Section, Subject, Teacher, Room, TimeSlot)
-                .join(Section, Section.id == SpecialAllotment.section_id)
-                .join(Subject, Subject.id == SpecialAllotment.subject_id)
-                .join(Teacher, Teacher.id == SpecialAllotment.teacher_id)
-                .join(Room, Room.id == SpecialAllotment.room_id)
-                .join(TimeSlot, TimeSlot.id == SpecialAllotment.slot_id)
-                .where(SpecialAllotment.id == existing.id),
-                SpecialAllotment,
-                tenant_id,
-            )
-        )
-        .first()
-    )
-    if row is None:
-        raise HTTPException(status_code=500, detail="SPECIAL_ALLOTMENT_WRITE_FAILED")
-    sa, sec, subj, teacher, room, slot = row
     return SpecialAllotmentOut(
         id=sa.id,
         section_id=sec.id,
         section_code=sec.code,
         section_name=sec.name,
+        combined_group_id=combined_group.id if combined_group is not None else None,
+        target_kind=target_kind,
+        target_label=label,
+        target_section_codes=target_section_codes,
         subject_id=subj.id,
         subject_code=subj.code,
         subject_name=subj.name,
@@ -826,9 +728,289 @@ def upsert_special_allotment(
     )
 
 
+@router.get("/special-allotments", response_model=ListSpecialAllotmentsResponse)
+def list_special_allotments(
+    section_id: uuid.UUID | None = Query(default=None),
+    teacher_id: uuid.UUID | None = Query(default=None),
+    include_inactive: bool = Query(default=False),
+    _admin=Depends(require_admin),
+    db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
+):
+    if section_id is None and teacher_id is None:
+        raise HTTPException(status_code=400, detail="SECTION_OR_TEACHER_REQUIRED")
+    if section_id is not None and get_by_id(db, Section, section_id, tenant_id) is None:
+        raise HTTPException(status_code=404, detail="SECTION_NOT_FOUND")
+    if teacher_id is not None and get_by_id(db, Teacher, teacher_id, tenant_id) is None:
+        raise HTTPException(status_code=404, detail="TEACHER_NOT_FOUND")
+
+    q = (
+        select(SpecialAllotment, Section, Subject, Teacher, Room, TimeSlot)
+        .join(Section, Section.id == SpecialAllotment.section_id)
+        .join(Subject, Subject.id == SpecialAllotment.subject_id)
+        .join(Teacher, Teacher.id == SpecialAllotment.teacher_id)
+        .join(Room, Room.id == SpecialAllotment.room_id)
+        .join(TimeSlot, TimeSlot.id == SpecialAllotment.slot_id)
+    )
+    if section_id is not None:
+        q = q.where(SpecialAllotment.section_id == section_id)
+    if teacher_id is not None:
+        q = q.where(SpecialAllotment.teacher_id == teacher_id)
+    q = where_tenant(q, SpecialAllotment, tenant_id)
+    if not include_inactive:
+        q = q.where(SpecialAllotment.is_active.is_(True))
+    q = q.order_by(TimeSlot.day_of_week.asc(), TimeSlot.slot_index.asc())
+
+    rows = db.execute(q).all()
+
+    group_cache: dict[tuple[uuid.UUID, uuid.UUID], CombinedGroup | None] = {}
+    group_section_codes: dict[uuid.UUID, list[str]] = {}
+
+    def get_group(sec_id: uuid.UUID, subj_id: uuid.UUID) -> CombinedGroup | None:
+        key = (sec_id, subj_id)
+        if key in group_cache:
+            return group_cache[key]
+        group_cache[key] = _resolve_combined_group_for_section_subject(
+            db,
+            section_id=sec_id,
+            subject_id=subj_id,
+            tenant_id=tenant_id,
+        )
+        return group_cache[key]
+
+    def get_group_codes(group_id: uuid.UUID) -> list[str]:
+        if group_id in group_section_codes:
+            return group_section_codes[group_id]
+        sec_rows = db.execute(
+            where_tenant(
+                where_tenant(
+                    select(Section.code)
+                    .join(CombinedGroupSection, CombinedGroupSection.section_id == Section.id)
+                    .where(CombinedGroupSection.combined_group_id == group_id)
+                    .order_by(Section.code.asc()),
+                    Section,
+                    tenant_id,
+                ),
+                CombinedGroupSection,
+                tenant_id,
+            )
+        ).all()
+        group_section_codes[group_id] = [str(code) for (code,) in sec_rows]
+        return group_section_codes[group_id]
+
+    out: list[SpecialAllotmentOut] = []
+    for sa, sec, subj, teacher, room, slot in rows:
+        group = get_group(sec.id, subj.id)
+        codes = get_group_codes(group.id) if group is not None else [sec.code]
+        out.append(
+            _special_allotment_out(
+                sa=sa,
+                sec=sec,
+                subj=subj,
+                teacher=teacher,
+                room=room,
+                slot=slot,
+                combined_group=group,
+                target_section_codes=codes,
+            )
+        )
+    return ListSpecialAllotmentsResponse(entries=out)
+
+
+@router.post("/special-allotments", response_model=SpecialAllotmentOut)
+def upsert_special_allotment(
+    payload: UpsertSpecialAllotmentRequest,
+    _admin=Depends(require_admin),
+    db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
+):
+    if payload.section_id is None and payload.combined_group_id is None:
+        raise HTTPException(status_code=400, detail="SPECIAL_ALLOTMENT_TARGET_REQUIRED")
+    if payload.section_id is not None and payload.combined_group_id is not None:
+        raise HTTPException(status_code=400, detail="SPECIAL_ALLOTMENT_TARGET_AMBIGUOUS")
+
+    subject = get_by_id(db, Subject, payload.subject_id, tenant_id)
+    if subject is None:
+        raise HTTPException(status_code=404, detail="SUBJECT_NOT_FOUND")
+    teacher = get_by_id(db, Teacher, payload.teacher_id, tenant_id)
+    if teacher is None:
+        raise HTTPException(status_code=404, detail="TEACHER_NOT_FOUND")
+    room = get_by_id(db, Room, payload.room_id, tenant_id)
+    if room is None:
+        raise HTTPException(status_code=404, detail="ROOM_NOT_FOUND")
+    if not bool(getattr(room, "is_special", False)):
+        raise HTTPException(status_code=400, detail="SPECIAL_ALLOTMENT_ROOM_NOT_SPECIAL")
+    slot = get_by_id(db, TimeSlot, payload.slot_id, tenant_id)
+    if slot is None:
+        raise HTTPException(status_code=404, detail="SLOT_NOT_FOUND")
+
+    target_sections: list[Section] = []
+    group_for_response: CombinedGroup | None = None
+    if payload.combined_group_id is not None:
+        use_v2 = table_exists(db, "combined_groups") and table_exists(db, "combined_group_sections")
+        if not use_v2:
+            raise HTTPException(status_code=400, detail="COMBINED_GROUPS_NOT_AVAILABLE")
+        group = get_by_id(db, CombinedGroup, payload.combined_group_id, tenant_id)
+        if group is None:
+            raise HTTPException(status_code=404, detail="COMBINED_GROUP_NOT_FOUND")
+        if group.subject_id != payload.subject_id:
+            raise HTTPException(status_code=400, detail="COMBINED_GROUP_SUBJECT_MISMATCH")
+        group_teacher_id = getattr(group, "teacher_id", None)
+        if group_teacher_id is not None and group_teacher_id != payload.teacher_id:
+            raise HTTPException(status_code=400, detail="COMBINED_GROUP_TEACHER_MISMATCH")
+
+        sec_rows = db.execute(
+            where_tenant(
+                where_tenant(
+                    select(Section)
+                    .join(CombinedGroupSection, CombinedGroupSection.section_id == Section.id)
+                    .where(CombinedGroupSection.combined_group_id == group.id)
+                    .order_by(Section.code.asc()),
+                    Section,
+                    tenant_id,
+                ),
+                CombinedGroupSection,
+                tenant_id,
+            )
+        ).scalars().all()
+        if not sec_rows:
+            raise HTTPException(status_code=400, detail="COMBINED_GROUP_EMPTY")
+        target_sections = list(sec_rows)
+        group_for_response = group
+    else:
+        section = get_by_id(db, Section, payload.section_id, tenant_id)
+        if section is None:
+            raise HTTPException(status_code=404, detail="SECTION_NOT_FOUND")
+        target_sections = [section]
+
+    for section in target_sections:
+        allowed_subject_ids = set(
+            _required_subject_ids_for_section(db, program_id=section.program_id, section=section, tenant_id=tenant_id)
+        )
+        if allowed_subject_ids and subject.id not in allowed_subject_ids:
+            raise HTTPException(status_code=400, detail="SUBJECT_NOT_ALLOWED_FOR_SECTION")
+
+        _validate_special_allotment_refs(
+            db,
+            section=section,
+            subject=subject,
+            teacher=teacher,
+            room=room,
+            slot=slot,
+            tenant_id=tenant_id,
+            allow_combined_subject=group_for_response is not None,
+            check_slot_conflicts=False,
+        )
+
+    target_section_ids = [s.id for s in target_sections]
+
+    existing_rows = (
+        db.execute(
+            where_tenant(
+                select(SpecialAllotment)
+                .where(SpecialAllotment.section_id.in_(target_section_ids))
+                .where(SpecialAllotment.slot_id == payload.slot_id)
+                .where(SpecialAllotment.is_active.is_(True)),
+                SpecialAllotment,
+                tenant_id,
+            )
+        )
+        .scalars()
+        .all()
+    )
+    existing_by_section = {row.section_id: row for row in existing_rows}
+    existing_ids = [row.id for row in existing_rows]
+
+    q_teacher = (
+        select(SpecialAllotment.id)
+        .where(SpecialAllotment.teacher_id == teacher.id)
+        .where(SpecialAllotment.slot_id == slot.id)
+        .where(SpecialAllotment.is_active.is_(True))
+    )
+    q_teacher = where_tenant(q_teacher, SpecialAllotment, tenant_id)
+    if existing_ids:
+        q_teacher = q_teacher.where(SpecialAllotment.id.not_in(existing_ids))
+    if db.execute(q_teacher.limit(1)).first() is not None:
+        raise HTTPException(status_code=400, detail="SPECIAL_ALLOTMENT_TEACHER_SLOT_CONFLICT")
+
+    q_room = (
+        select(SpecialAllotment.id)
+        .where(SpecialAllotment.room_id == room.id)
+        .where(SpecialAllotment.slot_id == slot.id)
+        .where(SpecialAllotment.is_active.is_(True))
+    )
+    q_room = where_tenant(q_room, SpecialAllotment, tenant_id)
+    if existing_ids:
+        q_room = q_room.where(SpecialAllotment.id.not_in(existing_ids))
+    if db.execute(q_room.limit(1)).first() is not None:
+        raise HTTPException(status_code=400, detail="SPECIAL_ALLOTMENT_ROOM_SLOT_CONFLICT")
+
+    representative_section_id: uuid.UUID | None = None
+    for section in target_sections:
+        existing = existing_by_section.get(section.id)
+        if existing is None:
+            existing = SpecialAllotment(
+                tenant_id=tenant_id,
+                section_id=section.id,
+                subject_id=payload.subject_id,
+                teacher_id=payload.teacher_id,
+                room_id=payload.room_id,
+                slot_id=payload.slot_id,
+                reason=payload.reason,
+                is_active=True,
+            )
+            db.add(existing)
+        else:
+            existing.subject_id = payload.subject_id
+            existing.teacher_id = payload.teacher_id
+            existing.room_id = payload.room_id
+            existing.reason = payload.reason
+            existing.is_active = True
+        if representative_section_id is None:
+            representative_section_id = section.id
+
+    db.commit()
+
+    if representative_section_id is None:
+        raise HTTPException(status_code=500, detail="SPECIAL_ALLOTMENT_WRITE_FAILED")
+
+    row = (
+        db.execute(
+            where_tenant(
+                select(SpecialAllotment, Section, Subject, Teacher, Room, TimeSlot)
+                .join(Section, Section.id == SpecialAllotment.section_id)
+                .join(Subject, Subject.id == SpecialAllotment.subject_id)
+                .join(Teacher, Teacher.id == SpecialAllotment.teacher_id)
+                .join(Room, Room.id == SpecialAllotment.room_id)
+                .join(TimeSlot, TimeSlot.id == SpecialAllotment.slot_id)
+                .where(SpecialAllotment.section_id == representative_section_id)
+                .where(SpecialAllotment.slot_id == payload.slot_id)
+                .where(SpecialAllotment.is_active.is_(True)),
+                SpecialAllotment,
+                tenant_id,
+            )
+        )
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=500, detail="SPECIAL_ALLOTMENT_WRITE_FAILED")
+    sa, sec, subj, teacher, room, slot = row
+    return _special_allotment_out(
+        sa=sa,
+        sec=sec,
+        subj=subj,
+        teacher=teacher,
+        room=room,
+        slot=slot,
+        combined_group=group_for_response,
+        target_section_codes=[s.code for s in target_sections],
+    )
+
+
 @router.delete("/special-allotments/{entry_id}")
 def delete_special_allotment(
     entry_id: uuid.UUID,
+    cascade_combined: bool = Query(default=True),
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
     tenant_id: uuid.UUID | None = Depends(get_tenant_id),
@@ -836,7 +1018,62 @@ def delete_special_allotment(
     row = get_by_id(db, SpecialAllotment, entry_id, tenant_id)
     if row is None:
         raise HTTPException(status_code=404, detail="SPECIAL_ALLOTMENT_NOT_FOUND")
-    row.is_active = False
+
+    if not cascade_combined:
+        row.is_active = False
+        db.commit()
+        return {"ok": True}
+
+    group = _resolve_combined_group_for_section_subject(
+        db,
+        section_id=row.section_id,
+        subject_id=row.subject_id,
+        tenant_id=tenant_id,
+    )
+    if group is None:
+        row.is_active = False
+        db.commit()
+        return {"ok": True}
+
+    section_ids = [
+        sid
+        for (sid,) in db.execute(
+            where_tenant(
+                select(CombinedGroupSection.section_id).where(CombinedGroupSection.combined_group_id == group.id),
+                CombinedGroupSection,
+                tenant_id,
+            )
+        ).all()
+    ]
+    if not section_ids:
+        row.is_active = False
+        db.commit()
+        return {"ok": True}
+
+    linked = (
+        db.execute(
+            where_tenant(
+                select(SpecialAllotment)
+                .where(SpecialAllotment.section_id.in_(section_ids))
+                .where(SpecialAllotment.subject_id == row.subject_id)
+                .where(SpecialAllotment.teacher_id == row.teacher_id)
+                .where(SpecialAllotment.room_id == row.room_id)
+                .where(SpecialAllotment.slot_id == row.slot_id)
+                .where(SpecialAllotment.is_active.is_(True)),
+                SpecialAllotment,
+                tenant_id,
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not linked:
+        row.is_active = False
+        db.commit()
+        return {"ok": True}
+
+    for item in linked:
+        item.is_active = False
     db.commit()
     return {"ok": True}
 

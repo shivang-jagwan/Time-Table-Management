@@ -289,6 +289,10 @@ export type SpecialAllotment = {
   section_id: string
   section_code: string
   section_name: string
+  combined_group_id?: string | null
+  target_kind: 'SECTION' | 'COMBINED_GROUP'
+  target_label?: string | null
+  target_section_codes?: string[]
 
   subject_id: string
   subject_code: string
@@ -343,10 +347,13 @@ export async function deleteFixedEntry(entry_id: string): Promise<{ ok: true }> 
 }
 
 export async function listSpecialAllotments(params: {
-  section_id: string
+  section_id?: string
+  teacher_id?: string
   include_inactive?: boolean
 }): Promise<SpecialAllotment[]> {
-  const qs = new URLSearchParams({ section_id: params.section_id })
+  const qs = new URLSearchParams()
+  if (params.section_id) qs.set('section_id', params.section_id)
+  if (params.teacher_id) qs.set('teacher_id', params.teacher_id)
   if (params.include_inactive) qs.set('include_inactive', 'true')
   const data = await apiFetch<{ entries: SpecialAllotment[] }>(
     `/api/solver/special-allotments?${qs.toString()}`,
@@ -355,7 +362,8 @@ export async function listSpecialAllotments(params: {
 }
 
 export async function upsertSpecialAllotment(payload: {
-  section_id: string
+  section_id?: string
+  combined_group_id?: string
   subject_id: string
   teacher_id: string
   room_id: string
@@ -368,8 +376,14 @@ export async function upsertSpecialAllotment(payload: {
   })
 }
 
-export async function deleteSpecialAllotment(entry_id: string): Promise<{ ok: true }> {
-  return apiFetch<{ ok: true }>(`/api/solver/special-allotments/${entry_id}`, { method: 'DELETE' })
+export async function deleteSpecialAllotment(
+  entry_id: string,
+  params?: { cascade_combined?: boolean },
+): Promise<{ ok: true }> {
+  const qs = new URLSearchParams()
+  if (params?.cascade_combined === false) qs.set('cascade_combined', 'false')
+  const suffix = qs.toString() ? `?${qs.toString()}` : ''
+  return apiFetch<{ ok: true }>(`/api/solver/special-allotments/${entry_id}${suffix}`, { method: 'DELETE' })
 }
 
 export type RequiredSubject = {
