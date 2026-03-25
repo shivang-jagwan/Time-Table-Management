@@ -1771,15 +1771,6 @@ def upsert_elective_block_subject(
     if not bool(teacher.is_active):
         raise HTTPException(status_code=422, detail="TEACHER_INACTIVE")
 
-    q_dup = (
-        select(ElectiveBlockSubject.id)
-        .where(ElectiveBlockSubject.block_id == block_id)
-        .where(ElectiveBlockSubject.teacher_id == payload.teacher_id)
-        .limit(1)
-    )
-    q_dup = where_tenant(q_dup, ElectiveBlockSubject, tenant_id)
-    dup = db.execute(q_dup).first()
-
     # If this exact pair already exists, treat as a no-op.
     q_exact = (
         select(ElectiveBlockSubject)
@@ -1792,10 +1783,6 @@ def upsert_elective_block_subject(
     exact = db.execute(q_exact).scalars().first()
     if exact is not None:
         return AdminActionResult(ok=True, created=0, updated=0, deleted=0)
-
-    # Enforce rule: a teacher may appear at most once per block.
-    if dup is not None:
-        raise HTTPException(status_code=409, detail="DUPLICATE_TEACHER_IN_BLOCK")
 
     # If block already mapped to sections, require eligibility for all.
     q_sec_ids = select(SectionElectiveBlock.section_id).where(SectionElectiveBlock.block_id == block_id)
@@ -1826,7 +1813,7 @@ def upsert_elective_block_subject(
         db.commit()
     except IntegrityError:
         db.rollback()
-        raise HTTPException(status_code=409, detail="DUPLICATE_TEACHER_IN_BLOCK")
+        raise HTTPException(status_code=409, detail="DUPLICATE_SUBJECT_IN_BLOCK")
     return AdminActionResult(ok=True, created=1, updated=0, deleted=0)
 
 

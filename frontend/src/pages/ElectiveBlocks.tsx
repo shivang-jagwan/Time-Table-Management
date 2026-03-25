@@ -83,11 +83,6 @@ export function ElectiveBlocks() {
     setEditBlockActive(Boolean(selectedBlock.is_active))
   }, [selectedBlock])
 
-  const duplicateTeacherInBlock = React.useMemo(() => {
-    if (!selectedBlock || !assignTeacherId) return false
-    return selectedBlock.subjects.some((s) => s.teacher_id === assignTeacherId)
-  }, [selectedBlock, assignTeacherId, assignSubjectId])
-
   async function refresh(nextYear = year) {
     setLoading(true)
     try {
@@ -206,10 +201,6 @@ export function ElectiveBlocks() {
     }
     if (!assignTeacherId) {
       showToast('Select a teacher')
-      return
-    }
-    if (duplicateTeacherInBlock) {
-      showToast('Teacher already used in this block')
       return
     }
     setLoading(true)
