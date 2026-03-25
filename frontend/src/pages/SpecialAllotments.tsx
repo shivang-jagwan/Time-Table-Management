@@ -161,10 +161,25 @@ export function SpecialAllotments() {
         reason: form.reason.trim() ? form.reason.trim() : null,
       }
 
-      // Production-safe fallback: if slot is omitted, try teacher-window slots explicitly.
-      if (!form.slot_id && teacherWindows.length > 0) {
-        const candidates = slots
-          .filter((slot) => {
+      if (!form.slot_id) {
+        let needExplicitFallback = false
+        try {
+          // Prefer backend default-slot inference when available.
+          await upsertSpecialAllotment({
+            ...basePayload,
+            slot_id: undefined,
+          })
+        } catch (e: any) {
+          const msg = String(e?.message ?? e)
+          if (msg.includes('SPECIAL_ALLOTMENT_SLOT_REQUIRED_OR_DEFAULT_NOT_FOUND')) {
+            needExplicitFallback = true
+          } else {
+            throw e
+          }
+        }
+
+        if (needExplicitFallback) {
+          const teacherWindowCandidates = slots.filter((slot) => {
             const day = Number(slot.day_of_week)
             const idx = Number(slot.slot_index)
             return teacherWindows.some((w) => {
@@ -172,24 +187,35 @@ export function SpecialAllotments() {
               return idx >= Number(w.start_slot_index) && idx <= Number(w.end_slot_index)
             })
           })
-          .sort((a, b) => (a.day_of_week - b.day_of_week) || (a.slot_index - b.slot_index))
 
-        let saved = false
-        let lastErr: any = null
-        for (const slot of candidates) {
-          try {
-            await upsertSpecialAllotment({
-              ...basePayload,
-              slot_id: slot.id,
-            })
-            saved = true
-            break
-          } catch (e: any) {
-            lastErr = e
+          const sortedAllSlots = slots
+            .slice()
+            .sort((a, b) => (a.day_of_week - b.day_of_week) || (a.slot_index - b.slot_index))
+
+          const seen = new Set<string>()
+          const candidates = [...teacherWindowCandidates, ...sortedAllSlots].filter((slot) => {
+            if (seen.has(slot.id)) return false
+            seen.add(slot.id)
+            return true
+          })
+
+          let saved = false
+          let lastErr: any = null
+          for (const slot of candidates) {
+            try {
+              await upsertSpecialAllotment({
+                ...basePayload,
+                slot_id: slot.id,
+              })
+              saved = true
+              break
+            } catch (e: any) {
+              lastErr = e
+            }
           }
-        }
-        if (!saved) {
-          throw (lastErr ?? new Error('No teacher-window slot could be saved. Please select slot manually.'))
+          if (!saved) {
+            throw (lastErr ?? new Error('No feasible slot could be saved. Please select slot manually.'))
+          }
         }
       } else {
         await upsertSpecialAllotment({

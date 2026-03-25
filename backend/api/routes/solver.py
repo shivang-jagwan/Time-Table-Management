@@ -859,7 +859,22 @@ def _resolve_default_special_allotment_slot(
     q_exact = where_tenant(q_exact, TimetableRun, tenant_id)
     candidate_slots.extend([sid for (sid,) in db.execute(q_exact).all() if sid is not None])
 
-    # 3) Broader: teacher+subject across any sections.
+    # 3) Section+subject pattern across solved runs (teacher-agnostic).
+    # This helps tenants where teacher historical rows are sparse.
+    q_section_subject = (
+        select(TimetableEntry.slot_id)
+        .join(TimetableRun, TimetableRun.id == TimetableEntry.run_id)
+        .where(TimetableEntry.section_id.in_(section_ids))
+        .where(TimetableEntry.subject_id == subject_id)
+        .where(status_filter)
+        .group_by(TimetableEntry.slot_id)
+        .order_by(func.count(cast(TimetableEntry.section_id, String)).desc(), func.max(TimetableRun.created_at).desc())
+    )
+    q_section_subject = where_tenant(q_section_subject, TimetableEntry, tenant_id)
+    q_section_subject = where_tenant(q_section_subject, TimetableRun, tenant_id)
+    candidate_slots.extend([sid for (sid,) in db.execute(q_section_subject).all() if sid is not None])
+
+    # 4) Broader: teacher+subject across any sections.
     q_subject = (
         select(TimetableEntry.slot_id)
         .join(TimetableRun, TimetableRun.id == TimetableEntry.run_id)
@@ -873,7 +888,7 @@ def _resolve_default_special_allotment_slot(
     q_subject = where_tenant(q_subject, TimetableRun, tenant_id)
     candidate_slots.extend([sid for (sid,) in db.execute(q_subject).all() if sid is not None])
 
-    # 4) Last preference: teacher's normal timetable pattern (any subject).
+    # 5) Last preference: teacher's normal timetable pattern (any subject).
     q_teacher = (
         select(TimetableEntry.slot_id)
         .join(TimetableRun, TimetableRun.id == TimetableEntry.run_id)
