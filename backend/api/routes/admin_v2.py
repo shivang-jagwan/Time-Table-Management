@@ -1784,6 +1784,25 @@ def upsert_elective_block_subject(
     if exact is not None:
         return AdminActionResult(ok=True, created=0, updated=0, deleted=0)
 
+    # Upsert behavior: within a block, subject is unique. If subject already exists
+    # with another teacher, update that assignment instead of raising conflict.
+    q_subject_existing = (
+        select(ElectiveBlockSubject)
+        .where(ElectiveBlockSubject.block_id == block_id)
+        .where(ElectiveBlockSubject.subject_id == payload.subject_id)
+        .limit(1)
+    )
+    q_subject_existing = where_tenant(q_subject_existing, ElectiveBlockSubject, tenant_id)
+    subject_existing = db.execute(q_subject_existing).scalars().first()
+    if subject_existing is not None:
+        subject_existing.teacher_id = payload.teacher_id
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            raise HTTPException(status_code=409, detail="DUPLICATE_SUBJECT_IN_BLOCK")
+        return AdminActionResult(ok=True, created=0, updated=1, deleted=0)
+
     # If block already mapped to sections, require eligibility for all.
     q_sec_ids = select(SectionElectiveBlock.section_id).where(SectionElectiveBlock.block_id == block_id)
     q_sec_ids = where_tenant(q_sec_ids, SectionElectiveBlock, tenant_id)
