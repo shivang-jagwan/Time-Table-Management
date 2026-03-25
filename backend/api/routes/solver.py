@@ -147,6 +147,7 @@ def _validate_fixed_entry_refs(
     slot: TimeSlot,
     tenant_id: uuid.UUID | None,
     allow_special_room: bool = False,
+    enforce_teacher_assignment: bool = True,
 ) -> None:
     if subject.program_id != section.program_id:
         raise HTTPException(status_code=400, detail="SUBJECT_PROGRAM_MISMATCH")
@@ -179,23 +180,24 @@ def _validate_fixed_entry_refs(
         raise HTTPException(status_code=400, detail="TEACHER_WEEKLY_OFF_DAY")
 
     # Strict assignment: teacher must be assigned to (section, subject).
-    assigned = (
-        db.execute(
-            where_tenant(
-                select(TeacherSubjectSection.id)
-                .where(TeacherSubjectSection.teacher_id == teacher.id)
-                .where(TeacherSubjectSection.subject_id == subject.id)
-                .where(TeacherSubjectSection.section_id == section.id)
-                .where(TeacherSubjectSection.is_active.is_(True))
-                .limit(1),
-                TeacherSubjectSection,
-                tenant_id,
-            )
-        ).first()
-        is not None
-    )
-    if not assigned:
-        raise HTTPException(status_code=400, detail="TEACHER_NOT_ASSIGNED_TO_SECTION_SUBJECT")
+    if enforce_teacher_assignment:
+        assigned = (
+            db.execute(
+                where_tenant(
+                    select(TeacherSubjectSection.id)
+                    .where(TeacherSubjectSection.teacher_id == teacher.id)
+                    .where(TeacherSubjectSection.subject_id == subject.id)
+                    .where(TeacherSubjectSection.section_id == section.id)
+                    .where(TeacherSubjectSection.is_active.is_(True))
+                    .limit(1),
+                    TeacherSubjectSection,
+                    tenant_id,
+                )
+            ).first()
+            is not None
+        )
+        if not assigned:
+            raise HTTPException(status_code=400, detail="TEACHER_NOT_ASSIGNED_TO_SECTION_SUBJECT")
 
     # LAB block must fit (entry represents LAB start).
     if str(subject.subject_type) == "LAB":
@@ -251,6 +253,7 @@ def _validate_special_allotment_refs(
         slot=slot,
         tenant_id=tenant_id,
         allow_special_room=True,
+        enforce_teacher_assignment=not allow_combined_subject,
     )
 
     if not bool(getattr(room, "is_special", False)):
@@ -1056,11 +1059,12 @@ def upsert_special_allotment(
             raise HTTPException(status_code=400, detail="SPECIAL_ALLOTMENT_SLOT_REQUIRED_OR_DEFAULT_NOT_FOUND")
 
     for section in target_sections:
-        allowed_subject_ids = set(
-            _required_subject_ids_for_section(db, program_id=section.program_id, section=section, tenant_id=tenant_id)
-        )
-        if allowed_subject_ids and subject.id not in allowed_subject_ids:
-            raise HTTPException(status_code=400, detail="SUBJECT_NOT_ALLOWED_FOR_SECTION")
+        if group_for_response is None:
+            allowed_subject_ids = set(
+                _required_subject_ids_for_section(db, program_id=section.program_id, section=section, tenant_id=tenant_id)
+            )
+            if allowed_subject_ids and subject.id not in allowed_subject_ids:
+                raise HTTPException(status_code=400, detail="SUBJECT_NOT_ALLOWED_FOR_SECTION")
 
         _validate_special_allotment_refs(
             db,
