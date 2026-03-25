@@ -414,16 +414,11 @@ export function ElectiveBlocks() {
                       options={activeTeachers.map((t) => ({ value: t.id, label: `${t.code} — ${t.full_name}` }))}
                       searchable={activeTeachers.length >= 8}
                     />
-                    {duplicateTeacherInBlock ? (
-                      <div className="mt-1 text-xs font-semibold text-red-600">
-                        Duplicate teacher within this block is not allowed.
-                      </div>
-                    ) : null}
                   </div>
                   <div className="flex items-end">
                     <button
                       className="btn-primary w-full"
-                      disabled={loading || duplicateTeacherInBlock}
+                      disabled={loading}
                       onClick={onUpsertAssignment}
                     >
                       Save Assignment
