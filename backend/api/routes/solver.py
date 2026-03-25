@@ -31,6 +31,7 @@ from models.section_time_window import SectionTimeWindow
 from models.section_elective_block import SectionElectiveBlock
 from models.subject import Subject
 from models.teacher import Teacher
+from models.teacher_time_window import TeacherTimeWindow
 from models.teacher_subject_section import TeacherSubjectSection
 from models.time_slot import TimeSlot
 from models.timetable_conflict import TimetableConflict
@@ -893,6 +894,52 @@ def _resolve_default_special_allotment_slot(
         slot = get_by_id(db, TimeSlot, slot_id, tenant_id)
         if slot is not None and _is_slot_feasible(slot):
             return slot
+
+    # 5) Configured teacher availability window fallback (e.g., teacher teaches 2-4).
+    if table_exists(db, "teacher_time_windows"):
+        windows = (
+            db.execute(
+                where_tenant(
+                    select(TeacherTimeWindow)
+                    .where(TeacherTimeWindow.teacher_id == teacher_id)
+                    .order_by(TeacherTimeWindow.day_of_week.asc().nullsfirst()),
+                    TeacherTimeWindow,
+                    tenant_id,
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if windows:
+            slots = (
+                db.execute(
+                    where_tenant(
+                        select(TimeSlot).order_by(TimeSlot.day_of_week.asc(), TimeSlot.slot_index.asc()),
+                        TimeSlot,
+                        tenant_id,
+                    )
+                )
+                .scalars()
+                .all()
+            )
+
+            def _in_teacher_window(slot: TimeSlot) -> bool:
+                day = int(slot.day_of_week)
+                idx = int(slot.slot_index)
+                for w in windows:
+                    wday = getattr(w, "day_of_week", None)
+                    if wday is not None and int(wday) != day:
+                        continue
+                    if idx < int(w.start_slot_index) or idx > int(w.end_slot_index):
+                        continue
+                    return True
+                return False
+
+            for slot in slots:
+                if not _in_teacher_window(slot):
+                    continue
+                if _is_slot_feasible(slot):
+                    return slot
 
     # No teacher-pattern slot could be applied safely.
     return None

@@ -10,7 +10,7 @@ import {
 } from '../api/admin'
 import { listSections, type Section } from '../api/sections'
 import { listRooms, type Room } from '../api/rooms'
-import { listTeachers, type Teacher } from '../api/teachers'
+import { getTeacherTimeWindows, listTeachers, type Teacher, type TeacherTimeWindow } from '../api/teachers'
 import { listSubjects, type Subject } from '../api/subjects'
 import {
   listTimeSlots,
@@ -42,6 +42,7 @@ export function SpecialAllotments() {
   const [teachers, setTeachers] = React.useState<Teacher[]>([])
   const [combinedGroups, setCombinedGroups] = React.useState<CombinedSubjectGroupOut[]>([])
   const [teacherSubjectRows, setTeacherSubjectRows] = React.useState<TeacherSubjectSectionAssignmentRow[]>([])
+  const [teacherWindows, setTeacherWindows] = React.useState<TeacherTimeWindow[]>([])
 
   const [entries, setEntries] = React.useState<SpecialAllotment[]>([])
   const [teacherId, setTeacherId] = React.useState('')
@@ -102,16 +103,19 @@ export function SpecialAllotments() {
     if (!selectedTeacherId) {
       setTeacherSubjectRows([])
       setEntries([])
+      setTeacherWindows([])
       return
     }
     setLoading(true)
     try {
-      const [rows, sa] = await Promise.all([
+      const [rows, sa, tw] = await Promise.all([
         listTeacherSubjectSections({ teacher_id: selectedTeacherId }),
         listSpecialAllotments({ teacher_id: selectedTeacherId }),
+        getTeacherTimeWindows(selectedTeacherId),
       ])
       setTeacherSubjectRows(rows)
       setEntries(sa)
+      setTeacherWindows(tw.windows ?? [])
     } catch (e: any) {
       showToast(`Load failed: ${String(e?.message ?? e)}`, 3500)
     } finally {
@@ -147,15 +151,53 @@ export function SpecialAllotments() {
     try {
       const sectionId = form.target_key.startsWith('S:') ? form.target_key.slice(2) : undefined
       const combinedGroupId = form.target_key.startsWith('C:') ? form.target_key.slice(2) : undefined
-      await upsertSpecialAllotment({
+
+      const basePayload = {
         section_id: sectionId,
         combined_group_id: combinedGroupId,
-        slot_id: form.slot_id || undefined,
         subject_id: form.subject_id,
         teacher_id: teacherId,
         room_id: form.room_id,
         reason: form.reason.trim() ? form.reason.trim() : null,
-      })
+      }
+
+      // Production-safe fallback: if slot is omitted, try teacher-window slots explicitly.
+      if (!form.slot_id && teacherWindows.length > 0) {
+        const candidates = slots
+          .filter((slot) => {
+            const day = Number(slot.day_of_week)
+            const idx = Number(slot.slot_index)
+            return teacherWindows.some((w) => {
+              if (w.day_of_week !== null && Number(w.day_of_week) !== day) return false
+              return idx >= Number(w.start_slot_index) && idx <= Number(w.end_slot_index)
+            })
+          })
+          .sort((a, b) => (a.day_of_week - b.day_of_week) || (a.slot_index - b.slot_index))
+
+        let saved = false
+        let lastErr: any = null
+        for (const slot of candidates) {
+          try {
+            await upsertSpecialAllotment({
+              ...basePayload,
+              slot_id: slot.id,
+            })
+            saved = true
+            break
+          } catch (e: any) {
+            lastErr = e
+          }
+        }
+        if (!saved) {
+          throw (lastErr ?? new Error('No teacher-window slot could be saved. Please select slot manually.'))
+        }
+      } else {
+        await upsertSpecialAllotment({
+          ...basePayload,
+          slot_id: form.slot_id || undefined,
+        })
+      }
+
       showToast('Saved special allotment')
       setForm((f) => ({ ...f, reason: '' }))
       await refreshTeacherData(teacherId)
