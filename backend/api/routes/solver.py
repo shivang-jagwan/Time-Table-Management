@@ -734,11 +734,31 @@ def _resolve_default_special_allotment_slot(
     section_ids: list[uuid.UUID],
     subject_id: uuid.UUID,
     teacher_id: uuid.UUID,
+    room_id: uuid.UUID,
+    teacher_weekly_off_day: int | None,
     tenant_id: uuid.UUID | None,
 ) -> TimeSlot | None:
     if not section_ids:
         return None
 
+    # 1) Reuse an existing active lock for this teacher+subject+target sections if present.
+    q_existing = (
+        select(SpecialAllotment.slot_id)
+        .where(SpecialAllotment.section_id.in_(section_ids))
+        .where(SpecialAllotment.subject_id == subject_id)
+        .where(SpecialAllotment.teacher_id == teacher_id)
+        .where(SpecialAllotment.is_active.is_(True))
+        .order_by(SpecialAllotment.created_at.desc())
+        .limit(1)
+    )
+    q_existing = where_tenant(q_existing, SpecialAllotment, tenant_id)
+    existing_slot_row = db.execute(q_existing).first()
+    if existing_slot_row is not None and existing_slot_row[0] is not None:
+        slot = get_by_id(db, TimeSlot, existing_slot_row[0], tenant_id)
+        if slot is not None:
+            return slot
+
+    # 2) Prefer historically used normal timetable slot for teacher+subject+sections.
     q = (
         select(
             TimetableEntry.slot_id,
@@ -765,6 +785,99 @@ def _resolve_default_special_allotment_slot(
 
     row = db.execute(q).first()
     if row is None:
+        # 3) Fallback: pick first feasible slot from section windows with no current clashes.
+        slots = (
+            db.execute(
+                where_tenant(
+                    select(TimeSlot).order_by(TimeSlot.day_of_week.asc(), TimeSlot.slot_index.asc()),
+                    TimeSlot,
+                    tenant_id,
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for slot in slots:
+            day = int(slot.day_of_week)
+            idx = int(slot.slot_index)
+            if teacher_weekly_off_day is not None and int(teacher_weekly_off_day) == day:
+                continue
+
+            all_sections_fit = True
+            for sec_id in section_ids:
+                w = (
+                    db.execute(
+                        where_tenant(
+                            select(SectionTimeWindow)
+                            .where(SectionTimeWindow.section_id == sec_id)
+                            .where(SectionTimeWindow.day_of_week == day)
+                            .limit(1),
+                            SectionTimeWindow,
+                            tenant_id,
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
+                if w is None or idx < int(w.start_slot_index) or idx > int(w.end_slot_index):
+                    all_sections_fit = False
+                    break
+            if not all_sections_fit:
+                continue
+
+            fixed_exists = (
+                db.execute(
+                    where_tenant(
+                        select(FixedTimetableEntry.id)
+                        .where(FixedTimetableEntry.section_id.in_(section_ids))
+                        .where(FixedTimetableEntry.slot_id == slot.id)
+                        .where(FixedTimetableEntry.is_active.is_(True))
+                        .limit(1),
+                        FixedTimetableEntry,
+                        tenant_id,
+                    )
+                ).first()
+                is not None
+            )
+            if fixed_exists:
+                continue
+
+            teacher_conflict = (
+                db.execute(
+                    where_tenant(
+                        select(SpecialAllotment.id)
+                        .where(SpecialAllotment.teacher_id == teacher_id)
+                        .where(SpecialAllotment.slot_id == slot.id)
+                        .where(SpecialAllotment.is_active.is_(True))
+                        .limit(1),
+                        SpecialAllotment,
+                        tenant_id,
+                    )
+                ).first()
+                is not None
+            )
+            if teacher_conflict:
+                continue
+
+            room_conflict = (
+                db.execute(
+                    where_tenant(
+                        select(SpecialAllotment.id)
+                        .where(SpecialAllotment.room_id == room_id)
+                        .where(SpecialAllotment.slot_id == slot.id)
+                        .where(SpecialAllotment.is_active.is_(True))
+                        .limit(1),
+                        SpecialAllotment,
+                        tenant_id,
+                    )
+                ).first()
+                is not None
+            )
+            if room_conflict:
+                continue
+
+            return slot
+
         return None
     slot_id = row[0]
     if slot_id is None:
@@ -935,6 +1048,8 @@ def upsert_special_allotment(
             section_ids=[s.id for s in target_sections],
             subject_id=payload.subject_id,
             teacher_id=payload.teacher_id,
+            room_id=payload.room_id,
+            teacher_weekly_off_day=teacher.weekly_off_day,
             tenant_id=tenant_id,
         )
         if slot is None:
@@ -1002,8 +1117,22 @@ def upsert_special_allotment(
     if db.execute(q_room.limit(1)).first() is not None:
         raise HTTPException(status_code=400, detail="SPECIAL_ALLOTMENT_ROOM_SLOT_CONFLICT")
 
+    # Persisting one canonical row for combined targets avoids violating
+    # tenant-level unique constraints such as (teacher_id, slot_id).
+    section_by_id = {s.id: s for s in target_sections}
+    if group_for_response is not None:
+        if existing_rows:
+            write_section_ids = [existing_rows[0].section_id]
+        else:
+            write_section_ids = [target_sections[0].id]
+    else:
+        write_section_ids = [s.id for s in target_sections]
+
     representative_section_id: uuid.UUID | None = None
-    for section in target_sections:
+    for write_section_id in write_section_ids:
+        section = section_by_id.get(write_section_id)
+        if section is None:
+            continue
         existing = existing_by_section.get(section.id)
         if existing is None:
             existing = SpecialAllotment(
