@@ -5,8 +5,8 @@
       "destination": "https://time-table-management-mek3.onrender.com/health"
     },
     {
-      "source": "/api/:path*",
-      "destination": "https://time-table-management-mek3.onrender.com/api/:path*"
+      "source": "/api/(.*)",
+      "destination": "https://time-table-management-mek3.onrender.com/api/$1"
     },
     {
       "source": "/(.*)",
