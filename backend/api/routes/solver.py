@@ -2559,6 +2559,11 @@ def _global_solve_body(
             logger.error("_global_solve_body: run %s not found", run_id)
             return
 
+        # Mark as actively processing so callers can distinguish queued vs stuck runs.
+        if str(getattr(run, "status", "")) in {"CREATED", ""}:
+            run.status = "RUNNING"
+            db.commit()
+
         q_program = where_tenant(select(Program).where(Program.code == payload.program_code), Program, tenant_id)
         program = db.execute(q_program).scalar_one_or_none()
         if program is None:
@@ -2703,7 +2708,8 @@ def _global_solve_body(
         try:
             db.rollback()
             fresh = db.get(TimetableRun, run_id)
-            if fresh is not None and str(fresh.status) in {"CREATED", ""}:
+            terminal = {"OPTIMAL", "SUBOPTIMAL", "FEASIBLE", "INFEASIBLE", "VALIDATION_FAILED", "ERROR"}
+            if fresh is not None and str(fresh.status) not in terminal:
                 fresh.status = "ERROR"
                 fresh.notes = f"{type(exc).__name__}: {str(exc)}"[:500]
                 db.commit()
@@ -2735,7 +2741,7 @@ def solve_timetable_global(
             tenant_id=tenant_id,
             academic_year_id=None,
             seed=payload.seed,
-            status="CREATED",
+            status="RUNNING",
             parameters={
                 "program_code": payload.program_code,
                 "max_time_seconds": max_time_seconds,
