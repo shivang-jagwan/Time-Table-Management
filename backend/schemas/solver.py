@@ -254,7 +254,7 @@ class UpsertSpecialAllotmentRequest(BaseModel):
     subject_id: uuid.UUID
     teacher_id: uuid.UUID
     room_id: uuid.UUID
-    slot_id: uuid.UUID
+    slot_id: uuid.UUID | None = None
     reason: str | None = None
 
 

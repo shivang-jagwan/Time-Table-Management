@@ -367,7 +367,7 @@ export async function upsertSpecialAllotment(payload: {
   subject_id: string
   teacher_id: string
   room_id: string
-  slot_id: string
+  slot_id?: string
   reason?: string | null
 }): Promise<SpecialAllotment> {
   return apiFetch<SpecialAllotment>(`/api/solver/special-allotments`, {

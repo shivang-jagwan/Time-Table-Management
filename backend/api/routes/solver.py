@@ -728,6 +728,50 @@ def _special_allotment_out(
     )
 
 
+def _resolve_default_special_allotment_slot(
+    db: Session,
+    *,
+    section_ids: list[uuid.UUID],
+    subject_id: uuid.UUID,
+    teacher_id: uuid.UUID,
+    tenant_id: uuid.UUID | None,
+) -> TimeSlot | None:
+    if not section_ids:
+        return None
+
+    q = (
+        select(
+            TimetableEntry.slot_id,
+            func.count(cast(TimetableEntry.section_id, String)).label("section_hits"),
+            func.max(TimetableRun.created_at).label("last_seen"),
+        )
+        .join(TimetableRun, TimetableRun.id == TimetableEntry.run_id)
+        .where(TimetableEntry.section_id.in_(section_ids))
+        .where(TimetableEntry.subject_id == subject_id)
+        .where(TimetableEntry.teacher_id == teacher_id)
+        .where(
+            cast(TimetableRun.status, String).in_([
+                "FEASIBLE",
+                "SUBOPTIMAL",
+                "OPTIMAL",
+            ])
+        )
+        .group_by(TimetableEntry.slot_id)
+        .order_by(func.count(cast(TimetableEntry.section_id, String)).desc(), func.max(TimetableRun.created_at).desc())
+        .limit(1)
+    )
+    q = where_tenant(q, TimetableEntry, tenant_id)
+    q = where_tenant(q, TimetableRun, tenant_id)
+
+    row = db.execute(q).first()
+    if row is None:
+        return None
+    slot_id = row[0]
+    if slot_id is None:
+        return None
+    return get_by_id(db, TimeSlot, slot_id, tenant_id)
+
+
 @router.get("/special-allotments", response_model=ListSpecialAllotmentsResponse)
 def list_special_allotments(
     section_id: uuid.UUID | None = Query(default=None),
@@ -840,9 +884,6 @@ def upsert_special_allotment(
         raise HTTPException(status_code=404, detail="ROOM_NOT_FOUND")
     if not bool(getattr(room, "is_special", False)):
         raise HTTPException(status_code=400, detail="SPECIAL_ALLOTMENT_ROOM_NOT_SPECIAL")
-    slot = get_by_id(db, TimeSlot, payload.slot_id, tenant_id)
-    if slot is None:
-        raise HTTPException(status_code=404, detail="SLOT_NOT_FOUND")
 
     target_sections: list[Section] = []
     group_for_response: CombinedGroup | None = None
@@ -883,6 +924,22 @@ def upsert_special_allotment(
             raise HTTPException(status_code=404, detail="SECTION_NOT_FOUND")
         target_sections = [section]
 
+    slot: TimeSlot | None = None
+    if payload.slot_id is not None:
+        slot = get_by_id(db, TimeSlot, payload.slot_id, tenant_id)
+        if slot is None:
+            raise HTTPException(status_code=404, detail="SLOT_NOT_FOUND")
+    else:
+        slot = _resolve_default_special_allotment_slot(
+            db,
+            section_ids=[s.id for s in target_sections],
+            subject_id=payload.subject_id,
+            teacher_id=payload.teacher_id,
+            tenant_id=tenant_id,
+        )
+        if slot is None:
+            raise HTTPException(status_code=400, detail="SPECIAL_ALLOTMENT_SLOT_REQUIRED_OR_DEFAULT_NOT_FOUND")
+
     for section in target_sections:
         allowed_subject_ids = set(
             _required_subject_ids_for_section(db, program_id=section.program_id, section=section, tenant_id=tenant_id)
@@ -909,7 +966,7 @@ def upsert_special_allotment(
             where_tenant(
                 select(SpecialAllotment)
                 .where(SpecialAllotment.section_id.in_(target_section_ids))
-                .where(SpecialAllotment.slot_id == payload.slot_id)
+                .where(SpecialAllotment.slot_id == slot.id)
                 .where(SpecialAllotment.is_active.is_(True)),
                 SpecialAllotment,
                 tenant_id,
@@ -955,7 +1012,7 @@ def upsert_special_allotment(
                 subject_id=payload.subject_id,
                 teacher_id=payload.teacher_id,
                 room_id=payload.room_id,
-                slot_id=payload.slot_id,
+                slot_id=slot.id,
                 reason=payload.reason,
                 is_active=True,
             )
@@ -984,7 +1041,7 @@ def upsert_special_allotment(
                 .join(Room, Room.id == SpecialAllotment.room_id)
                 .join(TimeSlot, TimeSlot.id == SpecialAllotment.slot_id)
                 .where(SpecialAllotment.section_id == representative_section_id)
-                .where(SpecialAllotment.slot_id == payload.slot_id)
+                .where(SpecialAllotment.slot_id == slot.id)
                 .where(SpecialAllotment.is_active.is_(True)),
                 SpecialAllotment,
                 tenant_id,

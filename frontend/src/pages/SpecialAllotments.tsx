@@ -138,8 +138,8 @@ export function SpecialAllotments() {
       showToast('Pick a teacher', 2500)
       return
     }
-    if (!form.slot_id || !form.subject_id || !form.target_key || !form.room_id) {
-      showToast('Pick slot, subject, target, and room', 2500)
+    if (!form.subject_id || !form.target_key || !form.room_id) {
+      showToast('Pick subject, target, and room', 2500)
       return
     }
 
@@ -150,7 +150,7 @@ export function SpecialAllotments() {
       await upsertSpecialAllotment({
         section_id: sectionId,
         combined_group_id: combinedGroupId,
-        slot_id: form.slot_id,
+        slot_id: form.slot_id || undefined,
         subject_id: form.subject_id,
         teacher_id: teacherId,
         room_id: form.room_id,
@@ -331,7 +331,7 @@ export function SpecialAllotments() {
         <div className="mt-3 grid gap-3 md:grid-cols-2">
           <div>
             <label className="text-xs font-medium text-slate-600" htmlFor="sa_slot">
-              Time slot
+              Time slot (optional)
             </label>
             <PremiumSelect
               id="sa_slot"
@@ -343,6 +343,7 @@ export function SpecialAllotments() {
               options={slotOptions}
               disabled={!teacherId}
             />
+            <div className="mt-1 text-[11px] text-slate-500">Leave empty to auto-use teacher's normal timetable slot.</div>
           </div>
 
           <div>
