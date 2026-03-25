@@ -2559,6 +2559,13 @@ def _global_solve_body(
             logger.error("_global_solve_body: run %s not found", run_id)
             return
 
+        # Lightweight heartbeat that the worker thread has started.
+        try:
+            run.notes = "SOLVER_WORKER_STARTED"
+            db.commit()
+        except Exception:
+            db.rollback()
+
         q_program = where_tenant(select(Program).where(Program.code == payload.program_code), Program, tenant_id)
         program = db.execute(q_program).scalar_one_or_none()
         if program is None:
@@ -2745,6 +2752,7 @@ def solve_timetable_global(
                 "scope": "PROGRAM_GLOBAL",
                 **({"tenant_id": str(tenant_id)} if tenant_id is not None else {}),
             },
+            notes="SOLVER_QUEUED",
         )
         db.add(run)
         db.flush()
@@ -2754,7 +2762,7 @@ def solve_timetable_global(
         threading.Thread(
             target=_global_solve_body,
             args=(run_id, payload.model_copy(), tenant_id, max_time_seconds),
-            daemon=True,
+            daemon=False,
         ).start()
 
         return SolveTimetableResponse(
