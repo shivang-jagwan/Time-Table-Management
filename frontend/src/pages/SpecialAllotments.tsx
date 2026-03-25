@@ -343,7 +343,7 @@ export function SpecialAllotments() {
               options={slotOptions}
               disabled={!teacherId}
             />
-            <div className="mt-1 text-[11px] text-slate-500">Leave empty to auto-use teacher's normal timetable slot.</div>
+            <div className="mt-1 text-[11px] text-slate-500">Leave empty to auto-use teacher's normal timetable slot. If no history exists, select slot manually.</div>
           </div>
 
           <div>

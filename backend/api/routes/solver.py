@@ -761,131 +761,141 @@ def _resolve_default_special_allotment_slot(
         if slot is not None:
             return slot
 
-    # 2) Prefer historically used normal timetable slot for teacher+subject+sections.
-    q = (
-        select(
-            TimetableEntry.slot_id,
-            func.count(cast(TimetableEntry.section_id, String)).label("section_hits"),
-            func.max(TimetableRun.created_at).label("last_seen"),
+    def _is_slot_feasible(slot: TimeSlot) -> bool:
+        day = int(slot.day_of_week)
+        idx = int(slot.slot_index)
+        if teacher_weekly_off_day is not None and int(teacher_weekly_off_day) == day:
+            return False
+
+        for sec_id in section_ids:
+            w = (
+                db.execute(
+                    where_tenant(
+                        select(SectionTimeWindow)
+                        .where(SectionTimeWindow.section_id == sec_id)
+                        .where(SectionTimeWindow.day_of_week == day)
+                        .limit(1),
+                        SectionTimeWindow,
+                        tenant_id,
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if w is None or idx < int(w.start_slot_index) or idx > int(w.end_slot_index):
+                return False
+
+        fixed_exists = (
+            db.execute(
+                where_tenant(
+                    select(FixedTimetableEntry.id)
+                    .where(FixedTimetableEntry.section_id.in_(section_ids))
+                    .where(FixedTimetableEntry.slot_id == slot.id)
+                    .where(FixedTimetableEntry.is_active.is_(True))
+                    .limit(1),
+                    FixedTimetableEntry,
+                    tenant_id,
+                )
+            ).first()
+            is not None
         )
+        if fixed_exists:
+            return False
+
+        teacher_conflict = (
+            db.execute(
+                where_tenant(
+                    select(SpecialAllotment.id)
+                    .where(SpecialAllotment.teacher_id == teacher_id)
+                    .where(SpecialAllotment.slot_id == slot.id)
+                    .where(SpecialAllotment.is_active.is_(True))
+                    .limit(1),
+                    SpecialAllotment,
+                    tenant_id,
+                )
+            ).first()
+            is not None
+        )
+        if teacher_conflict:
+            return False
+
+        room_conflict = (
+            db.execute(
+                where_tenant(
+                    select(SpecialAllotment.id)
+                    .where(SpecialAllotment.room_id == room_id)
+                    .where(SpecialAllotment.slot_id == slot.id)
+                    .where(SpecialAllotment.is_active.is_(True))
+                    .limit(1),
+                    SpecialAllotment,
+                    tenant_id,
+                )
+            ).first()
+            is not None
+        )
+        return not room_conflict
+
+    status_filter = cast(TimetableRun.status, String).in_([
+        "FEASIBLE",
+        "SUBOPTIMAL",
+        "OPTIMAL",
+    ])
+
+    candidate_slots: list[uuid.UUID] = []
+
+    # 2) Best match: teacher+subject on target sections.
+    q_exact = (
+        select(TimetableEntry.slot_id)
         .join(TimetableRun, TimetableRun.id == TimetableEntry.run_id)
         .where(TimetableEntry.section_id.in_(section_ids))
         .where(TimetableEntry.subject_id == subject_id)
         .where(TimetableEntry.teacher_id == teacher_id)
-        .where(
-            cast(TimetableRun.status, String).in_([
-                "FEASIBLE",
-                "SUBOPTIMAL",
-                "OPTIMAL",
-            ])
-        )
+        .where(status_filter)
         .group_by(TimetableEntry.slot_id)
         .order_by(func.count(cast(TimetableEntry.section_id, String)).desc(), func.max(TimetableRun.created_at).desc())
-        .limit(1)
     )
-    q = where_tenant(q, TimetableEntry, tenant_id)
-    q = where_tenant(q, TimetableRun, tenant_id)
+    q_exact = where_tenant(q_exact, TimetableEntry, tenant_id)
+    q_exact = where_tenant(q_exact, TimetableRun, tenant_id)
+    candidate_slots.extend([sid for (sid,) in db.execute(q_exact).all() if sid is not None])
 
-    row = db.execute(q).first()
-    if row is None:
-        # 3) Fallback: pick first feasible slot from section windows with no current clashes.
-        slots = (
-            db.execute(
-                where_tenant(
-                    select(TimeSlot).order_by(TimeSlot.day_of_week.asc(), TimeSlot.slot_index.asc()),
-                    TimeSlot,
-                    tenant_id,
-                )
-            )
-            .scalars()
-            .all()
-        )
-        for slot in slots:
-            day = int(slot.day_of_week)
-            idx = int(slot.slot_index)
-            if teacher_weekly_off_day is not None and int(teacher_weekly_off_day) == day:
-                continue
+    # 3) Broader: teacher+subject across any sections.
+    q_subject = (
+        select(TimetableEntry.slot_id)
+        .join(TimetableRun, TimetableRun.id == TimetableEntry.run_id)
+        .where(TimetableEntry.subject_id == subject_id)
+        .where(TimetableEntry.teacher_id == teacher_id)
+        .where(status_filter)
+        .group_by(TimetableEntry.slot_id)
+        .order_by(func.count(TimetableEntry.id).desc(), func.max(TimetableRun.created_at).desc())
+    )
+    q_subject = where_tenant(q_subject, TimetableEntry, tenant_id)
+    q_subject = where_tenant(q_subject, TimetableRun, tenant_id)
+    candidate_slots.extend([sid for (sid,) in db.execute(q_subject).all() if sid is not None])
 
-            all_sections_fit = True
-            for sec_id in section_ids:
-                w = (
-                    db.execute(
-                        where_tenant(
-                            select(SectionTimeWindow)
-                            .where(SectionTimeWindow.section_id == sec_id)
-                            .where(SectionTimeWindow.day_of_week == day)
-                            .limit(1),
-                            SectionTimeWindow,
-                            tenant_id,
-                        )
-                    )
-                    .scalars()
-                    .first()
-                )
-                if w is None or idx < int(w.start_slot_index) or idx > int(w.end_slot_index):
-                    all_sections_fit = False
-                    break
-            if not all_sections_fit:
-                continue
+    # 4) Last preference: teacher's normal timetable pattern (any subject).
+    q_teacher = (
+        select(TimetableEntry.slot_id)
+        .join(TimetableRun, TimetableRun.id == TimetableEntry.run_id)
+        .where(TimetableEntry.teacher_id == teacher_id)
+        .where(status_filter)
+        .group_by(TimetableEntry.slot_id)
+        .order_by(func.count(TimetableEntry.id).desc(), func.max(TimetableRun.created_at).desc())
+    )
+    q_teacher = where_tenant(q_teacher, TimetableEntry, tenant_id)
+    q_teacher = where_tenant(q_teacher, TimetableRun, tenant_id)
+    candidate_slots.extend([sid for (sid,) in db.execute(q_teacher).all() if sid is not None])
 
-            fixed_exists = (
-                db.execute(
-                    where_tenant(
-                        select(FixedTimetableEntry.id)
-                        .where(FixedTimetableEntry.section_id.in_(section_ids))
-                        .where(FixedTimetableEntry.slot_id == slot.id)
-                        .where(FixedTimetableEntry.is_active.is_(True))
-                        .limit(1),
-                        FixedTimetableEntry,
-                        tenant_id,
-                    )
-                ).first()
-                is not None
-            )
-            if fixed_exists:
-                continue
-
-            teacher_conflict = (
-                db.execute(
-                    where_tenant(
-                        select(SpecialAllotment.id)
-                        .where(SpecialAllotment.teacher_id == teacher_id)
-                        .where(SpecialAllotment.slot_id == slot.id)
-                        .where(SpecialAllotment.is_active.is_(True))
-                        .limit(1),
-                        SpecialAllotment,
-                        tenant_id,
-                    )
-                ).first()
-                is not None
-            )
-            if teacher_conflict:
-                continue
-
-            room_conflict = (
-                db.execute(
-                    where_tenant(
-                        select(SpecialAllotment.id)
-                        .where(SpecialAllotment.room_id == room_id)
-                        .where(SpecialAllotment.slot_id == slot.id)
-                        .where(SpecialAllotment.is_active.is_(True))
-                        .limit(1),
-                        SpecialAllotment,
-                        tenant_id,
-                    )
-                ).first()
-                is not None
-            )
-            if room_conflict:
-                continue
-
+    seen: set[uuid.UUID] = set()
+    for slot_id in candidate_slots:
+        if slot_id in seen:
+            continue
+        seen.add(slot_id)
+        slot = get_by_id(db, TimeSlot, slot_id, tenant_id)
+        if slot is not None and _is_slot_feasible(slot):
             return slot
 
-        return None
-    slot_id = row[0]
-    if slot_id is None:
-        return None
-    return get_by_id(db, TimeSlot, slot_id, tenant_id)
+    # No teacher-pattern slot could be applied safely.
+    return None
 
 
 @router.get("/special-allotments", response_model=ListSpecialAllotmentsResponse)
