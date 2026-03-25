@@ -64,11 +64,29 @@ export async function pollRunUntilDone(
   timeoutMs = 360_000,
 ): Promise<RunDetail> {
   const deadline = Date.now() + timeoutMs
+  let transientErrors = 0
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, intervalMs))
-    const detail = await getRun(runId)
-    onTick(detail)
-    if (detail.status !== 'RUNNING' && detail.status !== 'CREATED') return detail
+    try {
+      const detail = await getRun(runId)
+      transientErrors = 0
+      onTick(detail)
+      if (detail.status !== 'RUNNING' && detail.status !== 'CREATED') return detail
+    } catch (e: any) {
+      const msg = String(e?.message ?? e)
+      const transientDbError =
+        msg.includes('DATABASE_UNAVAILABLE') ||
+        msg.includes('Database temporarily unavailable') ||
+        msg.includes('Service Unavailable') ||
+        msg.includes('503')
+      if (!transientDbError) {
+        throw e
+      }
+      transientErrors += 1
+      if (transientErrors >= 8) {
+        throw new Error('Solver status check is temporarily unavailable. Please retry in a moment.')
+      }
+    }
   }
   throw new Error('Poll timeout: solver did not complete within the allowed time.')
 }
