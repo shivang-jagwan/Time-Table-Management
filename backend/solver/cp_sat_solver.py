@@ -19,9 +19,15 @@ The heavy lifting is split into sub-modules:
 
 from __future__ import annotations
 
+from collections import defaultdict
+
 from ortools.sat.python import cp_model
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from api.tenant import where_tenant
+from models.section import Section
+from models.timetable_entry import TimetableEntry
 from models.timetable_conflict import TimetableConflict
 from models.timetable_run import TimetableRun
 
@@ -33,6 +39,7 @@ import os
 
 from solver.constraints import add_constraints
 from solver.data_loader import load_all, build_pruned_slots
+from solver.hybrid_initializer import generate_hybrid_hints
 from solver.objective import add_objective
 from solver.pre_solve_locks import apply_pre_solve_locks, check_teacher_window_feasibility
 from solver.result_writer import write_results
@@ -52,6 +59,9 @@ def solve_program_year(
     enforce_teacher_load_limits: bool = True,
     require_optimal: bool = False,
     allow_extended_solve: bool = False,
+    hybrid_init_enabled: bool = False,
+    hybrid_population_size: int = 24,
+    hybrid_generations: int = 20,
 ) -> SolveResult:
     return _solve_program(
         db,
@@ -63,6 +73,9 @@ def solve_program_year(
         enforce_teacher_load_limits=enforce_teacher_load_limits,
         require_optimal=require_optimal,
         allow_extended_solve=allow_extended_solve,
+        hybrid_init_enabled=hybrid_init_enabled,
+        hybrid_population_size=hybrid_population_size,
+        hybrid_generations=hybrid_generations,
     )
 
 
@@ -76,18 +89,155 @@ def solve_program_global(
     enforce_teacher_load_limits: bool = True,
     require_optimal: bool = False,
     allow_extended_solve: bool = False,
+    hybrid_init_enabled: bool = False,
+    hybrid_population_size: int = 24,
+    hybrid_generations: int = 20,
 ) -> SolveResult:
-    """Program-wide solve across all academic years."""
-    return _solve_program(
+    """Program-wide solve across all academic years via decomposed batches.
+
+    Phase-1 scalable architecture: partition by academic year, solve incrementally,
+    and carry teacher slot usage globally across partitions.
+    """
+    return _solve_program_global_decomposed(
         db,
         run=run,
         program_id=program_id,
-        academic_year_id=None,
         seed=seed,
         max_time_seconds=max_time_seconds,
         enforce_teacher_load_limits=enforce_teacher_load_limits,
         require_optimal=require_optimal,
         allow_extended_solve=allow_extended_solve,
+        hybrid_init_enabled=hybrid_init_enabled,
+        hybrid_population_size=hybrid_population_size,
+        hybrid_generations=hybrid_generations,
+    )
+
+
+def _collect_teacher_schedule_map_for_run(
+    db: Session,
+    *,
+    run_id,
+    tenant_id,
+) -> dict[Any, set[Any]]:
+    schedule: dict[Any, set[Any]] = defaultdict(set)
+    q = select(TimetableEntry.teacher_id, TimetableEntry.slot_id).where(TimetableEntry.run_id == run_id)
+    q = where_tenant(q, TimetableEntry, tenant_id)
+    for teacher_id, slot_id in db.execute(q).all():
+        schedule[teacher_id].add(slot_id)
+    return schedule
+
+
+def _solve_program_global_decomposed(
+    db: Session,
+    *,
+    run: TimetableRun,
+    program_id,
+    seed: int | None,
+    max_time_seconds: float,
+    enforce_teacher_load_limits: bool,
+    require_optimal: bool,
+    allow_extended_solve: bool,
+    hybrid_init_enabled: bool,
+    hybrid_population_size: int,
+    hybrid_generations: int,
+) -> SolveResult:
+    tenant_id = getattr(run, "tenant_id", None)
+
+    q_years = (
+        select(Section.academic_year_id)
+        .where(Section.program_id == program_id)
+        .where(Section.is_active.is_(True))
+    )
+    q_years = where_tenant(q_years, Section, tenant_id)
+    year_ids = sorted({year_id for (year_id,) in db.execute(q_years).all() if year_id is not None})
+
+    # Fallback to single-model solve if no year-scoped sections were found.
+    if not year_ids:
+        return _solve_program(
+            db,
+            run=run,
+            program_id=program_id,
+            academic_year_id=None,
+            seed=seed,
+            max_time_seconds=max_time_seconds,
+            enforce_teacher_load_limits=enforce_teacher_load_limits,
+            require_optimal=require_optimal,
+            allow_extended_solve=allow_extended_solve,
+            hybrid_init_enabled=hybrid_init_enabled,
+            hybrid_population_size=hybrid_population_size,
+            hybrid_generations=hybrid_generations,
+        )
+
+    teacher_schedule_map: dict[Any, set[Any]] = defaultdict(set)
+    combined_conflicts: list[TimetableConflict] = []
+    total_entries_written = 0
+    total_warnings: list[str] = []
+    remaining_budget = float(max_time_seconds)
+    last_result: SolveResult | None = None
+
+    for idx, year_id in enumerate(year_ids):
+        batches_left = max(1, len(year_ids) - idx)
+        batch_budget = min(300.0, max(60.0, remaining_budget / batches_left))
+
+        logger.info(
+            "[solver] global decomposed batch=%d/%d year_id=%s budget=%.1fs blocked_teachers=%d",
+            idx + 1,
+            len(year_ids),
+            str(year_id),
+            batch_budget,
+            len(teacher_schedule_map),
+        )
+
+        result = _solve_program(
+            db,
+            run=run,
+            program_id=program_id,
+            academic_year_id=year_id,
+            seed=seed,
+            max_time_seconds=batch_budget,
+            enforce_teacher_load_limits=enforce_teacher_load_limits,
+            require_optimal=require_optimal,
+            allow_extended_solve=allow_extended_solve,
+            clear_existing_entries=(idx == 0),
+            external_teacher_blocked_slot_ids=teacher_schedule_map,
+            hybrid_init_enabled=hybrid_init_enabled,
+            hybrid_population_size=hybrid_population_size,
+            hybrid_generations=hybrid_generations,
+        )
+        last_result = result
+        combined_conflicts.extend(result.conflicts)
+        total_warnings.extend(result.warnings)
+        total_entries_written += int(result.entries_written)
+
+        # Refresh global teacher usage from what has been persisted so far.
+        teacher_schedule_map = _collect_teacher_schedule_map_for_run(
+            db,
+            run_id=run.id,
+            tenant_id=tenant_id,
+        )
+
+        elapsed = float(result.solve_time_seconds or 0.0)
+        remaining_budget = max(60.0, remaining_budget - elapsed)
+
+        if str(result.status) in {"INFEASIBLE", "ERROR", "VALIDATION_FAILED"}:
+            break
+
+    if last_result is None:
+        return SolveResult(status="ERROR", entries_written=0, conflicts=[])
+
+    return SolveResult(
+        status=str(last_result.status),
+        entries_written=total_entries_written,
+        conflicts=combined_conflicts,
+        diagnostics=list(last_result.diagnostics or []),
+        reason_summary=last_result.reason_summary,
+        objective_score=last_result.objective_score,
+        warnings=total_warnings,
+        solver_stats=dict(last_result.solver_stats or {}),
+        best_objective_bound=last_result.best_objective_bound,
+        optimality_gap=last_result.optimality_gap,
+        solve_time_seconds=last_result.solve_time_seconds,
+        message=last_result.message,
     )
 
 
@@ -129,6 +279,11 @@ def _solve_program(
     enforce_teacher_load_limits: bool,
     require_optimal: bool,
     allow_extended_solve: bool = False,
+    clear_existing_entries: bool = True,
+    external_teacher_blocked_slot_ids: dict[Any, set[Any]] | None = None,
+    hybrid_init_enabled: bool = False,
+    hybrid_population_size: int = 24,
+    hybrid_generations: int = 20,
 ) -> SolveResult:
     tenant_id = getattr(run, "tenant_id", None)
 
@@ -144,6 +299,10 @@ def _solve_program(
         require_optimal=require_optimal,
         tenant_id=tenant_id,
     )
+    if external_teacher_blocked_slot_ids:
+        for teacher_id, slot_ids in external_teacher_blocked_slot_ids.items():
+            if slot_ids:
+                ctx.external_teacher_blocked_slot_ids[teacher_id].update(slot_ids)
 
     # 2. Load data
     load_all(ctx)
@@ -185,6 +344,21 @@ def _solve_program(
 
     # 6. Set objective
     add_objective(ctx)
+
+    # 6b. Optional hybrid initialization (GA-style warm hints).
+    if hybrid_init_enabled:
+        try:
+            hints = generate_hybrid_hints(
+                ctx,
+                seed=seed,
+                population_size=int(hybrid_population_size),
+                generations=int(hybrid_generations),
+            )
+            for var, val in hints.items():
+                ctx.model.AddHint(var, int(val))
+            logger.info("[solver] hybrid hints applied: %d", len(hints))
+        except Exception:
+            logger.warning("[solver] hybrid initialization failed; continuing without hints", exc_info=True)
 
     # 7. Search strategy hints — guide CP-SAT to branch on the most
     #    constrained decision variables first (section-slot assignments).
@@ -275,7 +449,7 @@ def _solve_program(
         return _handle_infeasible(ctx, solver, status)
 
     # 10. Write results
-    return write_results(ctx, solver, status)
+    return write_results(ctx, solver, status, clear_existing_entries=clear_existing_entries)
 
 
 def _add_search_hints(ctx: SolverContext) -> None:

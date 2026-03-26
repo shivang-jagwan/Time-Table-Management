@@ -36,16 +36,23 @@ from solver.room_assigner import (
 )
 
 
-def write_results(ctx: SolverContext, solver: cp_model.CpSolver, status: int) -> SolveResult:
+def write_results(
+    ctx: SolverContext,
+    solver: cp_model.CpSolver,
+    status: int,
+    *,
+    clear_existing_entries: bool = True,
+) -> SolveResult:
     """Delete old entries, write all new entries, commit, return SolveResult."""
     db = ctx.db
     run = ctx.run
     tenant_id = ctx.tenant_id
 
-    # Delete previous entries for this run
-    stmt = delete(TimetableEntry).where(TimetableEntry.run_id == run.id)
-    stmt = where_tenant(stmt, TimetableEntry, tenant_id)
-    db.execute(stmt)
+    # Delete previous entries for this run only for the first partition.
+    if clear_existing_entries:
+        stmt = delete(TimetableEntry).where(TimetableEntry.run_id == run.id)
+        stmt = where_tenant(stmt, TimetableEntry, tenant_id)
+        db.execute(stmt)
 
     # Objective score
     try:

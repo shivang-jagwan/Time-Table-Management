@@ -195,6 +195,8 @@ class SolverContext:
     locked_fixed_entry_ids: set[str] = field(default_factory=set)
 
     teacher_disallowed_slot_ids: dict[Any, set[Any]] = field(default_factory=lambda: defaultdict(set))
+    # Cross-batch blocked slots from previously solved partitions.
+    external_teacher_blocked_slot_ids: dict[Any, set[Any]] = field(default_factory=lambda: defaultdict(set))
     # Slots the teacher prefers to avoid (soft window) — used by objective penalty.
     teacher_soft_window_slots: dict[Any, set[Any]] = field(default_factory=dict)
 

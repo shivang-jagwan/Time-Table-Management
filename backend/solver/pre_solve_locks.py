@@ -289,6 +289,10 @@ def _apply_fixed_entries(ctx: SolverContext) -> None:
 
 def _prune_teacher_slots(ctx: SolverContext) -> None:
     """Build teacher_disallowed_slot_ids from locked slots, weekly off days, and time windows."""
+    for teacher_id, blocked_slots in ctx.external_teacher_blocked_slot_ids.items():
+        if blocked_slots:
+            ctx.teacher_disallowed_slot_ids[teacher_id].update(blocked_slots)
+
     for teacher_id, slot_id in ctx.locked_teacher_slots:
         ctx.teacher_disallowed_slot_ids[teacher_id].add(slot_id)
     for teacher_id, teacher in ctx.teacher_by_id.items():

@@ -32,6 +32,10 @@ class SolveTimetableRequest(GenerateTimetableRequest):
     smart_relaxation: bool = False
     # Extended solve: if FEASIBLE after the initial budget, re-run with 2x time
     allow_extended_solve: bool = False
+    # Optional hybrid initialization (GA-style warm start for CP-SAT)
+    hybrid_init_enabled: bool = False
+    hybrid_population_size: int = Field(default=24, ge=4, le=200)
+    hybrid_generations: int = Field(default=20, ge=1, le=500)
 
 
 class SolveGlobalTimetableRequest(GenerateGlobalTimetableRequest):
@@ -42,6 +46,10 @@ class SolveGlobalTimetableRequest(GenerateGlobalTimetableRequest):
     smart_relaxation: bool = False
     # Extended solve: if FEASIBLE after the initial budget, re-run with 2x time
     allow_extended_solve: bool = False
+    # Optional hybrid initialization (GA-style warm start for CP-SAT)
+    hybrid_init_enabled: bool = False
+    hybrid_population_size: int = Field(default=24, ge=4, le=200)
+    hybrid_generations: int = Field(default=20, ge=1, le=500)
 
 
 class SolverConflict(BaseModel):

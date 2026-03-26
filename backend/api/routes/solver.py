@@ -2192,6 +2192,9 @@ def solve_timetable(
                 "max_time_seconds": max_time_seconds,
                 "relax_teacher_load_limits": payload.relax_teacher_load_limits,
                 "require_optimal": payload.require_optimal,
+                "hybrid_init_enabled": bool(getattr(payload, "hybrid_init_enabled", False)),
+                "hybrid_population_size": int(getattr(payload, "hybrid_population_size", 24) or 24),
+                "hybrid_generations": int(getattr(payload, "hybrid_generations", 20) or 20),
                 "scope": "ACADEMIC_YEAR",
                 **({"tenant_id": str(tenant_id)} if tenant_id is not None else {}),
             },
@@ -2370,6 +2373,9 @@ def solve_timetable(
             enforce_teacher_load_limits=not payload.relax_teacher_load_limits,
             require_optimal=payload.require_optimal,
             allow_extended_solve=getattr(payload, "allow_extended_solve", False),
+            hybrid_init_enabled=bool(getattr(payload, "hybrid_init_enabled", False)),
+            hybrid_population_size=int(getattr(payload, "hybrid_population_size", 24) or 24),
+            hybrid_generations=int(getattr(payload, "hybrid_generations", 20) or 20),
         )
 
         # Soft conflicts (warnings) created during solve (e.g., room assignment conflicts).
@@ -2682,6 +2688,9 @@ def _global_solve_body(
             enforce_teacher_load_limits=not payload.relax_teacher_load_limits,
             require_optimal=payload.require_optimal,
             allow_extended_solve=getattr(payload, "allow_extended_solve", False),
+            hybrid_init_enabled=bool(getattr(payload, "hybrid_init_enabled", False)),
+            hybrid_population_size=int(getattr(payload, "hybrid_population_size", 24) or 24),
+            hybrid_generations=int(getattr(payload, "hybrid_generations", 20) or 20),
         )
 
         # Persist solver stats so the polling endpoint can surface them.
@@ -2749,6 +2758,9 @@ def solve_timetable_global(
                 "max_time_seconds": max_time_seconds,
                 "relax_teacher_load_limits": payload.relax_teacher_load_limits,
                 "require_optimal": payload.require_optimal,
+                "hybrid_init_enabled": bool(getattr(payload, "hybrid_init_enabled", False)),
+                "hybrid_population_size": int(getattr(payload, "hybrid_population_size", 24) or 24),
+                "hybrid_generations": int(getattr(payload, "hybrid_generations", 20) or 20),
                 "scope": "PROGRAM_GLOBAL",
                 **({"tenant_id": str(tenant_id)} if tenant_id is not None else {}),
             },
