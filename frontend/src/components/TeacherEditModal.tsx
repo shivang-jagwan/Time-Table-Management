@@ -44,9 +44,6 @@ function validateForm(f: FormState): string[] {
   if (Number.isNaN(f.max_continuous) || f.max_continuous < 1)
     errors.push('Max continuous must be >= 1')
 
-  if (f.max_per_day > 6) errors.push('Max per day cannot exceed 6')
-  if (f.max_per_week > 30) errors.push('Max per week cannot exceed 30')
-
   if (f.max_per_day > f.max_per_week) errors.push('Max per day must be <= Max per week')
   if (f.max_continuous > f.max_per_day) errors.push('Max continuous must be <= Max per day')
 
@@ -322,7 +319,6 @@ export function TeacherEditModal({
                   value={form.max_per_day}
                   onChange={(e) => setForm((f) => (f ? { ...f, max_per_day: Number(e.target.value) } : f))}
                   min={0}
-                  max={6}
                 />
               </div>
               <div>
@@ -336,7 +332,6 @@ export function TeacherEditModal({
                   value={form.max_per_week}
                   onChange={(e) => setForm((f) => (f ? { ...f, max_per_week: Number(e.target.value) } : f))}
                   min={0}
-                  max={30}
                 />
               </div>
             </div>

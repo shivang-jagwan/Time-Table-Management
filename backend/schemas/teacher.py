@@ -33,8 +33,8 @@ class TeacherUpdate(BaseModel):
 class TeacherPut(BaseModel):
     full_name: str = Field(min_length=1)
     weekly_off_day: int | None = Field(default=None, ge=0, le=5)
-    max_per_day: int = Field(default=4, ge=0, le=6)
-    max_per_week: int = Field(default=20, ge=0, le=36)
+    max_per_day: int = Field(default=4, ge=0)
+    max_per_week: int = Field(default=20, ge=0)
     max_continuous: int = Field(default=3, ge=1)
     is_active: bool = True
 

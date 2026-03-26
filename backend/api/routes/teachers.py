@@ -86,10 +86,6 @@ def _validate_teacher_constraints(
 
     if weekly_off_day is not None and not (0 <= int(weekly_off_day) <= 5):
         errors.append("WEEKLY_OFF_DAY_OUT_OF_RANGE")
-    if int(max_per_day) > 6:
-        errors.append("MAX_PER_DAY_EXCEEDS_6")
-    if int(max_per_week) > 36:
-        errors.append("MAX_PER_WEEK_EXCEEDS_36")
     if int(max_per_day) > int(max_per_week):
         errors.append("MAX_PER_DAY_GT_MAX_PER_WEEK")
     if int(max_continuous) > int(max_per_day):
