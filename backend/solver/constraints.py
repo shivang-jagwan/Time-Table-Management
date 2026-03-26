@@ -333,6 +333,7 @@ def _add_section_compactness(ctx: SolverContext) -> None:
             model.Add(gap_penalty == 0).OnlyEnforceIf(any_class.Not())
 
             ctx.internal_gap_terms.append(gap_penalty)
+            ctx.section_gap_terms_by_section_day[(sec_id, int(day))].append(gap_penalty)
 
 
 # ── Teacher constraints ─────────────────────────────────────────────────────
@@ -424,6 +425,7 @@ def _add_subject_day_spread(ctx: SolverContext) -> None:
         model.Add(2 * pv <= total)                        # pv=1 → total >= 2
         model.Add(total <= 1 + pv * (len(day_x) - 1))    # total >= 2 → pv=1
         ctx.subject_spread_penalty_terms.append(pv)
+        ctx.subject_spread_terms_by_section_day[(sec_id, int(day))].append(pv)
 
     # Lab sessions (day_starts with >1 start on same day)
     for (sec_id, subj_id, day), day_starts in ctx.lab_starts_by_sec_subj_day.items():
@@ -437,6 +439,7 @@ def _add_subject_day_spread(ctx: SolverContext) -> None:
         model.Add(2 * pv <= total)
         model.Add(total <= 1 + pv * (len(day_starts) - 1))
         ctx.subject_spread_penalty_terms.append(pv)
+        ctx.subject_spread_terms_by_section_day[(sec_id, int(day))].append(pv)
 
 
 # ── Teacher compactness (soft) ─────────────────────────────────────────────
@@ -493,6 +496,7 @@ def _add_teacher_compactness(ctx: SolverContext) -> None:
                 model.Add(gv + occ_vars[i] <= 1)
                 model.Add(gv >= prefix[i - 1] + suffix[i + 1] - occ_vars[i] - 1)
                 ctx.teacher_gap_terms.append(gv)
+                ctx.teacher_gap_terms_by_teacher_day[(teacher_id, int(day))].append(gv)
 
 
 # ── Daily load balance (soft) ──────────────────────────────────────────────
@@ -544,6 +548,7 @@ def _add_daily_load_balance(ctx: SolverContext) -> None:
         spread = model.NewIntVar(0, 20, f"dspread_{sec_id}")
         model.Add(spread == max_load - min_load)
         ctx.daily_load_balance_terms.append(spread)
+        ctx.daily_balance_terms_by_section[sec_id].append(spread)
 
 
 # ── No consecutive same-subject (hard, THEORY only) ────────────────────────

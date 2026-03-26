@@ -55,6 +55,8 @@ def load_all(ctx: SolverContext) -> None:
     q_sections = where_tenant(q_sections, Section, tenant_id)
     if academic_year_id is not None:
         q_sections = q_sections.where(Section.academic_year_id == academic_year_id)
+    if ctx.section_id_subset:
+        q_sections = q_sections.where(Section.id.in_(list(ctx.section_id_subset)))
 
     ctx.sections = db.execute(q_sections.order_by(Section.code)).scalars().all()
     ctx.section_year_by_id = {s.id: s.academic_year_id for s in ctx.sections}

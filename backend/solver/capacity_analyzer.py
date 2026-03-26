@@ -28,6 +28,8 @@ from models.track_subject import TrackSubject
 
 from models.combined_subject_group import CombinedSubjectGroup
 from models.combined_subject_section import CombinedSubjectSection
+from models.elective_block_subject import ElectiveBlockSubject
+from models.section_elective_block import SectionElectiveBlock
 from models.subject_allowed_room import SubjectAllowedRoom
 
 
@@ -57,6 +59,8 @@ def build_capacity_data(
     mapped_subject_ids_by_section: dict[Any, list[Any]] = defaultdict(list)
     sessions_per_week_by_section_subject: dict[tuple[Any, Any], int] = {}
     lab_block_by_section_subject: dict[tuple[Any, Any], int] = {}
+    blocks_by_section: dict[Any, list[Any]] = defaultdict(list)
+    block_subject_pairs_by_block: dict[Any, list[tuple[Any, Any]]] = defaultdict(list)
     if section_ids:
         q_sec_subj = select(SectionSubject.section_id, SectionSubject.subject_id).where(
             SectionSubject.section_id.in_(section_ids)
@@ -127,6 +131,37 @@ def build_capacity_data(
                         getattr(row, "sessions_override", None) if getattr(row, "sessions_override", None) is not None else fallback_sessions
                     )
                     lab_block_by_section_subject[(sec_id, row.subject_id)] = int(getattr(subj, "lab_block_size_slots", 1) or 1)
+
+    # Elective blocks and their (subject, teacher) pairs.
+    if section_ids and table_exists(db, "section_elective_blocks") and table_exists(db, "elective_block_subjects"):
+        block_rows = db.execute(
+            where_tenant(
+                select(SectionElectiveBlock.section_id, SectionElectiveBlock.block_id).where(
+                    SectionElectiveBlock.section_id.in_(section_ids)
+                ),
+                SectionElectiveBlock,
+                tenant_id,
+            )
+        ).all()
+        block_ids: set[Any] = set()
+        for sec_id, block_id in block_rows:
+            blocks_by_section[sec_id].append(block_id)
+            block_ids.add(block_id)
+
+        if block_ids:
+            pair_rows = db.execute(
+                where_tenant(
+                    select(
+                        ElectiveBlockSubject.block_id,
+                        ElectiveBlockSubject.subject_id,
+                        ElectiveBlockSubject.teacher_id,
+                    ).where(ElectiveBlockSubject.block_id.in_(sorted(block_ids, key=lambda x: str(x)))),
+                    ElectiveBlockSubject,
+                    tenant_id,
+                )
+            ).all()
+            for block_id, subj_id, teacher_id in pair_rows:
+                block_subject_pairs_by_block[block_id].append((subj_id, teacher_id))
 
     # Assigned teacher per (section, subject)
     assigned_teacher_by_section_subject: dict[tuple[Any, Any], Any] = {}
@@ -243,6 +278,8 @@ def build_capacity_data(
         "mapped_subject_ids_by_section": mapped_subject_ids_by_section,
         "sessions_per_week_by_section_subject": sessions_per_week_by_section_subject,
         "lab_block_by_section_subject": lab_block_by_section_subject,
+        "blocks_by_section": dict(blocks_by_section),
+        "block_subject_pairs_by_block": dict(block_subject_pairs_by_block),
         "allowed_rooms_by_subject": dict(allowed_rooms_by_subject),
     }
 
@@ -264,6 +301,8 @@ def analyze_capacity(data: dict[str, Any], debug: bool = False) -> dict[str, Any
         data.get("sessions_per_week_by_section_subject") or {}
     )
     lab_block_by_section_subject: dict[tuple[Any, Any], int] = dict(data.get("lab_block_by_section_subject") or {})
+    blocks_by_section: dict[Any, list[Any]] = dict(data.get("blocks_by_section") or {})
+    block_subject_pairs_by_block: dict[Any, list[tuple[Any, Any]]] = dict(data.get("block_subject_pairs_by_block") or {})
     assigned_teacher_by_section_subject: dict[tuple[Any, Any], Any] = dict(data.get("assigned_teacher_by_section_subject") or {})
     fixed_entries: list[Any] = list(data.get("fixed_entries") or [])
     special_allotments: list[Any] = list(data.get("special_allotments") or [])
@@ -415,6 +454,30 @@ def analyze_capacity(data: dict[str, Any], debug: bool = False) -> dict[str, Any
                     "slots": int(slots_needed),
                 }
             )
+
+    # Elective blocks add explicit teacher demand per section.
+    for sec_id, block_ids in blocks_by_section.items():
+        for block_id in block_ids or []:
+            for subj_id, tid in block_subject_pairs_by_block.get(block_id, []) or []:
+                if tid is None:
+                    continue
+                subj = subject_by_id.get(subj_id)
+                if subj is None:
+                    continue
+                spw = int(getattr(subj, "sessions_per_week", 0) or 0)
+                if spw <= 0:
+                    continue
+                slots_needed = int(_slots_for_subject(subj, spw))
+                required_by_teacher[tid] += int(slots_needed)
+                teacher_contrib[tid].append(
+                    {
+                        "source": "ELECTIVE_BLOCK",
+                        "block_id": str(block_id),
+                        "section_code": getattr(section_by_id.get(sec_id), "code", None),
+                        "subject_code": getattr(subj, "code", None),
+                        "slots": int(slots_needed),
+                    }
+                )
 
     # 2) Available capacity per Teacher/Room type/Section
     available_by_teacher: dict[Any, int] = {}

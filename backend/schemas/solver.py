@@ -36,6 +36,9 @@ class SolveTimetableRequest(GenerateTimetableRequest):
     hybrid_init_enabled: bool = False
     hybrid_population_size: int = Field(default=24, ge=4, le=200)
     hybrid_generations: int = Field(default=20, ge=1, le=500)
+    multi_seed_restarts: int = Field(default=1, ge=1, le=20)
+    lns_iterations: int = Field(default=0, ge=0, le=10)
+    lns_keep_fraction: float = Field(default=0.7, ge=0.0, le=1.0)
 
 
 class SolveGlobalTimetableRequest(GenerateGlobalTimetableRequest):
@@ -50,6 +53,9 @@ class SolveGlobalTimetableRequest(GenerateGlobalTimetableRequest):
     hybrid_init_enabled: bool = False
     hybrid_population_size: int = Field(default=24, ge=4, le=200)
     hybrid_generations: int = Field(default=20, ge=1, le=500)
+    multi_seed_restarts: int = Field(default=1, ge=1, le=20)
+    lns_iterations: int = Field(default=0, ge=0, le=10)
+    lns_keep_fraction: float = Field(default=0.7, ge=0.0, le=1.0)
 
 
 class SolverConflict(BaseModel):
@@ -110,6 +116,7 @@ class RunSummary(BaseModel):
 class RunDetail(RunSummary):
     conflicts_total: int = 0
     entries_total: int = 0
+    lns_telemetry: dict[str, Any] | None = None
 
 
 class TimetableEntryOut(BaseModel):

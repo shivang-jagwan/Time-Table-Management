@@ -925,6 +925,28 @@ def validate_prereqs(
                     teacher_affected_sections[teacher_id].add(sid)
                 teacher_affected_subjects[teacher_id].add(subj_id)
 
+            # 3) Count elective-block teacher demand per section.
+            # This catches overload patterns that can be missed when sections use
+            # elective blocks (especially with mixed/legacy configurations).
+            if use_elective_blocks and section_ids:
+                for section in sections:
+                    sec_id = section.id
+                    for bid in blocks_by_section.get(sec_id, []):
+                        for subj_id, teacher_id in block_subjects_by_block.get(bid, []):
+                            if teacher_id is None:
+                                continue
+                            subj = subj_by_id.get(subj_id)
+                            if subj is None:
+                                continue
+                            spw = int(getattr(subj, "sessions_per_week", 0) or 0)
+                            if spw <= 0:
+                                continue
+                            block = int(getattr(subj, "lab_block_size_slots", 1) or 1)
+                            slots = spw * max(block, 1) if str(getattr(subj, "subject_type", "")).upper() == "LAB" else spw
+                            teacher_required_slots[teacher_id] += int(slots)
+                            teacher_affected_sections[teacher_id].add(sec_id)
+                            teacher_affected_subjects[teacher_id].add(subj_id)
+
             for teacher_id, required in teacher_required_slots.items():
                 teacher = teacher_by_id.get(teacher_id)
                 if teacher is None:

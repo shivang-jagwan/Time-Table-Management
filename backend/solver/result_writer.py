@@ -17,7 +17,7 @@ from collections import defaultdict
 from typing import Any
 
 from ortools.sat.python import cp_model
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 
 from api.tenant import where_tenant
@@ -34,6 +34,38 @@ from solver.room_assigner import (
     reserve_locked_rooms,
     room_conflict_group_id,
 )
+
+
+def _bootstrap_existing_run_occupancy(ctx: SolverContext) -> None:
+    """Seed room/section/teacher occupancy sets from already persisted run entries.
+
+    Needed for decomposed global solves where later batches append to the same run.
+    """
+    q = select(
+        TimetableEntry.section_id,
+        TimetableEntry.teacher_id,
+        TimetableEntry.room_id,
+        TimetableEntry.slot_id,
+        TimetableEntry.combined_class_id,
+        TimetableEntry.elective_block_id,
+    ).where(TimetableEntry.run_id == ctx.run.id)
+    q = where_tenant(q, TimetableEntry, ctx.tenant_id)
+
+    for section_id, teacher_id, room_id, slot_id, combined_class_id, elective_block_id in ctx.db.execute(q).all():
+        sid = str(slot_id)
+        rid = str(room_id)
+        ctx.used_rooms_by_slot[sid].add(rid)
+
+        if combined_class_id is None:
+            ctx.seen_uncombined_room_slot.add((rid, sid))
+
+        if elective_block_id is None:
+            ctx.seen_non_elective_section_slot.add((str(section_id), sid))
+
+        tk = (str(teacher_id), sid)
+        combined_key = str(combined_class_id) if combined_class_id is not None else None
+        if tk not in ctx.seen_teacher_slot_event:
+            ctx.seen_teacher_slot_event[tk] = combined_key
 
 
 def write_results(
@@ -53,6 +85,8 @@ def write_results(
         stmt = delete(TimetableEntry).where(TimetableEntry.run_id == run.id)
         stmt = where_tenant(stmt, TimetableEntry, tenant_id)
         db.execute(stmt)
+    else:
+        _bootstrap_existing_run_occupancy(ctx)
 
     # Objective score
     try:

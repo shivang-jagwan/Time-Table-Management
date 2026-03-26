@@ -1434,16 +1434,54 @@ def get_run(
     )
     entries_total = db.execute(q_entries_total).scalar_one() or 0
 
+    params = run.parameters or {}
+    raw_telemetry = params.get("_lns_telemetry") if isinstance(params, dict) else None
+    lns_telemetry: dict[str, Any] | None = None
+    if isinstance(raw_telemetry, dict):
+        rows = raw_telemetry.get("lns_iterations")
+        accepted_count = 0
+        total_gain = 0
+        iter_count = 0
+        if isinstance(rows, list):
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                iter_count += 1
+                accepted_count += 1 if bool(row.get("accepted")) else 0
+                gain = row.get("objective_gain")
+                if isinstance(gain, (int, float)):
+                    total_gain += int(gain)
+
+        strategy_scores = raw_telemetry.get("strategy_scores")
+        best_strategy: str | None = None
+        if isinstance(strategy_scores, dict) and strategy_scores:
+            best_strategy = str(
+                max(strategy_scores.items(), key=lambda item: float(item[1]))[0]
+            )
+
+        lns_telemetry = {
+            "multi_start_count": raw_telemetry.get("multi_start_count"),
+            "lns_iterations_requested": raw_telemetry.get("lns_iterations_requested"),
+            "lns_iterations_executed": iter_count,
+            "accepted_iterations": accepted_count,
+            "total_objective_gain": total_gain,
+            "avg_objective_gain": (float(total_gain) / float(iter_count) if iter_count > 0 else 0.0),
+            "selected_seed": raw_telemetry.get("selected_seed"),
+            "best_strategy": best_strategy,
+            "strategy_scores": strategy_scores if isinstance(strategy_scores, dict) else {},
+        }
+
     return RunDetail(
         id=run.id,
         created_at=run.created_at,
         status=str(run.status),
         solver_version=run.solver_version,
         seed=run.seed,
-        parameters=run.parameters or {},
+        parameters=params,
         notes=run.notes,
         conflicts_total=int(conflicts_total),
         entries_total=int(entries_total),
+        lns_telemetry=lns_telemetry,
     )
 
 
@@ -2195,6 +2233,9 @@ def solve_timetable(
                 "hybrid_init_enabled": bool(getattr(payload, "hybrid_init_enabled", False)),
                 "hybrid_population_size": int(getattr(payload, "hybrid_population_size", 24) or 24),
                 "hybrid_generations": int(getattr(payload, "hybrid_generations", 20) or 20),
+                "multi_seed_restarts": int(getattr(payload, "multi_seed_restarts", 1) or 1),
+                "lns_iterations": int(getattr(payload, "lns_iterations", 0) or 0),
+                "lns_keep_fraction": float(getattr(payload, "lns_keep_fraction", 0.7) or 0.7),
                 "scope": "ACADEMIC_YEAR",
                 **({"tenant_id": str(tenant_id)} if tenant_id is not None else {}),
             },
@@ -2376,6 +2417,9 @@ def solve_timetable(
             hybrid_init_enabled=bool(getattr(payload, "hybrid_init_enabled", False)),
             hybrid_population_size=int(getattr(payload, "hybrid_population_size", 24) or 24),
             hybrid_generations=int(getattr(payload, "hybrid_generations", 20) or 20),
+            multi_seed_restarts=int(getattr(payload, "multi_seed_restarts", 1) or 1),
+            lns_iterations=int(getattr(payload, "lns_iterations", 0) or 0),
+            lns_keep_fraction=float(getattr(payload, "lns_keep_fraction", 0.7) or 0.7),
         )
 
         # Soft conflicts (warnings) created during solve (e.g., room assignment conflicts).
@@ -2691,6 +2735,9 @@ def _global_solve_body(
             hybrid_init_enabled=bool(getattr(payload, "hybrid_init_enabled", False)),
             hybrid_population_size=int(getattr(payload, "hybrid_population_size", 24) or 24),
             hybrid_generations=int(getattr(payload, "hybrid_generations", 20) or 20),
+            multi_seed_restarts=int(getattr(payload, "multi_seed_restarts", 1) or 1),
+            lns_iterations=int(getattr(payload, "lns_iterations", 0) or 0),
+            lns_keep_fraction=float(getattr(payload, "lns_keep_fraction", 0.7) or 0.7),
         )
 
         # Persist solver stats so the polling endpoint can surface them.
@@ -2761,6 +2808,9 @@ def solve_timetable_global(
                 "hybrid_init_enabled": bool(getattr(payload, "hybrid_init_enabled", False)),
                 "hybrid_population_size": int(getattr(payload, "hybrid_population_size", 24) or 24),
                 "hybrid_generations": int(getattr(payload, "hybrid_generations", 20) or 20),
+                "multi_seed_restarts": int(getattr(payload, "multi_seed_restarts", 1) or 1),
+                "lns_iterations": int(getattr(payload, "lns_iterations", 0) or 0),
+                "lns_keep_fraction": float(getattr(payload, "lns_keep_fraction", 0.7) or 0.7),
                 "scope": "PROGRAM_GLOBAL",
                 **({"tenant_id": str(tenant_id)} if tenant_id is not None else {}),
             },

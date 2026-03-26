@@ -71,6 +71,8 @@ class SolveResult:
         optimality_gap: int | None = None,
         solve_time_seconds: float | None = None,
         message: str | None = None,
+        solution_hints: dict | None = None,
+        lns_feedback: dict | None = None,
     ):
         self.status = status
         self.entries_written = entries_written
@@ -84,6 +86,8 @@ class SolveResult:
         self.optimality_gap = optimality_gap
         self.solve_time_seconds = solve_time_seconds
         self.message = message
+        self.solution_hints = solution_hints or {}
+        self.lns_feedback = lns_feedback or {}
 
 
 @dataclass
@@ -100,6 +104,7 @@ class SolverContext:
     enforce_teacher_load_limits: bool
     require_optimal: bool
     tenant_id: Any | None = None
+    section_id_subset: set[Any] | None = None
 
     # --- Loaded data ---------------------------------------------------------
     sections: list[Section] = field(default_factory=list)
@@ -241,6 +246,20 @@ class SolverContext:
 
     # Subject day-spread penalty terms (soft: penalise >1 session of same subject on same day)
     subject_spread_penalty_terms: list[Any] = field(default_factory=list)
+
+    # Objective attribution maps for adaptive LNS.
+    section_gap_terms_by_section_day: dict[tuple[Any, int], list[Any]] = field(
+        default_factory=lambda: defaultdict(list)
+    )
+    teacher_gap_terms_by_teacher_day: dict[tuple[Any, int], list[Any]] = field(
+        default_factory=lambda: defaultdict(list)
+    )
+    subject_spread_terms_by_section_day: dict[tuple[Any, int], list[Any]] = field(
+        default_factory=lambda: defaultdict(list)
+    )
+    daily_balance_terms_by_section: dict[Any, list[Any]] = field(
+        default_factory=lambda: defaultdict(list)
+    )
 
     # Teacher compactness gap terms (soft: penalise teacher internal gaps)
     teacher_gap_terms: list[Any] = field(default_factory=list)
