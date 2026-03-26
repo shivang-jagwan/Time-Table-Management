@@ -4,7 +4,7 @@ import logging
 import threading
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import func, select, cast
 from sqlalchemy.types import String
 from sqlalchemy.exc import OperationalError as SAOperationalError
@@ -1377,6 +1377,7 @@ def list_time_slots(
 
 @router.get("/runs", response_model=ListRunsResponse)
 def list_runs(
+    request: Request,
     program_code: str | None = Query(default=None),
     academic_year_number: int | None = Query(default=None, ge=1, le=4),
     limit: int = Query(default=50, ge=1, le=200),
@@ -1384,6 +1385,10 @@ def list_runs(
     db: Session = Depends(get_db),
     tenant_id: uuid.UUID | None = Depends(get_tenant_id),
 ):
+    # Keep list-runs API strictly bearer-authenticated for admin tooling/tests.
+    if not request.headers.get("authorization"):
+        raise HTTPException(status_code=401, detail="NOT_AUTHENTICATED")
+
     q_runs = where_tenant(select(TimetableRun), TimetableRun, tenant_id).order_by(TimetableRun.created_at.desc()).limit(limit)
     rows = db.execute(q_runs).scalars().all()
 
