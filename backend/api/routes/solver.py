@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import logging
+import csv
+import io
 import threading
 import uuid
+from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from sqlalchemy import func, select, cast
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from sqlalchemy import delete, func, select, cast
 from sqlalchemy.types import String
 from sqlalchemy.exc import OperationalError as SAOperationalError
 from sqlalchemy.exc import IntegrityError
@@ -57,6 +60,8 @@ from schemas.solver import (
     RunDetail,
     RunSummary,
     ListTimeSlotsResponse,
+    TeacherLoadAdjustmentReportResponse,
+    TeacherLoadAdjustmentRow,
     SolveTimetableRequest,
     SolveGlobalTimetableRequest,
     SolveTimetableResponse,
@@ -82,6 +87,106 @@ from solver.capacity_analyzer import build_capacity_data, analyze_capacity
 router = APIRouter()
 
 logger = logging.getLogger(__name__)
+
+
+def _persist_teacher_load_adjustment_report_for_run(
+    db: Session,
+    *,
+    run: TimetableRun,
+    tenant_id: uuid.UUID | None,
+) -> None:
+    """Persist per-teacher load adjustment rows as structured conflicts for one run."""
+    q_delete = delete(TimetableConflict).where(
+        TimetableConflict.run_id == run.id,
+        TimetableConflict.conflict_type == "TEACHER_LOAD_ADJUSTMENT",
+    )
+    q_delete = where_tenant(q_delete, TimetableConflict, tenant_id)
+    db.execute(q_delete)
+
+    q_load = (
+        select(TimetableEntry.teacher_id, func.count(TimetableEntry.id))
+        .where(TimetableEntry.run_id == run.id)
+        .group_by(TimetableEntry.teacher_id)
+    )
+    q_load = where_tenant(q_load, TimetableEntry, tenant_id)
+    load_by_teacher = {teacher_id: int(cnt or 0) for teacher_id, cnt in db.execute(q_load).all()}
+
+    if not load_by_teacher:
+        return
+
+    teacher_ids = list(load_by_teacher.keys())
+    q_teachers = where_tenant(select(Teacher).where(Teacher.id.in_(teacher_ids)), Teacher, tenant_id)
+    teachers = db.execute(q_teachers).scalars().all()
+
+    for teacher in teachers:
+        assigned_load = int(load_by_teacher.get(teacher.id, 0) or 0)
+        original_limit = int(getattr(teacher, "max_per_week", 0) or 0)
+        extended_limit = max(original_limit, assigned_load)
+        overload = max(0, assigned_load - original_limit)
+        payload = {
+            "teacher_id": str(teacher.id),
+            "teacher_code": str(getattr(teacher, "code", "") or ""),
+            "teacher_name": str(getattr(teacher, "full_name", "") or ""),
+            "original_limit": int(original_limit),
+            "assigned_load": int(assigned_load),
+            "extended_limit": int(extended_limit),
+            "overload": int(overload),
+        }
+        db.add(
+            TimetableConflict(
+                tenant_id=tenant_id,
+                run_id=run.id,
+                severity=("WARN" if overload > 0 else "INFO"),
+                conflict_type="TEACHER_LOAD_ADJUSTMENT",
+                message=(
+                    f"Teacher load auto-adjusted by +{overload}."
+                    if overload > 0
+                    else "Teacher load within configured weekly limit."
+                ),
+                teacher_id=teacher.id,
+                details_json=payload,
+                metadata_json=payload,
+            )
+        )
+
+
+def _get_teacher_load_adjustment_rows(
+    db: Session,
+    *,
+    run_id: uuid.UUID,
+    tenant_id: uuid.UUID | None,
+) -> list[TeacherLoadAdjustmentRow]:
+    q = (
+        select(TimetableConflict)
+        .where(TimetableConflict.run_id == run_id)
+        .where(TimetableConflict.conflict_type == "TEACHER_LOAD_ADJUSTMENT")
+        .order_by(TimetableConflict.created_at.asc())
+    )
+    q = where_tenant(q, TimetableConflict, tenant_id)
+    rows = db.execute(q).scalars().all()
+
+    report_rows: list[TeacherLoadAdjustmentRow] = []
+    for c in rows:
+        payload = c.details_json or c.metadata_json or {}
+        teacher_id = payload.get("teacher_id")
+        try:
+            teacher_uuid = uuid.UUID(str(teacher_id)) if teacher_id else c.teacher_id
+        except Exception:
+            teacher_uuid = c.teacher_id
+        report_rows.append(
+            TeacherLoadAdjustmentRow(
+                teacher_id=teacher_uuid,
+                teacher_code=payload.get("teacher_code"),
+                teacher_name=payload.get("teacher_name"),
+                original_limit=int(payload.get("original_limit", 0) or 0),
+                assigned_load=int(payload.get("assigned_load", 0) or 0),
+                extended_limit=int(payload.get("extended_limit", 0) or 0),
+                overload=int(payload.get("overload", 0) or 0),
+            )
+        )
+
+    report_rows.sort(key=lambda r: (-int(r.overload), str(r.teacher_name or ""), str(r.teacher_code or "")))
+    return report_rows
 
 
 def _required_subject_ids_for_section(
@@ -1414,6 +1519,74 @@ def list_runs(
     return ListRunsResponse(runs=runs)
 
 
+@router.get("/reports/teacher-load-adjustments", response_model=TeacherLoadAdjustmentReportResponse)
+def get_teacher_load_adjustment_report(
+    run_id: uuid.UUID | None = Query(default=None),
+    format: str = Query(default="json"),
+    _admin=Depends(require_admin),
+    db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
+):
+    chosen_run_id = run_id
+    if chosen_run_id is None:
+        q_latest = (
+            select(TimetableRun.id)
+            .order_by(TimetableRun.created_at.desc())
+            .limit(1)
+        )
+        q_latest = where_tenant(q_latest, TimetableRun, tenant_id)
+        chosen_run_id = db.execute(q_latest).scalar_one_or_none()
+        if chosen_run_id is None:
+            raise HTTPException(status_code=404, detail="RUN_NOT_FOUND")
+
+    run = get_by_id(db, TimetableRun, chosen_run_id, tenant_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="RUN_NOT_FOUND")
+
+    report_rows = _get_teacher_load_adjustment_rows(
+        db,
+        run_id=chosen_run_id,
+        tenant_id=tenant_id,
+    )
+
+    if format.lower() == "csv":
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow([
+            "Teacher ID",
+            "Name",
+            "Code",
+            "Original Limit",
+            "Assigned Load",
+            "Extended Limit",
+            "Overload",
+        ])
+        for row in report_rows:
+            writer.writerow([
+                str(row.teacher_id) if row.teacher_id is not None else "",
+                row.teacher_name or "",
+                row.teacher_code or "",
+                int(row.original_limit),
+                int(row.assigned_load),
+                int(row.extended_limit),
+                int(row.overload),
+            ])
+        filename = f"teacher-load-adjustments-{chosen_run_id}.csv"
+        return Response(
+            content=buf.getvalue(),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
+        )
+
+    adjusted_count = sum(1 for row in report_rows if int(row.overload) > 0)
+    return TeacherLoadAdjustmentReportResponse(
+        run_id=chosen_run_id,
+        total_teachers=len(report_rows),
+        adjusted_teachers=adjusted_count,
+        rows=report_rows,
+    )
+
+
 @router.get("/runs/{run_id}", response_model=RunDetail)
 def get_run(
     run_id: uuid.UUID,
@@ -2354,8 +2527,9 @@ def solve_timetable(
 
         issue_types = {i.get("type") for i in cap.get("issues", [])}
         only_teacher_overload = bool(issue_types) and issue_types.issubset({"CAPACITY_OVERLOAD"})
+        blocking_issues = [i for i in cap.get("issues", []) if i.get("type") != "CAPACITY_OVERLOAD"]
 
-        if cap.get("issues") and not payload.relax_teacher_load_limits and not (
+        if blocking_issues and not payload.relax_teacher_load_limits and not (
             getattr(payload, "smart_relaxation", False) and only_teacher_overload
         ):
             run.status = "VALIDATION_FAILED"
@@ -2363,7 +2537,7 @@ def solve_timetable(
             return SolveTimetableResponse(
                 run_id=run.id,
                 status="FAILED_VALIDATION",
-                reason_summary=f"Capacity analysis found {len(cap['issues'])} blocking shortages",
+                reason_summary=f"Capacity analysis found {len(blocking_issues)} blocking shortages",
                 diagnostics=capacity_diagnostics,
                 minimal_relaxation=cap.get("minimal_relaxation", []),
                 conflicts=[
@@ -2374,7 +2548,7 @@ def solve_timetable(
                         details={k: v for k, v in i.items() if k not in {"type", "required_slots", "available_slots", "shortage", "resource"}},
                         metadata={k: v for k, v in i.items() if k not in {"type"}},
                     )
-                    for i in cap.get("issues", [])
+                    for i in blocking_issues
                 ],
             )
 
@@ -2426,6 +2600,14 @@ def solve_timetable(
             lns_iterations=int(getattr(payload, "lns_iterations", 0) or 0),
             lns_keep_fraction=float(getattr(payload, "lns_keep_fraction", 0.7) or 0.7),
         )
+
+        if str(result.status) in {"FEASIBLE", "SUBOPTIMAL", "OPTIMAL"}:
+            _persist_teacher_load_adjustment_report_for_run(
+                db,
+                run=run,
+                tenant_id=tenant_id,
+            )
+            db.commit()
 
         # Soft conflicts (warnings) created during solve (e.g., room assignment conflicts).
         soft_conflicts: list[TimetableConflict] = []
@@ -2692,12 +2874,13 @@ def _global_solve_body(
 
         issue_types = {i.get("type") for i in cap.get("issues", [])}
         only_teacher_overload = bool(issue_types) and issue_types.issubset({"CAPACITY_OVERLOAD"})
+        blocking_issues = [i for i in cap.get("issues", []) if i.get("type") != "CAPACITY_OVERLOAD"]
 
-        if cap.get("issues") and not payload.relax_teacher_load_limits and not (
+        if blocking_issues and not payload.relax_teacher_load_limits and not (
             getattr(payload, "smart_relaxation", False) and only_teacher_overload
         ):
             run.status = "VALIDATION_FAILED"
-            run.notes = f"Capacity analysis found {len(cap['issues'])} blocking shortages"
+            run.notes = f"Capacity analysis found {len(blocking_issues)} blocking shortages"
             db.commit()
             return
 
@@ -2744,6 +2927,13 @@ def _global_solve_body(
             lns_iterations=int(getattr(payload, "lns_iterations", 0) or 0),
             lns_keep_fraction=float(getattr(payload, "lns_keep_fraction", 0.7) or 0.7),
         )
+
+        if str(result.status) in {"FEASIBLE", "SUBOPTIMAL", "OPTIMAL"}:
+            _persist_teacher_load_adjustment_report_for_run(
+                db,
+                run=run,
+                tenant_id=tenant_id,
+            )
 
         # Persist solver stats so the polling endpoint can surface them.
         try:

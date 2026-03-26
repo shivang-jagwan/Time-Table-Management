@@ -22,6 +22,7 @@ def add_objective(ctx: SolverContext) -> None:
     W_SUBJECT_SPREAD   = 400   # spreading subjects across days aids learning
     W_TEACHER_GAP      = 300   # reduce wasted teacher wait-time
     W_DAILY_BALANCE    = 300   # even-out heavy vs light days
+    W_TEACHER_OVERLOAD = 700   # discourage weekly overflow but keep model feasible
     W_LATE_SLOT        =  10   # 10 × slot_index: penalise later time slots
     W_FRIDAY_LAST      =  50   # flat penalty per class in the last slot on Friday
 
@@ -45,6 +46,11 @@ def add_objective(ctx: SolverContext) -> None:
     if ctx.subject_spread_penalty_terms:
         for pv in ctx.subject_spread_penalty_terms:
             tier_primary.append(pv * W_SUBJECT_SPREAD)
+
+    # ── 2b. Teacher weekly overload penalty ─────────────────────────────
+    if ctx.teacher_weekly_overload_terms:
+        for ov in ctx.teacher_weekly_overload_terms:
+            tier_primary.append(ov * W_TEACHER_OVERLOAD)
 
     # ── 3. Teacher internal gaps ─────────────────────────────────────────
     if ctx.teacher_gap_terms:

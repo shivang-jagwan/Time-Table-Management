@@ -119,6 +119,23 @@ class RunDetail(RunSummary):
     lns_telemetry: dict[str, Any] | None = None
 
 
+class TeacherLoadAdjustmentRow(BaseModel):
+    teacher_id: uuid.UUID | None = None
+    teacher_code: str | None = None
+    teacher_name: str | None = None
+    original_limit: int
+    assigned_load: int
+    extended_limit: int
+    overload: int
+
+
+class TeacherLoadAdjustmentReportResponse(BaseModel):
+    run_id: uuid.UUID
+    total_teachers: int = 0
+    adjusted_teachers: int = 0
+    rows: list[TeacherLoadAdjustmentRow] = Field(default_factory=list)
+
+
 class TimetableEntryOut(BaseModel):
     id: uuid.UUID
     run_id: uuid.UUID

@@ -958,7 +958,8 @@ def validate_prereqs(
                     conflicts.append(
                         ValidationConflict(
                             conflict_type="TEACHER_LOAD_EXCEEDS_MAX_PER_WEEK",
-                            message="Assigned teaching load exceeds teacher.max_per_week; solve will be infeasible.",
+                            message="Assigned teaching load exceeds teacher.max_per_week; dynamic adjustment will extend effective weekly capacity.",
+                            severity="WARN",
                             teacher_id=teacher_id,
                             metadata={
                                 "teacher_id": str(teacher_id),

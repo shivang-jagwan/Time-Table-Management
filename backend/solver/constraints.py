@@ -387,7 +387,16 @@ def _add_teacher_load_limits(ctx: SolverContext) -> None:
     for teacher_id, teacher in ctx.teacher_by_id.items():
         all_terms = ctx.teacher_all_terms.get(teacher_id, [])
         if all_terms:
-            model.Add(sum(all_terms) <= int(teacher.max_per_week))
+            max_per_week = int(getattr(teacher, "max_per_week", 0) or 0)
+            max_total = 0
+            for term in all_terms:
+                max_total += int(term) if isinstance(term, int) else 1
+
+            overflow_ub = max(0, int(max_total) - int(max_per_week))
+            overflow = model.NewIntVar(0, overflow_ub, f"t_weekly_overflow_{teacher_id}")
+            model.Add(sum(all_terms) <= int(max_per_week) + overflow)
+            ctx.teacher_weekly_overload_terms.append(overflow)
+            ctx.teacher_weekly_overload_by_teacher[teacher_id] = overflow
 
         for day in range(0, 6):
             day_terms = ctx.teacher_day_terms.get((teacher_id, day), [])

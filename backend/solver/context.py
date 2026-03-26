@@ -267,6 +267,10 @@ class SolverContext:
     # Daily load balance terms per section (soft: penalise uneven days)
     daily_load_balance_terms: list[Any] = field(default_factory=list)
 
+    # Teacher weekly overload terms (soft: allow overflow above max_per_week with penalty)
+    teacher_weekly_overload_terms: list[Any] = field(default_factory=list)
+    teacher_weekly_overload_by_teacher: dict[Any, Any] = field(default_factory=dict)
+
     # --- Post-solve state (room assignment & writing) ------------------------
     used_rooms_by_slot: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
     seen_uncombined_room_slot: set[tuple[str, str]] = field(default_factory=set)

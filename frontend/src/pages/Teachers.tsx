@@ -79,8 +79,6 @@ export function Teachers() {
     maxContinuous: number,
   ): string[] {
     const errors: string[] = []
-    if (maxPerDay > 6) errors.push('Max per day cannot exceed 6')
-    if (maxPerWeek > 30) errors.push('Max per week cannot exceed 30')
     if (maxPerDay > maxPerWeek) errors.push('Max per day must be <= Max per week')
     if (maxContinuous > maxPerDay) errors.push('Max continuous must be <= Max per day')
     if (maxPerDay * 6 < maxPerWeek) errors.push('Max per week is too high for Max per day across 6 days')
