@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -10,7 +11,6 @@ from starlette.requests import Request as StarletteRequest
 from starlette.responses import JSONResponse, Response as StarletteResponse
 
 from sqlalchemy import text
-from sqlalchemy.engine import Connection
 from sqlalchemy.exc import OperationalError as SAOperationalError
 
 from api.router import api_router
@@ -22,17 +22,112 @@ from core.logging import setup_logging
 logger = logging.getLogger(__name__)
 
 
-def _execute_startup_ddl(conn: Connection, sql: str, *, step: str) -> None:
+def _short_sql(sql: str, *, limit: int = 220) -> str:
+    compact = " ".join((sql or "").split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3] + "..."
+
+
+def _is_timeout_or_lock_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return (
+        "statement timeout" in msg
+        or "lock timeout" in msg
+        or "querycanceled" in msg
+    )
+
+
+def _execute_startup_ddl(sql: str, *, step: str, max_attempts: int = 3) -> bool:
+    """Execute one startup DDL statement in its own transaction.
+
+    Each statement is isolated so one failure cannot poison subsequent steps.
+    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with ENGINE.begin() as conn:
+                conn.execute(text(sql))
+            if attempt > 1:
+                logger.info(
+                    "Startup schema step recovered step=%s attempt=%d/%d",
+                    step,
+                    attempt,
+                    max_attempts,
+                )
+            return True
+        except SAOperationalError as exc:
+            transient = is_transient_db_connectivity_error(exc) or _is_timeout_or_lock_error(exc)
+            logger.warning(
+                "Startup schema step failed step=%s attempt=%d/%d transient=%s sql=%s",
+                step,
+                attempt,
+                max_attempts,
+                transient,
+                _short_sql(sql),
+                exc_info=True,
+            )
+            if transient and attempt < max_attempts:
+                time.sleep(min(2.0, 0.5 * attempt))
+                continue
+            return False
+        except Exception:
+            logger.warning(
+                "Startup schema step failed step=%s attempt=%d/%d sql=%s",
+                step,
+                attempt,
+                max_attempts,
+                _short_sql(sql),
+                exc_info=True,
+            )
+            return False
+    return False
+
+
+def _table_exists(table_name: str, *, schema: str = "public") -> bool:
     try:
-        conn.execute(text(sql))
-    except SAOperationalError as exc:
-        msg = str(exc).lower()
-        if "statement timeout" in msg or "lock timeout" in msg or "querycanceled" in msg:
-            logger.warning("Startup schema recovery skipped step=%s due to timeout/lock", step)
-            return
-        logger.warning("Startup schema recovery failed step=%s", step, exc_info=True)
+        with ENGINE.connect() as conn:
+            return bool(
+                conn.execute(
+                    text("SELECT to_regclass(:fqname) IS NOT NULL"),
+                    {"fqname": f"{schema}.{table_name}"},
+                ).scalar()
+            )
     except Exception:
-        logger.warning("Startup schema recovery failed step=%s", step, exc_info=True)
+        logger.warning("Startup schema table existence check failed table=%s", table_name, exc_info=True)
+        return False
+
+
+def _constraint_exists(table_name: str, constraint_name: str, *, schema: str = "public") -> bool:
+    try:
+        with ENGINE.connect() as conn:
+            return bool(
+                conn.execute(
+                    text(
+                        """
+                        SELECT EXISTS (
+                          SELECT 1
+                          FROM information_schema.table_constraints
+                          WHERE table_schema = :schema
+                            AND table_name = :table_name
+                            AND constraint_name = :constraint_name
+                        )
+                        """
+                    ),
+                    {
+                        "schema": schema,
+                        "table_name": table_name,
+                        "constraint_name": constraint_name,
+                    },
+                ).scalar()
+            )
+    except Exception:
+        logger.warning(
+            "Startup schema constraint check failed table=%s constraint=%s",
+            table_name,
+            constraint_name,
+            exc_info=True,
+        )
+        return False
 
 
 def _apply_startup_schema_recovery() -> None:
@@ -41,33 +136,30 @@ def _apply_startup_schema_recovery() -> None:
     This keeps production boot resilient when a deployment is ahead of
     migration state and manual SQL execution is not possible.
     """
-    with ENGINE.begin() as conn:
-        _execute_startup_ddl(
-            conn,
+    ddl_steps = [
+        (
+            "teacher_time_windows.is_strict",
             """
             ALTER TABLE IF EXISTS teacher_time_windows
                 ADD COLUMN IF NOT EXISTS is_strict BOOLEAN NOT NULL DEFAULT FALSE
             """,
-            step="teacher_time_windows.is_strict",
-        )
-        _execute_startup_ddl(
-            conn,
+        ),
+        (
+            "subjects.credits",
             """
             ALTER TABLE IF EXISTS subjects
                 ADD COLUMN IF NOT EXISTS credits INTEGER NOT NULL DEFAULT 0
             """,
-            step="subjects.credits",
-        )
-        _execute_startup_ddl(
-            conn,
+        ),
+        (
+            "sections.max_daily_slots",
             """
             ALTER TABLE IF EXISTS sections
                 ADD COLUMN IF NOT EXISTS max_daily_slots INTEGER DEFAULT NULL
             """,
-            step="sections.max_daily_slots",
-        )
-        _execute_startup_ddl(
-            conn,
+        ),
+        (
+            "timetable_runs.solve_stats_columns",
             """
             ALTER TABLE IF EXISTS timetable_runs
                 ADD COLUMN IF NOT EXISTS solve_time_seconds DOUBLE PRECISION DEFAULT NULL,
@@ -75,42 +167,28 @@ def _apply_startup_schema_recovery() -> None:
                 ADD COLUMN IF NOT EXISTS total_constraints INTEGER DEFAULT NULL,
                 ADD COLUMN IF NOT EXISTS objective_value DOUBLE PRECISION DEFAULT NULL
             """,
-            step="timetable_runs.solve_stats_columns",
-        )
+        ),
+    ]
+
+    for step, sql in ddl_steps:
+        _execute_startup_ddl(sql, step=step)
+
+    # Add constraints without DO blocks to reduce opaque transactional failures.
+    if _table_exists("subjects") and not _constraint_exists("subjects", "ck_subjects_credits"):
         _execute_startup_ddl(
-            conn,
             """
-            DO $$
-            BEGIN
-              IF to_regclass('public.subjects') IS NOT NULL AND NOT EXISTS (
-                SELECT 1
-                FROM information_schema.table_constraints
-                WHERE table_name = 'subjects'
-                  AND constraint_name = 'ck_subjects_credits'
-              ) THEN
-                ALTER TABLE subjects
-                  ADD CONSTRAINT ck_subjects_credits CHECK (credits >= 0);
-              END IF;
-            END $$;
+            ALTER TABLE subjects
+                ADD CONSTRAINT ck_subjects_credits CHECK (credits >= 0)
             """,
             step="subjects.ck_subjects_credits",
         )
+
+    if _table_exists("sections") and not _constraint_exists("sections", "ck_sections_max_daily_slots"):
         _execute_startup_ddl(
-            conn,
             """
-            DO $$
-            BEGIN
-              IF to_regclass('public.sections') IS NOT NULL AND NOT EXISTS (
-                SELECT 1
-                FROM information_schema.table_constraints
-                WHERE table_name = 'sections'
-                  AND constraint_name = 'ck_sections_max_daily_slots'
-              ) THEN
-                ALTER TABLE sections
-                  ADD CONSTRAINT ck_sections_max_daily_slots
-                  CHECK (max_daily_slots IS NULL OR max_daily_slots >= 0);
-              END IF;
-            END $$;
+            ALTER TABLE sections
+                ADD CONSTRAINT ck_sections_max_daily_slots
+                CHECK (max_daily_slots IS NULL OR max_daily_slots >= 0)
             """,
             step="sections.ck_sections_max_daily_slots",
         )
