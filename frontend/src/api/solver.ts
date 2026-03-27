@@ -37,7 +37,7 @@ export type GenerateTimetableResponse = {
 
 export type SolveTimetableResponse = {
   run_id: string
-  status: 'RUNNING' | 'FAILED_VALIDATION' | 'INFEASIBLE' | 'FEASIBLE' | 'SUBOPTIMAL' | 'OPTIMAL' | 'ERROR'
+  status: 'CREATED' | 'RUNNING' | 'FAILED_VALIDATION' | 'INFEASIBLE' | 'FEASIBLE' | 'SUBOPTIMAL' | 'OPTIMAL' | 'ERROR'
   entries_written: number
   conflicts: SolverConflict[]
 
@@ -77,8 +77,12 @@ export async function pollRunUntilDone(
       const transientDbError =
         msg.includes('DATABASE_UNAVAILABLE') ||
         msg.includes('Database temporarily unavailable') ||
+        msg.includes('Bad Gateway') ||
+        msg.includes('Gateway Timeout') ||
         msg.includes('Service Unavailable') ||
+        msg.includes('502') ||
         msg.includes('503')
+        || msg.includes('504')
       if (!transientDbError) {
         throw e
       }

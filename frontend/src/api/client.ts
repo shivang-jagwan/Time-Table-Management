@@ -72,6 +72,46 @@ function getAccessToken(): string | null {
   }
 }
 
+function _isIdempotentMethod(method?: string): boolean {
+  const m = String(method || 'GET').toUpperCase()
+  return m === 'GET' || m === 'HEAD' || m === 'OPTIONS'
+}
+
+function _isTransientGatewayStatus(status: number): boolean {
+  return status === 502 || status === 503 || status === 504
+}
+
+function _sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function _fetchWithTransientRetry(url: string, init: RequestInit, maxAttempts = 3): Promise<Response> {
+  let lastError: any = null
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const res = await fetch(url, init)
+      if (!_isTransientGatewayStatus(res.status) || !_isIdempotentMethod(init.method) || attempt >= maxAttempts) {
+        return res
+      }
+    } catch (e: any) {
+      lastError = e
+      if (!_isIdempotentMethod(init.method) || attempt >= maxAttempts) {
+        throw e
+      }
+    }
+
+    // Exponential backoff for transient upstream failures.
+    const delayMs = Math.min(2000, 250 * (2 ** (attempt - 1)))
+    await _sleep(delayMs)
+  }
+
+  if (lastError) {
+    throw lastError
+  }
+  // Should be unreachable, keep a safe fallback.
+  return fetch(url, init)
+}
+
 export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   // If we've already determined auth is invalid and started redirecting,
   // avoid firing more protected API requests that will just 401 again.
@@ -81,7 +121,7 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
 
   const token = getAccessToken()
 
-  let res = await fetch(`${API_BASE}${path}`, {
+  let res = await _fetchWithTransientRetry(`${API_BASE}${path}`, {
     ...init,
     credentials: 'include',
     headers: {
@@ -100,7 +140,7 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
     if (refreshed) {
       // Retry the original request with the new token
       const newToken = getAccessToken()
-      const retryRes = await fetch(`${API_BASE}${path}`, {
+      const retryRes = await _fetchWithTransientRetry(`${API_BASE}${path}`, {
         ...init,
         credentials: 'include',
         headers: {
