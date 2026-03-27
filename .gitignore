@@ -1,3 +1,27 @@
+# Node / frontend artifacts
+node_modules/
+frontend/node_modules/
+dist/
+frontend/dist/
+
+# Python virtual environments and caches
+.venv/
+backend/.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Logs and temporary outputs
+*.log
+backend/*.log
+backend/*.err
+backend/outputs/
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+
 **/.env
 **/.venv/
 **/__pycache__/
@@ -9,8 +33,6 @@
 **/*.log
 **/*.err
 
-frontend/node_modules/
-frontend/dist/
 backend/.python-version
 
 # Local dev run artifacts
@@ -19,5 +41,4 @@ backend/_dev_uvicorn.*
 backend/_uvicorn.*
 backend/uvicorn.*
 backend/detached_uvicorn.log
-backend/outputs/
 frontend/frontend_dev.*
