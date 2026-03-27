@@ -2,6 +2,7 @@
 // when the backend is bound to IPv4 only.
 // Also normalize any env-provided localhost base to 127.0.0.1 (common source of “CORS”/ERR_FAILED in dev).
 const RAW_API_BASE = import.meta.env.VITE_API_BASE ?? ''
+const RAW_FALLBACK_API_BASE = import.meta.env.VITE_FALLBACK_API_BASE ?? 'https://time-table-management-mek3.onrender.com'
 
 function normalizeApiBase(raw: string): string {
   if (!raw) return ''
@@ -18,6 +19,7 @@ function normalizeApiBase(raw: string): string {
 // Default: same-origin requests (works when the frontend is reverse-proxied to the backend).
 // If VITE_API_BASE is provided (e.g. Render static frontend + separate backend service), use it in ALL modes.
 const API_BASE = RAW_API_BASE ? normalizeApiBase(RAW_API_BASE) : ''
+const FALLBACK_API_BASE = RAW_FALLBACK_API_BASE ? normalizeApiBase(RAW_FALLBACK_API_BASE) : ''
 
 // Track in-flight refresh to avoid thundering herd
 let _refreshPromise: Promise<boolean> | null = null
@@ -85,6 +87,16 @@ function _sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+function _shouldTryDirectBackendFallback(path: string, init: RequestInit | undefined, status: number): boolean {
+  if (!_isTransientGatewayStatus(status)) return false
+  if (!_isIdempotentMethod(init?.method)) return false
+  if (API_BASE) return false
+  if (!FALLBACK_API_BASE) return false
+  if (!path.startsWith('/api/')) return false
+  if (path.includes('/auth/login') || path.includes('/auth/refresh') || path.includes('/auth/logout')) return false
+  return true
+}
+
 async function _fetchWithTransientRetry(url: string, init: RequestInit, maxAttempts = 3): Promise<Response> {
   let lastError: any = null
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -121,7 +133,7 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
 
   const token = getAccessToken()
 
-  let res = await _fetchWithTransientRetry(`${API_BASE}${path}`, {
+  const requestInit: RequestInit = {
     ...init,
     credentials: 'include',
     headers: {
@@ -129,7 +141,14 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...(init?.headers ?? {}),
     },
-  })
+  }
+
+  let res = await _fetchWithTransientRetry(`${API_BASE}${path}`, requestInit)
+
+  // If Vercel proxy returns a transient gateway error, retry directly against backend.
+  if (_shouldTryDirectBackendFallback(path, requestInit, res.status)) {
+    res = await _fetchWithTransientRetry(`${FALLBACK_API_BASE}${path}`, requestInit, 2)
+  }
 
   // Automatic token refresh on 401
   if (res.status === 401 && !path.includes('/auth/refresh') && !path.includes('/auth/login')) {
@@ -140,7 +159,7 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
     if (refreshed) {
       // Retry the original request with the new token
       const newToken = getAccessToken()
-      const retryRes = await _fetchWithTransientRetry(`${API_BASE}${path}`, {
+      const retryInit: RequestInit = {
         ...init,
         credentials: 'include',
         headers: {
@@ -148,7 +167,11 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
           ...(newToken ? { Authorization: `Bearer ${newToken}` } : {}),
           ...(init?.headers ?? {}),
         },
-      })
+      }
+      let retryRes = await _fetchWithTransientRetry(`${API_BASE}${path}`, retryInit)
+      if (_shouldTryDirectBackendFallback(path, retryInit, retryRes.status)) {
+        retryRes = await _fetchWithTransientRetry(`${FALLBACK_API_BASE}${path}`, retryInit, 2)
+      }
       if (retryRes.ok) {
         return (await retryRes.json()) as T
       }
