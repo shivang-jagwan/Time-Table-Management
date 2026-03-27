@@ -1,0 +1,23 @@
+# Node / frontend artifacts
+node_modules/
+frontend/node_modules/
+dist/
+frontend/dist/
+
+# Python virtual environments and caches
+.venv/
+backend/.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Logs and temporary outputs
+*.log
+backend/*.log
+backend/*.err
+backend/outputs/
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+.vscode/
