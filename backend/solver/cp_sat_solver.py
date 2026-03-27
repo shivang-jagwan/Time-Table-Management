@@ -303,6 +303,7 @@ def _solve_program_global_decomposed(
             hints=None,
             initialization_mode="heuristic",
             persist_results=True,
+            suppress_terminal_status_update=(idx < (len(batch_units) - 1)),
         )
         last_result = result
         combined_conflicts.extend(result.conflicts)
@@ -321,6 +322,19 @@ def _solve_program_global_decomposed(
 
         if str(result.status) in {"INFEASIBLE", "ERROR", "VALIDATION_FAILED"}:
             break
+
+        # Intermediate decomposed batches must not expose terminal statuses.
+        # Keep polling semantics stable: RUNNING until the final batch finishes.
+        if idx < (len(batch_units) - 1):
+            try:
+                run.status = "CREATED"
+                run.notes = f"GLOBAL_DECOMPOSED_PROGRESS {idx + 1}/{len(batch_units)}"
+                db.commit()
+            except Exception:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
 
     if last_result is None:
         return SolveResult(status="ERROR", entries_written=0, conflicts=[])
@@ -429,6 +443,7 @@ def _build_lns_feedback(
     section_load: dict[Any, int] = defaultdict(int)
     x_keys_by_teacher: dict[Any, list[Any]] = defaultdict(list)
     x_keys_by_section: dict[Any, list[Any]] = defaultdict(list)
+    x_keys_by_slot: dict[Any, list[Any]] = defaultdict(list)
     high_penalty_x_keys: list[Any] = []
 
     for key in solution_hints.get("x", set()):
@@ -439,6 +454,7 @@ def _build_lns_feedback(
             x_keys_by_teacher[teacher_id].append(key)
         section_load[sec_id] += 1
         x_keys_by_section[sec_id].append(key)
+        x_keys_by_slot[slot_id].append(key)
 
         _day, slot_idx = ctx.slot_info.get(slot_id, (0, 0))
         if int(slot_idx) >= 5:
@@ -509,6 +525,33 @@ def _build_lns_feedback(
             sid for sid, _cnt in sorted(section_load.items(), key=lambda item: item[1], reverse=True)
         ]
 
+    congested_slots: list[Any] = []
+    slot_load_by_slot: dict[Any, int] = {}
+    overload_by_slot: dict[Any, int] = {}
+    slot_day_by_slot: dict[Any, int] = {}
+    try:
+        for slot_id, v in ctx.slot_load_vars.items():
+            slot_load_by_slot[slot_id] = int(solver.Value(v))
+            slot_day_by_slot[slot_id] = int((ctx.slot_info.get(slot_id) or (0, 0))[0])
+        for slot_id, v in ctx.slot_overload_by_slot.items():
+            overload_by_slot[slot_id] = int(solver.Value(v))
+
+        ranked = sorted(
+            ctx.slot_load_vars.keys(),
+            key=lambda sid: (
+                int(overload_by_slot.get(sid, 0)),
+                int(slot_load_by_slot.get(sid, 0)),
+            ),
+            reverse=True,
+        )
+        congested_slots = [
+            sid
+            for sid in ranked
+            if int(overload_by_slot.get(sid, 0)) > 0 or int(slot_load_by_slot.get(sid, 0)) > 0
+        ][:12]
+    except Exception:
+        congested_slots = []
+
     return {
         "teacher_hotspots": teacher_hotspots,
         "section_hotspots": section_hotspots,
@@ -516,6 +559,11 @@ def _build_lns_feedback(
         "section_penalty_score": dict(section_penalty_score),
         "x_keys_by_teacher": {k: list(v) for k, v in x_keys_by_teacher.items()},
         "x_keys_by_section": {k: list(v) for k, v in x_keys_by_section.items()},
+        "x_keys_by_slot": {k: list(v) for k, v in x_keys_by_slot.items()},
+        "congested_slots": list(congested_slots),
+        "slot_load_by_slot": dict(slot_load_by_slot),
+        "slot_overload_by_slot": dict(overload_by_slot),
+        "slot_day_by_slot": dict(slot_day_by_slot),
         "high_penalty_x_keys": high_penalty_x_keys,
     }
 
@@ -918,6 +966,7 @@ def _solve_program(
     hints: dict[str, set[Any]] | None = None,
     initialization_mode: str | None = None,
     persist_results: bool = True,
+    suppress_terminal_status_update: bool = False,
 ) -> SolveResult:
     tenant_id = getattr(run, "tenant_id", None)
 
@@ -1211,6 +1260,7 @@ def _solve_program(
         solver,
         status,
         clear_existing_entries=clear_existing_entries,
+        suppress_terminal_status_update=suppress_terminal_status_update,
     )
 
 

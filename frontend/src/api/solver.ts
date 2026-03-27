@@ -244,6 +244,48 @@ export type ValidateTimetableResponse = {
   summary: Record<string, any>
 }
 
+export type TeacherLoadCalculationRow = {
+  teacher_id: string
+  teacher_name: string
+  required_lectures: number
+  max_lectures_limit: number
+  overload: number
+}
+
+export type SectionCalculationRow = {
+  section_id: string
+  section_code: string
+  total_classes_required: number
+  available_slots: number
+  infeasible: boolean
+  shortage: number
+}
+
+export type RoomAnalysisSummary = {
+  total_rooms: number
+  parallel_required: number
+  deficit: number
+  lab_required_slots: number
+  lab_available_slots: number
+  lab_rooms: number
+}
+
+export type UtilizationSummary = {
+  total_slots: number
+  total_required_classes: number
+  total_capacity: number
+  percentage: number
+}
+
+export type SolverCalculationsResponse = {
+  teacher_load: TeacherLoadCalculationRow[]
+  section_summary: SectionCalculationRow[]
+  room_analysis: RoomAnalysisSummary
+  utilization: UtilizationSummary
+  bottlenecks: string[]
+  capacity_summary: Record<string, any>
+}
+
 export async function validateTimetable(payload: {
   program_code: string
   academic_year_number?: number | null
@@ -252,6 +294,17 @@ export async function validateTimetable(payload: {
     method: 'POST',
     body: JSON.stringify(payload),
   })
+}
+
+export async function getSolverCalculations(params: {
+  program_code: string
+  academic_year_number?: number | null
+}): Promise<SolverCalculationsResponse> {
+  const qs = new URLSearchParams({ program_code: params.program_code })
+  if (params.academic_year_number != null) {
+    qs.set('academic_year_number', String(params.academic_year_number))
+  }
+  return apiFetch<SolverCalculationsResponse>(`/api/solver/calculations?${qs.toString()}`)
 }
 
 export async function listRunEntries(

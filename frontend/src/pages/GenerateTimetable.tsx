@@ -3,10 +3,12 @@ import { Link } from 'react-router-dom'
 import { Toast } from '../components/Toast'
 import {
   generateTimetableGlobal,
+  getSolverCalculations,
   listTimeSlots,
   solveTimetableGlobal,
   pollRunUntilDone,
   validateTimetable,
+  type SolverCalculationsResponse,
   type SolverConflict,
   type SolveTimetableResponse,
   type RunDetail,
@@ -51,6 +53,7 @@ export function GenerateTimetable() {
   const [lastValidationConflicts, setLastValidationConflicts] = React.useState<SolverConflict[]>([])
   const [lastValidation, setLastValidation] = React.useState<ValidateTimetableResponse | null>(null)
   const [pollStatus, setPollStatus] = React.useState<string | null>(null)
+  const [calcData, setCalcData] = React.useState<SolverCalculationsResponse | null>(null)
 
   function showToast(message: string, ms = 2500) {
     setToast(message)
@@ -60,10 +63,21 @@ export function GenerateTimetable() {
   async function refresh() {
     setLoading(true)
     try {
-      const slots = await listTimeSlots()
+      const [slots, calcs] = await Promise.all([
+        listTimeSlots(),
+        programCode.trim()
+          ? getSolverCalculations({
+              program_code: programCode.trim(),
+              // Global diagnostics for this global-solve page.
+              academic_year_number: null,
+            }).catch(() => null)
+          : Promise.resolve(null),
+      ])
       setSlotCount(slots.length)
+      setCalcData(calcs)
     } catch (e: any) {
       showToast(`Preflight failed: ${String(e?.message ?? e)}`, 3500)
+      setCalcData(null)
     } finally {
       setLoading(false)
     }
@@ -90,7 +104,8 @@ export function GenerateTimetable() {
     try {
       const res = await validateTimetable({
         program_code: pc,
-        academic_year_number: academicYearNumber,
+        // This page uses global solve, so validation must also be global.
+        academic_year_number: null,
       })
       setLastValidation(res)
       setLastValidationConflicts([...res.errors, ...res.warnings])
@@ -254,6 +269,70 @@ export function GenerateTimetable() {
                 Teachers, subjects, sections, rooms, curriculum, and elective blocks checks will appear here.
               </div>
             </div>
+
+            {calcData ? (
+              <div className="rounded-2xl border bg-slate-50 p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="text-sm font-semibold text-slate-900">Calculation & Diagnostics</div>
+                  <div className="text-xs text-slate-500">Pre-solve transparency</div>
+                </div>
+
+                <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                  <div className="rounded-xl border bg-white p-3">
+                    <div className="text-xs text-slate-500">Utilization</div>
+                    <div className="mt-1 text-lg font-semibold text-slate-900">
+                      {Number(calcData.utilization.percentage).toFixed(1)}%
+                    </div>
+                    <div className="mt-1 text-xs text-slate-600">
+                      {calcData.utilization.total_required_classes} required / {calcData.utilization.total_capacity} capacity
+                    </div>
+                  </div>
+                  <div className="rounded-xl border bg-white p-3">
+                    <div className="text-xs text-slate-500">Room Parallelism</div>
+                    <div className="mt-1 text-lg font-semibold text-slate-900">
+                      {calcData.room_analysis.parallel_required} / {calcData.room_analysis.total_rooms}
+                    </div>
+                    <div className="mt-1 text-xs text-slate-600">
+                      Deficit: {calcData.room_analysis.deficit}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="mt-3 space-y-2">
+                  <div className="text-xs font-semibold text-slate-700">
+                    Top Teacher Overload
+                  </div>
+                  <div className="space-y-1">
+                    {[...calcData.teacher_load]
+                      .sort((a, b) => b.overload - a.overload)
+                      .slice(0, 3)
+                      .map((t) => (
+                        <div key={t.teacher_id} className="rounded-lg border bg-white px-3 py-2 text-xs text-slate-700">
+                          <span className="font-medium text-slate-900">{t.teacher_name}</span>
+                          {' · '}req {t.required_lectures}
+                          {' / max '}
+                          {t.max_lectures_limit}
+                          {' · overload '}
+                          <span className={t.overload > 0 ? 'font-semibold text-rose-700' : 'font-semibold text-emerald-700'}>
+                            {t.overload}
+                          </span>
+                        </div>
+                      ))}
+                  </div>
+                </div>
+
+                {calcData.bottlenecks.length > 0 ? (
+                  <div className="mt-3">
+                    <div className="text-xs font-semibold text-slate-700">Bottlenecks</div>
+                    <ul className="mt-1 list-disc space-y-1 pl-5 text-xs text-slate-700">
+                      {calcData.bottlenecks.slice(0, 5).map((b, i) => (
+                        <li key={`${i}-${b}`}>{b}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
           </div>
         </div>
 

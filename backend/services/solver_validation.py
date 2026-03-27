@@ -31,6 +31,7 @@ from models.timetable_conflict import TimetableConflict
 from models.timetable_run import TimetableRun
 from models.curriculum_subject import CurriculumSubject
 from models.track_subject import TrackSubject
+from solver.calculation_engine import calculate_pre_solve_metrics
 
 
 @dataclass(frozen=True)
@@ -88,6 +89,28 @@ def validate_prereqs(
 
     section_ids = [s.id for s in sections]
     section_by_id = {s.id: s for s in sections}
+
+    # Pre-solve transparent metrics (read-only) used for diagnostics visibility.
+    try:
+        calculations = calculate_pre_solve_metrics(
+            db,
+            program_id=program_id,
+            academic_year_id=academic_year_id,
+            sections=list(sections),
+            tenant_id=tenant_id,
+        )
+        for message in list(calculations.get("bottlenecks", []) or [])[:20]:
+            conflicts.append(
+                ValidationConflict(
+                    conflict_type="CALCULATION_BOTTLENECK",
+                    severity="WARN",
+                    message=str(message),
+                    metadata={"source": "calculation_engine"},
+                )
+            )
+    except Exception:
+        # Diagnostics should never block solve flow.
+        pass
 
     def _norm_track(track: Any) -> str:
         return str(track or "").strip().upper()

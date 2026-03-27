@@ -24,6 +24,7 @@ def choose_lns_strategy(
         "destroy_teacher_schedule",
         "destroy_day_block",
         "destroy_high_penalty_classes",
+        "destroy_congested_slots",
     ]
     if not strategies:
         return "destroy_random"
@@ -37,12 +38,15 @@ def choose_lns_strategy(
     teacher_penalty = float(sum((feedback.get("teacher_penalty_score", {}) or {}).values()))
     section_penalty = float(sum((feedback.get("section_penalty_score", {}) or {}).values()))
     high_penalty_count = int(len(feedback.get("high_penalty_x_keys", []) or []))
+    congested_slots = list(feedback.get("congested_slots", []) or [])
 
     prior = "destroy_day_block"
     if teacher_penalty >= section_penalty and teacher_penalty > 0:
         prior = "destroy_teacher_schedule"
     if high_penalty_count > 0 and high_penalty_count >= max(8, int(0.2 * high_penalty_count)):
         prior = "destroy_high_penalty_classes"
+    if congested_slots:
+        prior = "destroy_congested_slots"
 
     scores = strategy_scores or {}
     scored = [s for s in strategies if s in scores]
@@ -80,6 +84,13 @@ def build_lns_hints(
         )
     if strategy == "destroy_high_penalty_classes":
         return destroy_high_penalty_classes(
+            best_hints,
+            keep_fraction=keep_fraction,
+            seed=seed,
+            feedback=feedback,
+        )
+    if strategy == "destroy_congested_slots":
+        return destroy_congested_slots(
             best_hints,
             keep_fraction=keep_fraction,
             seed=seed,
@@ -196,6 +207,45 @@ def destroy_high_penalty_classes(
     for key in (feedback or {}).get("high_penalty_x_keys", []):
         if key in out["x"] and rng.random() < 0.75:
             out["x"].discard(key)
+
+    return out
+
+
+def destroy_congested_slots(
+    best_hints: dict[str, set[Any]],
+    *,
+    keep_fraction: float,
+    seed: int | None,
+    feedback: dict[str, Any] | None = None,
+) -> dict[str, set[Any]]:
+    """Destroy assignments concentrated in overloaded slots."""
+    rng = random.Random(0 if seed is None else int(seed))
+    out = destroy_random(best_hints, keep_fraction=keep_fraction, seed=seed)
+
+    congested_slots = list((feedback or {}).get("congested_slots", []) or [])
+    if not congested_slots:
+        return out
+
+    x_by_slot = (feedback or {}).get("x_keys_by_slot", {}) or {}
+    victim_slots = congested_slots[: max(1, min(3, len(congested_slots)))]
+    for slot_id in victim_slots:
+        out["x"].difference_update(set(x_by_slot.get(slot_id, [])))
+
+    # Also relax a subset of lab placements on congested days.
+    slot_day_by_slot = (feedback or {}).get("slot_day_by_slot", {}) or {}
+    congested_days = set()
+    for slot_id in victim_slots:
+        if slot_id in slot_day_by_slot:
+            try:
+                congested_days.add(int(slot_day_by_slot[slot_id]))
+            except Exception:
+                pass
+
+    if congested_days:
+        for key in list(out["lab_start"]):
+            _sec, _subj, day, _start = key
+            if int(day) in congested_days and rng.random() < 0.7:
+                out["lab_start"].discard(key)
 
     return out
 

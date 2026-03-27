@@ -136,6 +136,28 @@ class TeacherLoadAdjustmentReportResponse(BaseModel):
     rows: list[TeacherLoadAdjustmentRow] = Field(default_factory=list)
 
 
+class RoomCapacityIssueRow(BaseModel):
+    conflict_id: uuid.UUID | None = None
+    severity: Literal["INFO", "WARN", "ERROR"] = "ERROR"
+    conflict_type: str
+    message: str
+    slot_id: uuid.UUID | None = None
+    room_type: str | None = None
+    required: int | None = None
+    available: int | None = None
+    shortage: int | None = None
+    affected_slots: list[str] = Field(default_factory=list)
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class RoomCapacityReportResponse(BaseModel):
+    run_id: uuid.UUID
+    total_issues: int = 0
+    error_issues: int = 0
+    warning_issues: int = 0
+    rows: list[RoomCapacityIssueRow] = Field(default_factory=list)
+
+
 class TimetableEntryOut(BaseModel):
     id: uuid.UUID
     run_id: uuid.UUID
@@ -347,4 +369,46 @@ class ValidateTimetableResponse(BaseModel):
     capacity_issues: list[ValidationIssue] = Field(default_factory=list)
     # Raw capacity summary numbers for debugging
     summary: dict[str, Any] = Field(default_factory=dict)
+
+
+class TeacherLoadCalculationRow(BaseModel):
+    teacher_id: str
+    teacher_name: str
+    required_lectures: int
+    max_lectures_limit: int
+    overload: int
+
+
+class SectionCalculationRow(BaseModel):
+    section_id: str
+    section_code: str
+    total_classes_required: int
+    available_slots: int
+    infeasible: bool = False
+    shortage: int = 0
+
+
+class RoomAnalysisSummary(BaseModel):
+    total_rooms: int
+    parallel_required: int
+    deficit: int
+    lab_required_slots: int = 0
+    lab_available_slots: int = 0
+    lab_rooms: int = 0
+
+
+class UtilizationSummary(BaseModel):
+    total_slots: int
+    total_required_classes: int
+    total_capacity: int
+    percentage: float
+
+
+class SolverCalculationsResponse(BaseModel):
+    teacher_load: list[TeacherLoadCalculationRow] = Field(default_factory=list)
+    section_summary: list[SectionCalculationRow] = Field(default_factory=list)
+    room_analysis: RoomAnalysisSummary
+    utilization: UtilizationSummary
+    bottlenecks: list[str] = Field(default_factory=list)
+    capacity_summary: dict[str, Any] = Field(default_factory=dict)
 

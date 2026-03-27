@@ -34,6 +34,10 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
+from sqlalchemy import select
+
+from api.tenant import where_tenant
+from models.timetable_entry import TimetableEntry
 from solver.context import SolverContext
 from solver.pre_solve_locks import contiguous_starts, _ensure_elective_batches
 
@@ -44,6 +48,7 @@ def create_variables(ctx: SolverContext) -> None:
     _create_section_subject_vars(ctx)
     _create_combined_theory_vars(ctx)
     _create_elective_block_vars(ctx)
+    _create_room_assignment_vars(ctx)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -431,8 +436,8 @@ def _create_elective_block_vars(ctx: SolverContext) -> None:
                 for sec_id in batch_sec_ids:
                     ctx.section_slot_terms[(sec_id, slot_id)].append(zv)
 
-                for _subj_id, _teacher_id in pairs:
-                    ctx.room_terms_by_slot[slot_id].append(zv)
+                # One elective batch occurrence consumes one THEORY room.
+                ctx.room_terms_by_slot[slot_id].append(zv)
 
                 d = ctx.slot_info.get(slot_id, (None, None))[0]
                 if d is not None:
@@ -465,3 +470,206 @@ def _create_elective_block_vars(ctx: SolverContext) -> None:
                     model.Add(0 == 1)
                 elif day_terms:
                     model.Add(sum(day_terms) <= int(cap))
+
+
+def _candidate_theory_rooms(ctx: SolverContext, *, subject_id: Any) -> list[Any]:
+    allowed = list(ctx.allowed_rooms_by_subject.get(subject_id, []) or [])
+    if allowed:
+        return [
+            rid
+            for rid in allowed
+            if rid in ctx.room_by_id
+            and bool(getattr(ctx.room_by_id[rid], "is_active", True))
+            and not bool(getattr(ctx.room_by_id[rid], "is_special", False))
+        ]
+
+    out: list[Any] = []
+    for room in list(ctx.rooms_by_type.get("CLASSROOM", [])) + list(ctx.rooms_by_type.get("LT", [])):
+        if not bool(getattr(room, "is_active", True)):
+            continue
+        if bool(getattr(room, "is_special", False)):
+            continue
+        out.append(room.id)
+    return out
+
+
+def _candidate_lab_rooms(ctx: SolverContext, *, subject_id: Any) -> list[Any]:
+    allowed = list(ctx.allowed_rooms_by_subject.get(subject_id, []) or [])
+    if allowed:
+        return [
+            rid
+            for rid in allowed
+            if rid in ctx.room_by_id
+            and bool(getattr(ctx.room_by_id[rid], "is_active", True))
+            and not bool(getattr(ctx.room_by_id[rid], "is_special", False))
+            and str(getattr(ctx.room_by_id[rid], "room_type", "")).upper() == "LAB"
+        ]
+
+    out: list[Any] = []
+    for room in list(ctx.rooms_by_type.get("LAB", [])):
+        if not bool(getattr(room, "is_active", True)):
+            continue
+        if bool(getattr(room, "is_special", False)):
+            continue
+        out.append(room.id)
+    return out
+
+
+def _create_room_assignment_vars(ctx: SolverContext) -> None:
+    """Integrate room assignment into CP-SAT as decision variables.
+
+    Links each scheduled class variable with a compatible room choice variable,
+    and builds per-(room,slot) occupancy terms consumed by hard constraints.
+    """
+    model = ctx.model
+
+    # Seed locked fixed/special occupancy as constants.
+    # Also include already-persisted entries for decomposed global solves
+    # where subsequent batches append to the same run.
+    q_existing = select(
+        TimetableEntry.room_id,
+        TimetableEntry.slot_id,
+        TimetableEntry.combined_class_id,
+    ).where(
+        TimetableEntry.run_id == ctx.run.id
+    )
+    q_existing = where_tenant(q_existing, TimetableEntry, ctx.tenant_id)
+    seen_existing_events: set[tuple[Any, Any, Any | None]] = set()
+    for room_id, slot_id, combined_class_id in ctx.db.execute(q_existing).all():
+        room = ctx.room_by_id.get(room_id)
+        if room is not None and bool(getattr(room, "is_special", False)):
+            continue
+
+        ctx.locked_existing_room_rows_count += 1
+        ctx.locked_existing_room_rows_by_slot[slot_id] += 1
+
+        # Persisted combined/elective rows may store one DB row per section while
+        # representing one physical class event. Count locked room occupancy once
+        # per (room, slot, combined_event) to avoid artificial infeasibility.
+        event_key = (room_id, slot_id, combined_class_id)
+        if event_key in seen_existing_events:
+            continue
+        seen_existing_events.add(event_key)
+
+        ctx.locked_existing_room_events_count += 1
+        ctx.locked_existing_room_events_by_slot[slot_id] += 1
+
+        ctx.locked_room_usage_by_room_slot[(room_id, slot_id)] += 1
+
+    for _sec_id, _subj_id, _teacher_id, room_id, slot_id in ctx.special_entries_to_write:
+        room = ctx.room_by_id.get(room_id)
+        if room is not None and bool(getattr(room, "is_special", False)):
+            continue
+        ctx.locked_room_usage_by_room_slot[(room_id, slot_id)] += 1
+
+    for _sec_id, _subj_id, _teacher_id, room_id, slot_id in ctx.fixed_entries_to_write:
+        room = ctx.room_by_id.get(room_id)
+        if room is not None and bool(getattr(room, "is_special", False)):
+            continue
+        ctx.locked_room_usage_by_room_slot[(room_id, slot_id)] += 1
+
+    # Theory x-variables
+    for (sec_id, subj_id, slot_id), xv in ctx.x.items():
+        fixed_room = ctx.fixed_room_by_section_slot.get((sec_id, slot_id))
+        if fixed_room is not None:
+            candidates = [fixed_room]
+        else:
+            candidates = _candidate_theory_rooms(ctx, subject_id=subj_id)
+        if not candidates:
+            model.Add(xv == 0)
+            continue
+
+        room_vars = []
+        for rid in candidates:
+            rv = model.NewBoolVar(f"xr_{sec_id}_{subj_id}_{slot_id}_{rid}")
+            ctx.x_room[(sec_id, subj_id, slot_id, rid)] = rv
+            room_vars.append(rv)
+            ctx.room_slot_terms[(rid, slot_id)].append(rv)
+        model.Add(sum(room_vars) == xv)
+
+    # Combined theory variables
+    for (gid, slot_id), gv in ctx.combined_x.items():
+        subj_id = ctx.group_subject.get(gid)
+        if subj_id is None:
+            model.Add(gv == 0)
+            continue
+        fixed_rooms = {
+            ctx.fixed_room_by_section_slot.get((sid, slot_id))
+            for sid in ctx.group_sections.get(gid, [])
+            if ctx.fixed_room_by_section_slot.get((sid, slot_id)) is not None
+        }
+        if len(fixed_rooms) > 1:
+            model.Add(0 == 1)
+            continue
+        if fixed_rooms:
+            candidates = [next(iter(fixed_rooms))]
+        else:
+            candidates = _candidate_theory_rooms(ctx, subject_id=subj_id)
+        if not candidates:
+            model.Add(gv == 0)
+            continue
+
+        room_vars = []
+        for rid in candidates:
+            rv = model.NewBoolVar(f"cgr_{gid}_{slot_id}_{rid}")
+            ctx.combined_room[(gid, slot_id, rid)] = rv
+            room_vars.append(rv)
+            ctx.room_slot_terms[(rid, slot_id)].append(rv)
+        model.Add(sum(room_vars) == gv)
+
+    # Elective batch vars (theory rooms)
+    for (block_id, batch_idx, slot_id), zv in ctx.z.items():
+        candidates = _candidate_theory_rooms(ctx, subject_id=None)
+        if not candidates:
+            model.Add(zv == 0)
+            continue
+
+        room_vars = []
+        for rid in candidates:
+            rv = model.NewBoolVar(f"zr_{block_id}_{batch_idx}_{slot_id}_{rid}")
+            ctx.z_room[(block_id, int(batch_idx), slot_id, rid)] = rv
+            room_vars.append(rv)
+            ctx.room_slot_terms[(rid, slot_id)].append(rv)
+        model.Add(sum(room_vars) == zv)
+
+    # Lab start vars choose one lab room for the full block.
+    for (sec_id, subj_id, day, start_idx), sv in ctx.lab_start.items():
+        block = ctx.lab_block_for(subj_id)
+        if block < 1:
+            block = 1
+
+        block_slot_ids: list[Any] = []
+        for j in range(block):
+            ts = ctx.slot_by_day_index.get((day, start_idx + j))
+            if ts is None:
+                block_slot_ids = []
+                break
+            block_slot_ids.append(ts.id)
+        if not block_slot_ids:
+            model.Add(sv == 0)
+            continue
+
+        fixed_rooms = {
+            ctx.fixed_room_by_section_slot.get((sec_id, sid))
+            for sid in block_slot_ids
+            if ctx.fixed_room_by_section_slot.get((sec_id, sid)) is not None
+        }
+        if len(fixed_rooms) > 1:
+            model.Add(0 == 1)
+            continue
+        if fixed_rooms:
+            candidates = [next(iter(fixed_rooms))]
+        else:
+            candidates = _candidate_lab_rooms(ctx, subject_id=subj_id)
+        if not candidates:
+            model.Add(sv == 0)
+            continue
+
+        room_vars = []
+        for rid in candidates:
+            rv = model.NewBoolVar(f"lr_{sec_id}_{subj_id}_{day}_{start_idx}_{rid}")
+            ctx.lab_room[(sec_id, subj_id, day, start_idx, rid)] = rv
+            room_vars.append(rv)
+            for sid in block_slot_ids:
+                ctx.room_slot_terms[(rid, sid)].append(rv)
+        model.Add(sum(room_vars) == sv)

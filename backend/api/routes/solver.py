@@ -77,11 +77,13 @@ from schemas.solver import (
     ValidateTimetableRequest,
     ValidateTimetableResponse,
     ValidationIssue,
+    SolverCalculationsResponse,
 )
 from schemas.subject import SubjectOut
 from services.solver_validation import validate_prereqs
 from solver.cp_sat_solver import SolverInvariantError, solve_program_global, solve_program_year
 from solver.capacity_analyzer import build_capacity_data, analyze_capacity
+from solver.calculation_engine import calculate_pre_solve_metrics
 
 
 router = APIRouter()
@@ -2247,6 +2249,56 @@ def validate_timetable(
             ],
             summary={},
         )
+
+
+@router.get("/calculations", response_model=SolverCalculationsResponse)
+def get_solver_calculations(
+    program_code: str = Query(..., min_length=1),
+    academic_year_number: int | None = Query(default=None, ge=1, le=4),
+    _admin=Depends(require_admin),
+    db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
+):
+    """Return transparent pre-solve metrics and bottlenecks without running the solver."""
+    q_program = where_tenant(
+        select(Program).where(Program.code == program_code), Program, tenant_id
+    )
+    program = db.execute(q_program).scalar_one_or_none()
+    if program is None:
+        raise HTTPException(status_code=404, detail="PROGRAM_NOT_FOUND")
+
+    academic_year_id = None
+    q_sections = (
+        select(Section)
+        .where(Section.program_id == program.id)
+        .where(Section.is_active.is_(True))
+    )
+
+    if academic_year_number is not None:
+        q_ay = where_tenant(
+            select(AcademicYear).where(AcademicYear.year_number == academic_year_number),
+            AcademicYear,
+            tenant_id,
+        )
+        ay = db.execute(q_ay).scalar_one_or_none()
+        if ay is None:
+            raise HTTPException(status_code=404, detail="ACADEMIC_YEAR_NOT_FOUND")
+        academic_year_id = ay.id
+        q_sections = q_sections.where(Section.academic_year_id == academic_year_id)
+
+    q_sections = where_tenant(q_sections, Section, tenant_id).order_by(Section.code)
+    sections = db.execute(q_sections).scalars().all()
+    if not sections:
+        raise HTTPException(status_code=404, detail="NO_ACTIVE_SECTIONS")
+
+    payload = calculate_pre_solve_metrics(
+        db,
+        program_id=program.id,
+        academic_year_id=academic_year_id,
+        sections=list(sections),
+        tenant_id=tenant_id,
+    )
+    return SolverCalculationsResponse.model_validate(payload)
 
 
 @router.post("/generate-global", response_model=GenerateTimetableResponse)

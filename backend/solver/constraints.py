@@ -35,6 +35,8 @@ def add_constraints(ctx: SolverContext) -> None:
     _add_teacher_max_continuous(ctx)
     _add_teacher_compactness(ctx)
     _add_daily_load_balance(ctx)
+    _add_room_slot_uniqueness(ctx)
+    _add_slot_load_constraints(ctx)
     _add_section_max_daily_slots(ctx)
     if ctx.enforce_teacher_load_limits:
         _add_teacher_load_limits(ctx)
@@ -86,6 +88,80 @@ def _add_room_capacity_constraints(ctx: SolverContext) -> None:
             + int(ctx.fixed_lab_by_slot.get(slot_id, 0))
             <= int(lab_room_capacity)
         )
+
+
+def _add_room_slot_uniqueness(ctx: SolverContext) -> None:
+    """Hard constraint: a room can host at most one class per slot."""
+    model = ctx.model
+    for (room_id, slot_id), terms in ctx.room_slot_terms.items():
+        locked = int(ctx.locked_room_usage_by_room_slot.get((room_id, slot_id), 0) or 0)
+        if terms:
+            model.Add(sum(terms) + locked <= 1)
+        elif locked > 1:
+            model.Add(0 == 1)
+
+
+def _add_slot_load_constraints(ctx: SolverContext) -> None:
+    """Hard slot cap + soft balancing and anti-congestion penalties."""
+    model = ctx.model
+
+    total_available_rooms = int(
+        sum(
+            1
+            for room in ctx.rooms_all
+            if bool(getattr(room, "is_active", True)) and not bool(getattr(room, "is_special", False))
+        )
+    )
+    if total_available_rooms <= 0:
+        return
+
+    slot_load_vars = []
+    max_slot_load = max(0, total_available_rooms)
+    soft_threshold = max(1, int((total_available_rooms * 85 + 99) // 100))
+
+    for ts in ctx.slots:
+        slot_id = ts.id
+        load = model.NewIntVar(0, max_slot_load, f"slot_load_{slot_id}")
+        load_terms = list(ctx.room_terms_by_slot.get(slot_id, [])) + list(ctx.lab_room_terms_by_slot.get(slot_id, []))
+        load_terms.append(int(ctx.special_theory_by_slot.get(slot_id, 0) or 0))
+        load_terms.append(int(ctx.fixed_theory_by_slot.get(slot_id, 0) or 0))
+        load_terms.append(int(ctx.locked_block_theory_room_demand_by_slot.get(slot_id, 0) or 0))
+        load_terms.append(int(ctx.special_lab_by_slot.get(slot_id, 0) or 0))
+        load_terms.append(int(ctx.fixed_lab_by_slot.get(slot_id, 0) or 0))
+
+        model.Add(load == sum(load_terms))
+        # Phase 1 mandatory hard slot cap.
+        model.Add(load <= int(total_available_rooms))
+
+        overload = model.NewIntVar(0, max_slot_load, f"slot_over_{slot_id}")
+        model.Add(overload >= load - int(soft_threshold))
+        model.Add(overload >= 0)
+
+        ctx.slot_load_vars[slot_id] = load
+        ctx.slot_overload_by_slot[slot_id] = overload
+        ctx.slot_overload_terms.append(overload)
+        slot_load_vars.append(load)
+
+    if not slot_load_vars:
+        return
+
+    total_load = model.NewIntVar(0, max_slot_load * len(slot_load_vars), "total_slot_load")
+    model.Add(total_load == sum(slot_load_vars))
+
+    avg_load = model.NewIntVar(0, max_slot_load, "avg_slot_load_floor")
+    n = len(slot_load_vars)
+    model.Add(total_load >= avg_load * n)
+    model.Add(total_load <= avg_load * n + (n - 1))
+
+    for ts in ctx.slots:
+        slot_id = ts.id
+        load = ctx.slot_load_vars.get(slot_id)
+        if load is None:
+            continue
+        dev = model.NewIntVar(0, max_slot_load, f"slot_dev_{slot_id}")
+        model.Add(dev >= load - avg_load)
+        model.Add(dev >= avg_load - load)
+        ctx.slot_deviation_terms.append(dev)
 
 
 # ── Fixed-entry hard constraints ────────────────────────────────────────────

@@ -17,7 +17,7 @@ from collections import defaultdict
 from typing import Any
 
 from ortools.sat.python import cp_model
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 
 from api.tenant import where_tenant
@@ -74,6 +74,7 @@ def write_results(
     status: int,
     *,
     clear_existing_entries: bool = True,
+    suppress_terminal_status_update: bool = False,
 ) -> SolveResult:
     """Delete old entries, write all new entries, commit, return SolveResult."""
     db = ctx.db
@@ -127,11 +128,41 @@ def write_results(
     _write_lab_entries(ctx, solver)
 
     # Final status and human-readable message
-    if status == cp_model.OPTIMAL:
-        run.status = "OPTIMAL"
+    room_assignment_conflicts = _count_room_assignment_conflicts(ctx)
+    ctx.solver_stats["room_assignment_conflicts"] = int(room_assignment_conflicts)
+
+    final_status = "FEASIBLE"
+
+    if room_assignment_conflicts > 0:
+        final_status = "SUBOPTIMAL"
+        ctx.warnings.append(
+            "Room assignment required fallback in occupied slots; timetable contains room conflicts."
+        )
+        db.add(
+            TimetableConflict(
+                tenant_id=tenant_id,
+                run_id=run.id,
+                severity="WARN",
+                conflict_type="SUBOPTIMAL",
+                message=(
+                    "Solver found a schedule, but room assignment conflicts remain "
+                    f"({room_assignment_conflicts} conflict record(s))."
+                ),
+                metadata_json={
+                    "room_assignment_conflicts": int(room_assignment_conflicts),
+                    "max_time_seconds": float(ctx.max_time_seconds),
+                },
+            )
+        )
+        ctx.message = (
+            "Solver found a schedule, but room assignment conflicts remain. "
+            "Add more compatible rooms, relax subject room restrictions, or enable strict room mode."
+        )
+    elif status == cp_model.OPTIMAL:
+        final_status = "OPTIMAL"
         ctx.message = "Optimal timetable found within the time budget."
     elif ctx.require_optimal:
-        run.status = "SUBOPTIMAL"
+        final_status = "SUBOPTIMAL"
         ctx.warnings.append(
             "A feasible timetable was found, but optimality was not proven (SUBOPTIMAL)."
         )
@@ -155,7 +186,7 @@ def write_results(
             f" More time may produce a better timetable.{gap_info}"
         )
     else:
-        run.status = "FEASIBLE"
+        final_status = "FEASIBLE"
         gap_info = (
             f" (objective={ctx.objective_score}, bound={ctx.best_objective_bound}, gap={ctx.optimality_gap})"
             if ctx.optimality_gap is not None
@@ -165,6 +196,12 @@ def write_results(
             f"Solver found a valid timetable but optimality was not proven within the time budget."
             f" More time may produce a better timetable.{gap_info}"
         )
+
+    if suppress_terminal_status_update:
+        run.status = "CREATED"
+    else:
+        run.status = str(final_status)
+
     run.solver_version = "cp-sat-v1"
     run.solve_time_seconds = ctx.solve_time_seconds
     run.total_variables = len(ctx.x) + len(ctx.z)
@@ -181,7 +218,7 @@ def write_results(
             pass
         raise
     return SolveResult(
-        status=str(run.status),
+        status=str(final_status),
         entries_written=ctx.entries_written,
         conflicts=[],
         objective_score=ctx.objective_score,
@@ -259,6 +296,22 @@ def _compute_warnings(ctx: SolverContext, solver: cp_model.CpSolver) -> None:
         ctx.warnings = []
 
 
+def _count_room_assignment_conflicts(ctx: SolverContext) -> int:
+    conflict_types = (
+        "NO_ROOM_AVAILABLE",
+        "NO_LT_ROOM_AVAILABLE",
+        "SPECIAL_ROOM_CONFLICT",
+        "FIXED_ROOM_CONFLICT",
+    )
+    q = (
+        select(func.count(TimetableConflict.id))
+        .where(TimetableConflict.run_id == ctx.run.id)
+        .where(TimetableConflict.conflict_type.in_(list(conflict_types)))
+    )
+    q = where_tenant(q, TimetableConflict, ctx.tenant_id)
+    return int(ctx.db.execute(q).scalar() or 0)
+
+
 def _compute_solver_stats(ctx: SolverContext, solver: cp_model.CpSolver, status: int) -> None:
     ctx.solver_stats = {
         "ortools_status": int(status),
@@ -272,6 +325,92 @@ def _compute_solver_stats(ctx: SolverContext, solver: cp_model.CpSolver, status:
         ),
         "require_optimal": bool(ctx.require_optimal),
     }
+
+    # Slot-load and congestion metrics
+    try:
+        total_available_rooms = int(
+            sum(
+                1
+                for room in ctx.rooms_all
+                if bool(getattr(room, "is_active", True)) and not bool(getattr(room, "is_special", False))
+            )
+        )
+        slot_load_items: list[tuple[Any, int]] = []
+        for slot_id in [ts.id for ts in ctx.slots]:
+            load_var = ctx.slot_load_vars.get(slot_id)
+            if load_var is not None:
+                load_val = int(solver.Value(load_var))
+            else:
+                load_val = 0
+                for term in ctx.room_terms_by_slot.get(slot_id, []):
+                    load_val += int(term) if isinstance(term, int) else int(solver.Value(term))
+                for term in ctx.lab_room_terms_by_slot.get(slot_id, []):
+                    load_val += int(term) if isinstance(term, int) else int(solver.Value(term))
+                load_val += int(ctx.special_theory_by_slot.get(slot_id, 0) or 0)
+                load_val += int(ctx.fixed_theory_by_slot.get(slot_id, 0) or 0)
+                load_val += int(ctx.locked_block_theory_room_demand_by_slot.get(slot_id, 0) or 0)
+                load_val += int(ctx.special_lab_by_slot.get(slot_id, 0) or 0)
+                load_val += int(ctx.fixed_lab_by_slot.get(slot_id, 0) or 0)
+            slot_load_items.append((slot_id, int(load_val)))
+
+        overload_items: list[tuple[Any, int]] = []
+        for slot_id, _load in slot_load_items:
+            ov = ctx.slot_overload_by_slot.get(slot_id)
+            ov_val = int(solver.Value(ov)) if ov is not None else 0
+            overload_items.append((slot_id, int(ov_val)))
+
+        if slot_load_items:
+            max_load = max(v for _, v in slot_load_items)
+            avg_load = float(sum(v for _, v in slot_load_items)) / float(len(slot_load_items))
+        else:
+            max_load = 0
+            avg_load = 0.0
+
+        overloaded_slots = [sid for sid, ov in overload_items if int(ov) > 0]
+        top_slots = sorted(slot_load_items, key=lambda kv: kv[1], reverse=True)[:10]
+
+        ctx.solver_stats["room_capacity_total"] = int(total_available_rooms)
+        ctx.solver_stats["slot_load_max"] = int(max_load)
+        ctx.solver_stats["slot_load_avg"] = round(float(avg_load), 3)
+        ctx.solver_stats["slot_overload_total"] = int(sum(ov for _, ov in overload_items))
+        ctx.solver_stats["slot_overloaded_count"] = int(len(overloaded_slots))
+        ctx.solver_stats["slot_overloaded_ids"] = [str(sid) for sid in overloaded_slots[:20]]
+        ctx.solver_stats["slot_load_top10"] = [
+            {"slot_id": str(sid), "load": int(load)} for sid, load in top_slots
+        ]
+        ctx.solver_stats["slot_peak_utilization_pct"] = (
+            round((100.0 * float(max_load) / float(total_available_rooms)), 2)
+            if total_available_rooms > 0
+            else 0.0
+        )
+
+        locked_rows = int(ctx.locked_existing_room_rows_count or 0)
+        locked_events = int(ctx.locked_existing_room_events_count or 0)
+        ctx.solver_stats["locked_existing_room_rows"] = locked_rows
+        ctx.solver_stats["locked_existing_room_events"] = locked_events
+        ctx.solver_stats["locked_existing_room_dedup_delta"] = int(locked_rows - locked_events)
+
+        hot_locked_slots = sorted(
+            (
+                {
+                    "slot_id": str(slot_id),
+                    "rows": int(ctx.locked_existing_room_rows_by_slot.get(slot_id, 0) or 0),
+                    "events": int(ctx.locked_existing_room_events_by_slot.get(slot_id, 0) or 0),
+                    "dedup_delta": int(
+                        (ctx.locked_existing_room_rows_by_slot.get(slot_id, 0) or 0)
+                        - (ctx.locked_existing_room_events_by_slot.get(slot_id, 0) or 0)
+                    ),
+                }
+                for slot_id in set(ctx.locked_existing_room_rows_by_slot.keys())
+                | set(ctx.locked_existing_room_events_by_slot.keys())
+            ),
+            key=lambda row: (int(row["dedup_delta"]), int(row["rows"])),
+            reverse=True,
+        )[:10]
+        ctx.solver_stats["locked_existing_room_slots_top10"] = hot_locked_slots
+    except Exception:
+        import logging as _logging
+        _logging.getLogger(__name__).warning("Failed to compute slot-load stats", exc_info=True)
 
     # Section gap metrics
     try:
@@ -418,6 +557,70 @@ def _make_entry(ctx: SolverContext, **kwargs: Any) -> TimetableEntry:
     return entry
 
 
+def _cp_room_for_theory(ctx: SolverContext, solver: cp_model.CpSolver, sec_id: Any, subj_id: Any, slot_id: Any) -> Any | None:
+    _ensure_cp_room_lookups(ctx, solver)
+    return (getattr(ctx, "_cp_room_lookup_theory", {}) or {}).get((sec_id, subj_id, slot_id))
+
+
+def _cp_room_for_combined(ctx: SolverContext, solver: cp_model.CpSolver, gid: Any, slot_id: Any) -> Any | None:
+    _ensure_cp_room_lookups(ctx, solver)
+    return (getattr(ctx, "_cp_room_lookup_combined", {}) or {}).get((gid, slot_id))
+
+
+def _cp_room_for_elective(ctx: SolverContext, solver: cp_model.CpSolver, block_id: Any, batch_idx: int, slot_id: Any) -> Any | None:
+    _ensure_cp_room_lookups(ctx, solver)
+    return (getattr(ctx, "_cp_room_lookup_elective", {}) or {}).get((block_id, int(batch_idx), slot_id))
+
+
+def _cp_room_for_lab(ctx: SolverContext, solver: cp_model.CpSolver, sec_id: Any, subj_id: Any, day: int, start_idx: int) -> Any | None:
+    _ensure_cp_room_lookups(ctx, solver)
+    return (getattr(ctx, "_cp_room_lookup_lab", {}) or {}).get((sec_id, subj_id, int(day), int(start_idx)))
+
+
+def _ensure_cp_room_lookups(ctx: SolverContext, solver: cp_model.CpSolver) -> None:
+    if bool(getattr(ctx, "_cp_room_lookup_ready", False)):
+        return
+
+    theory: dict[tuple[Any, Any, Any], Any] = {}
+    combined: dict[tuple[Any, Any], Any] = {}
+    elective: dict[tuple[Any, int, Any], Any] = {}
+    lab: dict[tuple[Any, Any, int, int], Any] = {}
+
+    for (sec_id, subj_id, slot_id, room_id), rv in ctx.x_room.items():
+        try:
+            if int(solver.Value(rv)) == 1:
+                theory[(sec_id, subj_id, slot_id)] = room_id
+        except Exception:
+            continue
+
+    for (gid, slot_id, room_id), rv in ctx.combined_room.items():
+        try:
+            if int(solver.Value(rv)) == 1:
+                combined[(gid, slot_id)] = room_id
+        except Exception:
+            continue
+
+    for (block_id, batch_idx, slot_id, room_id), rv in ctx.z_room.items():
+        try:
+            if int(solver.Value(rv)) == 1:
+                elective[(block_id, int(batch_idx), slot_id)] = room_id
+        except Exception:
+            continue
+
+    for (sec_id, subj_id, day, start_idx, room_id), rv in ctx.lab_room.items():
+        try:
+            if int(solver.Value(rv)) == 1:
+                lab[(sec_id, subj_id, int(day), int(start_idx))] = room_id
+        except Exception:
+            continue
+
+    setattr(ctx, "_cp_room_lookup_theory", theory)
+    setattr(ctx, "_cp_room_lookup_combined", combined)
+    setattr(ctx, "_cp_room_lookup_elective", elective)
+    setattr(ctx, "_cp_room_lookup_lab", lab)
+    setattr(ctx, "_cp_room_lookup_ready", True)
+
+
 def _write_special_entries(ctx: SolverContext) -> None:
     run = ctx.run
     tenant_id = ctx.tenant_id
@@ -478,7 +681,11 @@ def _write_theory_entries(ctx: SolverContext, solver: cp_model.CpSolver) -> None
         if fixed_room is not None:
             room_id, ok_room = fixed_room, True
         else:
-            room_id, ok_room = pick_room(ctx, slot_id, str(subj.subject_type), section_id=sec_id, subject_id=subj_id)
+            cp_room = _cp_room_for_theory(ctx, solver, sec_id, subj_id, slot_id)
+            if cp_room is not None:
+                room_id, ok_room = cp_room, True
+            else:
+                room_id, ok_room = pick_room(ctx, slot_id, str(subj.subject_type), section_id=sec_id, subject_id=subj_id)
         if room_id is None:
             continue
 
@@ -521,7 +728,7 @@ def _write_theory_entries(ctx: SolverContext, solver: cp_model.CpSolver) -> None
         )
 
 
-def _emit_block_batch_occurrence(ctx: SolverContext, block_id: Any, batch_idx: int, slot_id: Any) -> None:
+def _emit_block_batch_occurrence(ctx: SolverContext, solver: cp_model.CpSolver, block_id: Any, batch_idx: int, slot_id: Any) -> None:
     """Emit timetable entries for one elective batch occurrence."""
     run = ctx.run
     tenant_id = ctx.tenant_id
@@ -575,9 +782,13 @@ def _emit_block_batch_occurrence(ctx: SolverContext, block_id: Any, batch_idx: i
                 )
             room_id = forced
         else:
-            room_id, ok_room = pick_lt_room(ctx, slot_id, subject_id=subj_id)
-            if room_id is None:
-                continue
+            cp_room = _cp_room_for_elective(ctx, solver, block_id, int(batch_idx), slot_id)
+            if cp_room is not None:
+                room_id, ok_room = cp_room, True
+            else:
+                room_id, ok_room = pick_lt_room(ctx, slot_id, subject_id=subj_id)
+                if room_id is None:
+                    continue
 
         combined_conflict_id = elective_group_id(
             run_id=run.id,
@@ -626,13 +837,13 @@ def _write_elective_block_entries(ctx: SolverContext, solver: cp_model.CpSolver)
     for block_id, batch_idx, slot_id in sorted(
         list(ctx.locked_elective_block_batch_slots), key=lambda x: (str(x[0]), int(x[1]), str(x[2]))
     ):
-        _emit_block_batch_occurrence(ctx, block_id, int(batch_idx), slot_id)
+        _emit_block_batch_occurrence(ctx, solver, block_id, int(batch_idx), slot_id)
 
     # Emit solver-chosen batch-level block occurrences.
     for (block_id, batch_idx, slot_id), zv in ctx.z.items():
         if solver.Value(zv) != 1:
             continue
-        _emit_block_batch_occurrence(ctx, block_id, int(batch_idx), slot_id)
+        _emit_block_batch_occurrence(ctx, solver, block_id, int(batch_idx), slot_id)
 
 
 def _write_combined_theory_entries(ctx: SolverContext, solver: cp_model.CpSolver) -> None:
@@ -669,7 +880,11 @@ def _write_combined_theory_entries(ctx: SolverContext, solver: cp_model.CpSolver
         if fixed_rooms:
             room_id, ok_room = fixed_rooms[0], True
         else:
-            room_id, ok_room = pick_lt_room(ctx, slot_id, subject_id=subj_id)
+            cp_room = _cp_room_for_combined(ctx, solver, group_id, slot_id)
+            if cp_room is not None:
+                room_id, ok_room = cp_room, True
+            else:
+                room_id, ok_room = pick_lt_room(ctx, slot_id, subject_id=subj_id)
         if room_id is None:
             continue
         if not ok_room:
@@ -734,7 +949,11 @@ def _write_lab_entries(ctx: SolverContext, solver: cp_model.CpSolver) -> None:
         if fixed_rooms:
             room_id, ok_room = fixed_rooms[0], True
         else:
-            room_id, ok_room = pick_room_for_block(ctx, slot_ids, subject_id=subj_id)
+            cp_room = _cp_room_for_lab(ctx, solver, sec_id, subj_id, int(day), int(start_idx))
+            if cp_room is not None:
+                room_id, ok_room = cp_room, True
+            else:
+                room_id, ok_room = pick_room_for_block(ctx, slot_ids, subject_id=subj_id)
         if room_id is None:
             continue
 

@@ -23,6 +23,8 @@ def add_objective(ctx: SolverContext) -> None:
     W_TEACHER_GAP      = 300   # reduce wasted teacher wait-time
     W_DAILY_BALANCE    = 300   # even-out heavy vs light days
     W_TEACHER_OVERLOAD = 700   # discourage weekly overflow but keep model feasible
+    W_SLOT_BALANCE     = 220   # smooth class density across slots
+    W_SLOT_OVERLOAD    = 500   # discourage high-density slot congestion
     W_LATE_SLOT        =  10   # 10 × slot_index: penalise later time slots
     W_FRIDAY_LAST      =  50   # flat penalty per class in the last slot on Friday
 
@@ -51,6 +53,14 @@ def add_objective(ctx: SolverContext) -> None:
     if ctx.teacher_weekly_overload_terms:
         for ov in ctx.teacher_weekly_overload_terms:
             tier_primary.append(ov * W_TEACHER_OVERLOAD)
+
+    # ── 2c. Slot load balancing and anti-congestion ────────────────────
+    if ctx.slot_deviation_terms:
+        for dv in ctx.slot_deviation_terms:
+            tier_primary.append(dv * W_SLOT_BALANCE)
+    if ctx.slot_overload_terms:
+        for ov in ctx.slot_overload_terms:
+            tier_primary.append(ov * W_SLOT_OVERLOAD)
 
     # ── 3. Teacher internal gaps ─────────────────────────────────────────
     if ctx.teacher_gap_terms:

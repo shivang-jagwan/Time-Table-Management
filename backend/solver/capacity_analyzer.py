@@ -455,29 +455,47 @@ def analyze_capacity(data: dict[str, Any], debug: bool = False) -> dict[str, Any
                 }
             )
 
-    # Elective blocks add explicit teacher demand per section.
+    # Elective blocks: one section attends one elective per block session.
+    # Do not sum all subject-teacher pairs as mandatory load.
+    unresolved_elective_teacher_slots = 0
     for sec_id, block_ids in blocks_by_section.items():
         for block_id in block_ids or []:
-            for subj_id, tid in block_subject_pairs_by_block.get(block_id, []) or []:
-                if tid is None:
-                    continue
-                subj = subject_by_id.get(subj_id)
-                if subj is None:
-                    continue
-                spw = int(getattr(subj, "sessions_per_week", 0) or 0)
-                if spw <= 0:
-                    continue
-                slots_needed = int(_slots_for_subject(subj, spw))
+            pairs = block_subject_pairs_by_block.get(block_id, []) or []
+            if not pairs:
+                continue
+
+            first_subject = subject_by_id.get(pairs[0][0])
+            if first_subject is None:
+                continue
+            spw = int(getattr(first_subject, "sessions_per_week", 0) or 0)
+            if spw <= 0:
+                continue
+            slots_needed = int(_slots_for_subject(first_subject, spw))
+
+            teacher_candidates = sorted(
+                {tid for _subj_id, tid in pairs if tid is not None},
+                key=lambda x: str(x),
+            )
+            if not teacher_candidates:
+                continue
+
+            # If the block has a single teacher candidate, the load is deterministic.
+            if len(teacher_candidates) == 1:
+                tid = teacher_candidates[0]
                 required_by_teacher[tid] += int(slots_needed)
                 teacher_contrib[tid].append(
                     {
                         "source": "ELECTIVE_BLOCK",
                         "block_id": str(block_id),
                         "section_code": getattr(section_by_id.get(sec_id), "code", None),
-                        "subject_code": getattr(subj, "code", None),
+                        "subject_code": getattr(first_subject, "code", None),
                         "slots": int(slots_needed),
                     }
                 )
+                continue
+
+            # Multiple teacher options: load is flexible and should not be double-counted.
+            unresolved_elective_teacher_slots += int(slots_needed)
 
     # 2) Available capacity per Teacher/Room type/Section
     available_by_teacher: dict[Any, int] = {}
@@ -676,6 +694,7 @@ def analyze_capacity(data: dict[str, Any], debug: bool = False) -> dict[str, Any
         "available_by_room_type": {k: int(v) for k, v in available_by_room_type.items()},
         "available_by_section": {str(k): int(v) for k, v in available_by_section.items()},
         "group_domain_size": {str(k): int(v) for k, v in group_domain_size.items()},
+        "unresolved_elective_teacher_slots": int(unresolved_elective_teacher_slots),
     }
 
     return {

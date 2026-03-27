@@ -239,6 +239,27 @@ class SolverContext:
 
     room_terms_by_slot: dict[Any, list] = field(default_factory=lambda: defaultdict(list))
     lab_room_terms_by_slot: dict[Any, list] = field(default_factory=lambda: defaultdict(list))
+    # Per-(room,slot) occupancy terms for room-aware CP-SAT assignment.
+    room_slot_terms: dict[tuple[Any, Any], list] = field(default_factory=lambda: defaultdict(list))
+    # Constant locked occupancy per-(room,slot) from fixed/special entries.
+    locked_room_usage_by_room_slot: dict[tuple[Any, Any], int] = field(default_factory=lambda: defaultdict(int))
+    # Diagnostics: persisted locked rows vs deduped physical events.
+    locked_existing_room_rows_count: int = 0
+    locked_existing_room_events_count: int = 0
+    locked_existing_room_rows_by_slot: dict[Any, int] = field(default_factory=lambda: defaultdict(int))
+    locked_existing_room_events_by_slot: dict[Any, int] = field(default_factory=lambda: defaultdict(int))
+
+    # Room assignment decision variables
+    x_room: dict[tuple[Any, Any, Any, Any], Any] = field(default_factory=dict)
+    z_room: dict[tuple[Any, int, Any, Any], Any] = field(default_factory=dict)
+    combined_room: dict[tuple[Any, Any, Any], Any] = field(default_factory=dict)
+    lab_room: dict[tuple[Any, Any, int, int, Any], Any] = field(default_factory=dict)
+
+    # Slot load and congestion balancing helpers
+    slot_load_vars: dict[Any, Any] = field(default_factory=dict)
+    slot_deviation_terms: list[Any] = field(default_factory=list)
+    slot_overload_terms: list[Any] = field(default_factory=list)
+    slot_overload_by_slot: dict[Any, Any] = field(default_factory=dict)
 
     # Compactness/gap (built in constraints phase)
     occ_by_section_day: dict[tuple[Any, int], list[tuple[int, Any]]] = field(default_factory=dict)

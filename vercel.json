@@ -1,0 +1,20 @@
+{
+  "version": 2,
+  "installCommand": "cd frontend && npm install",
+  "buildCommand": "cd frontend && npm run build",
+  "outputDirectory": "frontend/dist",
+  "rewrites": [
+    {
+      "source": "/api/health",
+      "destination": "https://time-table-management-mek3.onrender.com/health"
+    },
+    {
+      "source": "/api/(.*)",
+      "destination": "https://time-table-management-mek3.onrender.com/api/$1"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
+    }
+  ]
+}
