@@ -59,7 +59,7 @@ export function Subjects() {
     if (payload.max_per_day > payload.sessions_per_week) errors.push('Max/day must be <= Sessions/week')
 
     if (st === 'THEORY') {
-      if (payload.lab_block_size_slots !== 1) errors.push('For THEORY, Lab block size must be 1')
+      // THEORY can use any block size >= 1.
     } else if (st === 'LAB') {
       if (payload.lab_block_size_slots < 2) errors.push('For LAB, Lab block size must be >= 2')
     } else {
@@ -75,10 +75,7 @@ export function Subjects() {
 
   function effectiveWeeklyLoad(s: Subject): number {
     const spw = Number(s.sessions_per_week ?? 0)
-    if (String(s.subject_type).toUpperCase() === 'LAB') {
-      return spw * Number(s.lab_block_size_slots ?? 1)
-    }
-    return spw
+    return spw * Number(s.lab_block_size_slots ?? 1)
   }
 
   function openEdit(s: Subject) {
@@ -124,8 +121,7 @@ export function Subjects() {
       subject_type: form.subject_type,
       sessions_per_week: Number(form.sessions_per_week),
       max_per_day: Number(form.max_per_day),
-      lab_block_size_slots:
-        String(form.subject_type).toUpperCase() === 'THEORY' ? 1 : Number(form.lab_block_size_slots),
+      lab_block_size_slots: Number(form.lab_block_size_slots),
     }
     const errors = validateSubjectPayload(next)
     if (errors.length) {
@@ -162,8 +158,7 @@ export function Subjects() {
     const normalized: SubjectPut = {
       ...payload,
       subject_type: String(payload.subject_type).toUpperCase(),
-      lab_block_size_slots:
-        String(payload.subject_type).toUpperCase() === 'THEORY' ? 1 : payload.lab_block_size_slots,
+      lab_block_size_slots: Number(payload.lab_block_size_slots),
     }
     const errors = validateSubjectPayload({
       subject_type: normalized.subject_type,
@@ -276,9 +271,9 @@ export function Subjects() {
                       ...f,
                       subject_type: nextType,
                       lab_block_size_slots:
-                        String(nextType).toUpperCase() === 'THEORY'
-                          ? 1
-                          : Math.max(2, Number(f.lab_block_size_slots ?? 2)),
+                        String(nextType).toUpperCase() === 'LAB'
+                          ? Math.max(2, Number(f.lab_block_size_slots ?? 2))
+                          : Math.max(1, Number(f.lab_block_size_slots ?? 1)),
                     }))
                   }}
                   options={SUBJECT_TYPES.map((t) => ({ value: t.value, label: t.label }))}
@@ -329,23 +324,16 @@ export function Subjects() {
               </div>
               <div>
                 <label htmlFor="sub_lab" className="text-xs font-medium text-slate-600">
-                  Lab block slots
+                  Block slots
                 </label>
                 <input
                   id="sub_lab"
                   type="number"
                   min={String(form.subject_type).toUpperCase() === 'LAB' ? 2 : 1}
-                  className={
-                    'input-premium mt-1 w-full text-sm ' +
-                    (String(form.subject_type).toUpperCase() === 'THEORY' ? 'bg-slate-50 text-slate-700' : '')
-                  }
+                  className="input-premium mt-1 w-full text-sm"
                   value={form.lab_block_size_slots}
                   onChange={(e) => setForm((f) => ({ ...f, lab_block_size_slots: Number(e.target.value) }))}
-                  disabled={String(form.subject_type).toUpperCase() === 'THEORY'}
                 />
-                {String(form.subject_type).toUpperCase() === 'THEORY' && (
-                  <div className="mt-1 text-[11px] text-slate-500">THEORY uses block size 1.</div>
-                )}
               </div>
             </div>
 
@@ -398,7 +386,7 @@ export function Subjects() {
                   <th className="px-3 py-2 text-left font-semibold">Type</th>
                   <th className="px-3 py-2 text-left font-semibold">/week</th>
                   <th className="px-3 py-2 text-left font-semibold">Max/day</th>
-                  <th className="px-3 py-2 text-left font-semibold">Lab block</th>
+                  <th className="px-3 py-2 text-left font-semibold">Block</th>
                   <th className="px-3 py-2 text-left font-semibold">Effective Weekly Load</th>
                   <th className="px-3 py-2 text-left font-semibold">Active</th>
                   <th className="px-3 py-2 text-right font-semibold">Actions</th>

@@ -242,13 +242,32 @@ def create_section(
     ay = _get_or_create_academic_year(db, int(payload.academic_year_number), tenant_id=tenant_id)
 
     track = _validate_track(payload.track)
-    _ensure_unique_section_code(
-        db,
-        program_id=program.id,
-        code=payload.code,
-        exclude_section_id=None,
-        tenant_id=tenant_id,
-    )
+
+    # If a soft-deleted section with the same code exists, revive it so callers
+    # don't get stuck with SECTION_CODE_ALREADY_EXISTS for hidden inactive rows.
+    q_existing = select(Section).where(Section.program_id == program.id).where(Section.code == payload.code)
+    q_existing = where_tenant(q_existing, Section, tenant_id)
+    existing = db.execute(q_existing.limit(1)).scalar_one_or_none()
+    if existing is not None:
+        if bool(existing.is_active):
+            raise HTTPException(status_code=409, detail="SECTION_CODE_ALREADY_EXISTS")
+
+        existing.academic_year_id = ay.id
+        existing.name = payload.name
+        existing.strength = payload.strength
+        existing.track = track
+        existing.is_active = bool(payload.is_active)
+        existing.max_daily_slots = payload.max_daily_slots
+
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            raise HTTPException(status_code=409, detail="CONFLICT")
+
+        db.refresh(existing)
+        cache_delete_prefix(f"sections:list:{_tenant_scope_key(tenant_id)}")
+        return existing
 
     section = Section(
         tenant_id=tenant_id,

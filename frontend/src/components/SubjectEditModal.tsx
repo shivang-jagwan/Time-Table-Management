@@ -46,10 +46,14 @@ function subjectToForm(s: Subject): FormState {
 function normalizeForm(f: FormState): FormState {
   const st = String(f.subject_type).toUpperCase()
   if (st === 'THEORY') {
-    return { ...f, subject_type: 'THEORY', lab_block_size_slots: 1 }
+    return { ...f, subject_type: 'THEORY' }
   }
   if (st === 'LAB') {
-    return { ...f, subject_type: 'LAB' }
+    return {
+      ...f,
+      subject_type: 'LAB',
+      lab_block_size_slots: Math.max(2, Number(f.lab_block_size_slots ?? 2)),
+    }
   }
   return f
 }
@@ -67,7 +71,7 @@ function validateForm(f: FormState): string[] {
   if (f.max_per_day > f.sessions_per_week) errors.push('Max/day must be <= Sessions/week')
 
   if (st === 'THEORY') {
-    if (f.lab_block_size_slots !== 1) errors.push('For THEORY, Lab block size must be 1')
+    // THEORY can use any block size >= 1.
   } else if (st === 'LAB') {
     if (Number.isNaN(f.lab_block_size_slots) || f.lab_block_size_slots < 2)
       errors.push('For LAB, Lab block size must be >= 2')
@@ -231,8 +235,18 @@ export function SubjectEditModal({ open, subject, loading, onClose, onSave }: Su
                   onValueChange={(nextType) => {
                     setForm((f) => {
                       if (!f) return f
-                      if (nextType === 'THEORY') return { ...f, subject_type: 'THEORY', lab_block_size_slots: 1 }
-                      return { ...f, subject_type: 'LAB' }
+                      if (nextType === 'THEORY') {
+                        return {
+                          ...f,
+                          subject_type: 'THEORY',
+                          lab_block_size_slots: Math.max(1, Number(f.lab_block_size_slots ?? 1)),
+                        }
+                      }
+                      return {
+                        ...f,
+                        subject_type: 'LAB',
+                        lab_block_size_slots: Math.max(2, Number(f.lab_block_size_slots ?? 2)),
+                      }
                     })
                   }}
                   options={SUBJECT_TYPES.map((t) => ({ value: t.value, label: t.label }))}
@@ -280,27 +294,21 @@ export function SubjectEditModal({ open, subject, loading, onClose, onSave }: Su
                 />
               </div>
               <div>
-                {subjectType === 'LAB' ? (
-                  <>
-                    <label htmlFor={`${idPrefix}_lbs`} className="text-xs font-medium text-slate-600">
-                      Lab block size
-                    </label>
-                    <input
-                      id={`${idPrefix}_lbs`}
-                      type="number"
-                      min={2}
-                      className="input-premium mt-1 w-full text-sm"
-                      value={normalized.lab_block_size_slots}
-                      onChange={(e) =>
-                        setForm((f) =>
-                          f ? { ...f, lab_block_size_slots: Number(e.target.value) } : f,
-                        )
-                      }
-                    />
-                  </>
-                ) : (
-                  <div className="mt-6 text-xs text-slate-500">THEORY uses block size 1.</div>
-                )}
+                <label htmlFor={`${idPrefix}_lbs`} className="text-xs font-medium text-slate-600">
+                  Block slots
+                </label>
+                <input
+                  id={`${idPrefix}_lbs`}
+                  type="number"
+                  min={subjectType === 'LAB' ? 2 : 1}
+                  className="input-premium mt-1 w-full text-sm"
+                  value={normalized.lab_block_size_slots}
+                  onChange={(e) =>
+                    setForm((f) =>
+                      f ? { ...f, lab_block_size_slots: Number(e.target.value) } : f,
+                    )
+                  }
+                />
               </div>
             </div>
 
