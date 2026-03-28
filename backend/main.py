@@ -327,11 +327,15 @@ def create_app() -> FastAPI:
         pass
 
     allow_origins = [settings.frontend_origin]
-    allow_origin_regex = None
+    allow_origin_regex = settings.frontend_origin_regex or None
     if not is_production:
         # Dev-friendly: allow the configured origin and any localhost port.
         allow_origins.extend(["http://localhost:5173", "http://127.0.0.1:5173"])
-        allow_origin_regex = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
+        local_origin_regex = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
+        if allow_origin_regex:
+            allow_origin_regex = f"(?:{allow_origin_regex})|(?:{local_origin_regex})"
+        else:
+            allow_origin_regex = local_origin_regex
 
     app.add_middleware(
         CORSMiddleware,

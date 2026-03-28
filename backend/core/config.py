@@ -83,6 +83,10 @@ class Settings(BaseSettings):
         default="http://localhost:5173",
         validation_alias=AliasChoices("frontend_origin", "FRONTEND_ORIGIN"),
     )
+    frontend_origin_regex: str | None = Field(
+        default=r"^https://time-table-management(?:-[a-z0-9-]+)?\.vercel\.app$",
+        validation_alias=AliasChoices("frontend_origin_regex", "FRONTEND_ORIGIN_REGEX"),
+    )
 
     # Solver
     # When enabled, the solver fails fast instead of persisting conflicting room assignments.
@@ -120,6 +124,14 @@ class Settings(BaseSettings):
         # Render/Vercel UI often leads people to paste a trailing slash.
         # Starlette CORS expects the Origin to match exactly (no trailing slash).
         return v.strip().rstrip("/")
+
+    @field_validator("frontend_origin_regex")
+    @classmethod
+    def _normalize_frontend_origin_regex(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
 
     @field_validator("cookie_samesite")
     @classmethod
