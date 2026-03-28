@@ -33,13 +33,24 @@ from models.section_elective_block import SectionElectiveBlock
 from models.subject_allowed_room import SubjectAllowedRoom
 
 
+def _duration_slots(value: Any) -> int:
+    duration_raw = getattr(value, "duration_slots", None)
+    legacy_raw = getattr(value, "lab_block_size_slots", None)
+
+    duration = int(duration_raw or 0) if duration_raw is not None else 0
+    legacy = int(legacy_raw or 0) if legacy_raw is not None else 0
+
+    if duration < 1:
+        duration = legacy
+    if legacy >= 1 and duration != legacy:
+        duration = legacy
+    if duration < 1:
+        duration = 1
+    return duration
+
+
 def _slots_for_subject(subj: Any, sessions_per_week: int) -> int:
-    if str(getattr(subj, "subject_type", "THEORY")) == "LAB":
-        block = int(getattr(subj, "lab_block_size_slots", 1) or 1)
-        if block < 1:
-            block = 1
-        return int(sessions_per_week) * int(block)
-    return int(sessions_per_week)
+    return int(sessions_per_week) * int(_duration_slots(subj))
 
 
 def build_capacity_data(
@@ -94,7 +105,7 @@ def build_capacity_data(
                         continue
                     mapped_subject_ids_by_section[sec_id].append(subj_id)
                     sessions_per_week_by_section_subject[(sec_id, subj_id)] = int(getattr(row, "sessions_per_week", 0) or 0)
-                    lab_block_by_section_subject[(sec_id, subj_id)] = int(getattr(row, "lab_block_size_slots", 1) or 1)
+                    lab_block_by_section_subject[(sec_id, subj_id)] = int(_duration_slots(row))
 
             # Apply curriculum overrides even when section_subjects mapping exists.
             for subj_id in mapped_subject_ids_by_section.get(sec_id, []):
@@ -102,7 +113,7 @@ def build_capacity_data(
                 if row is None:
                     continue
                 sessions_per_week_by_section_subject[(sec_id, subj_id)] = int(getattr(row, "sessions_per_week", 0) or 0)
-                lab_block_by_section_subject[(sec_id, subj_id)] = int(getattr(row, "lab_block_size_slots", 1) or 1)
+                lab_block_by_section_subject[(sec_id, subj_id)] = int(_duration_slots(row))
     elif table_exists(db, "track_subjects"):
         year_ids = sorted({s.academic_year_id for s in sections if getattr(s, "academic_year_id", None) is not None})
         q_track = select(TrackSubject).where(TrackSubject.program_id == program_id)
@@ -130,7 +141,7 @@ def build_capacity_data(
                     sessions_per_week_by_section_subject[(sec_id, row.subject_id)] = int(
                         getattr(row, "sessions_override", None) if getattr(row, "sessions_override", None) is not None else fallback_sessions
                     )
-                    lab_block_by_section_subject[(sec_id, row.subject_id)] = int(getattr(subj, "lab_block_size_slots", 1) or 1)
+                    lab_block_by_section_subject[(sec_id, row.subject_id)] = int(_duration_slots(subj))
 
     # Elective blocks and their (subject, teacher) pairs.
     if section_ids and table_exists(db, "section_elective_blocks") and table_exists(db, "elective_block_subjects"):
@@ -277,6 +288,7 @@ def build_capacity_data(
         "active_days": active_days,
         "mapped_subject_ids_by_section": mapped_subject_ids_by_section,
         "sessions_per_week_by_section_subject": sessions_per_week_by_section_subject,
+        "duration_by_section_subject": lab_block_by_section_subject,
         "lab_block_by_section_subject": lab_block_by_section_subject,
         "blocks_by_section": dict(blocks_by_section),
         "block_subject_pairs_by_block": dict(block_subject_pairs_by_block),
@@ -318,18 +330,16 @@ def analyze_capacity(data: dict[str, Any], debug: bool = False) -> dict[str, Any
             )
             or 0
         )
-        if str(getattr(subj, "subject_type", "THEORY")) == "LAB":
-            block = int(
-                lab_block_by_section_subject.get(
-                    (sec_id, subj_id),
-                    getattr(subj, "lab_block_size_slots", 1) or 1,
-                )
-                or 1
+        duration = int(
+            lab_block_by_section_subject.get(
+                (sec_id, subj_id),
+                _duration_slots(subj),
             )
-            if block < 1:
-                block = 1
-            return sessions * block
-        return sessions
+            or 1
+        )
+        if duration < 1:
+            duration = 1
+        return sessions * duration
 
     # Build window slot sets per section and lock counts per day
     window_slot_ids_by_section: dict[Any, set[Any]] = defaultdict(set)
@@ -594,8 +604,8 @@ def analyze_capacity(data: dict[str, Any], debug: bool = False) -> dict[str, Any
     for gid, domain_size in group_domain_size.items():
         subj_id = group_subject.get(gid)
         subj = subject_by_id.get(subj_id)
-        spw = int(getattr(subj, "sessions_per_week", 0) or 0) if subj is not None else 0
-        if spw > int(domain_size):
+        required_slots = _slots_for_subject(subj, int(getattr(subj, "sessions_per_week", 0) or 0)) if subj is not None else 0
+        if required_slots > int(domain_size):
             issues.append(
                 {
                     "type": "COMBINED_DOMAIN_COLLAPSE",
@@ -603,9 +613,9 @@ def analyze_capacity(data: dict[str, Any], debug: bool = False) -> dict[str, Any
                     "resource_type": "COMBINED_GROUP",
                     "group_id": str(gid),
                     "subject_id": str(subj_id) if subj_id is not None else None,
-                    "required_slots": int(spw),
+                    "required_slots": int(required_slots),
                     "available_slots": int(domain_size),
-                    "shortage": int(spw) - int(domain_size),
+                    "shortage": int(required_slots) - int(domain_size),
                 }
             )
 

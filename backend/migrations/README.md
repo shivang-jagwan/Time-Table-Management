@@ -34,3 +34,10 @@ Apply:
 Teacher `email` and `phone` are removed from the API/UI. If you want to physically drop the unused DB columns:
 
 `python migrations/run_sql.py migrations/020_drop_teacher_email_phone.sql`
+
+## 2026-03: Dedicated duration columns
+
+Add `duration_slots` to `subjects` and `curriculum_subjects` (with legacy
+`lab_block_size_slots` synchronization for backward compatibility):
+
+`python migrations/run_sql.py migrations/040_add_duration_slots_columns.sql`

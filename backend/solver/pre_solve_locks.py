@@ -44,6 +44,18 @@ def contiguous_starts(sorted_indices: list[int], block: int) -> Iterator[int]:
             yield start
 
 
+def _covered_slots_for_block(ctx: SolverContext, *, day: int, start_idx: int, block: int) -> list[Any]:
+    """Return contiguous slot objects for a block start, or [] if incomplete."""
+    block = max(1, int(block))
+    covered: list[Any] = []
+    for j in range(block):
+        ts = ctx.slot_by_day_index.get((int(day), int(start_idx) + j))
+        if ts is None:
+            return []
+        covered.append(ts)
+    return covered
+
+
 def apply_pre_solve_locks(ctx: SolverContext) -> None:
     """Process special allotments and fixed entries, marking slots as locked."""
     _ensure_elective_batches(ctx)
@@ -130,23 +142,22 @@ def _apply_special_allotments(ctx: SolverContext) -> None:
         if di is None:
             continue
         day, slot_idx = int(di[0]), int(di[1])
+        section = ctx.section_by_id.get(sa.section_id)
+        track = str(getattr(section, "track", "CORE") or "CORE")
+        block = max(1, int(ctx.duration_for(sa.subject_id, track=track) or 1))
+        covered_slots = _covered_slots_for_block(ctx, day=day, start_idx=slot_idx, block=block)
+        if not covered_slots:
+            continue
 
         if str(subj.subject_type) == "LAB":
-            block = ctx.lab_block_for(sa.subject_id)
-            if block < 1:
-                block = 1
             ctx.locked_lab_sessions_by_sec_subj[(sa.section_id, sa.subject_id)] += 1
             ctx.locked_lab_sessions_by_sec_subj_day[(sa.section_id, sa.subject_id, day)] += 1
 
-            for j in range(block):
-                ts = ctx.slot_by_day_index.get((day, slot_idx + j))
-                if ts is None:
-                    continue
-
+            for ts in covered_slots:
                 ctx.locked_section_slots.add((sa.section_id, ts.id))
                 ctx.locked_teacher_slots.add((sa.teacher_id, ts.id))
                 ctx.locked_teacher_slot_day[(sa.teacher_id, ts.id)] = day
-                ctx.locked_slot_indices_by_section_day[(sa.section_id, day)].add(int(slot_idx + j))
+                ctx.locked_slot_indices_by_section_day[(sa.section_id, day)].add(int(ts.slot_index))
 
                 ctx.allowed_slots_by_section[sa.section_id].discard(ts.id)
                 ctx.special_room_by_section_slot[(sa.section_id, ts.id)] = sa.room_id
@@ -171,33 +182,37 @@ def _apply_special_allotments(ctx: SolverContext) -> None:
                     ctx.locked_elective_sessions_by_block_batch_day[(block_id, int(batch_idx), day)] += 1
 
                     for sec_id in ctx.elective_batches_by_block.get(block_id, [])[int(batch_idx)]:
-                        ctx.locked_section_slots.add((sec_id, sa.slot_id))
-                        ctx.locked_slot_indices_by_section_day[(sec_id, day)].add(int(slot_idx))
-                        ctx.allowed_slots_by_section[sec_id].discard(sa.slot_id)
+                        for ts in covered_slots:
+                            ctx.locked_section_slots.add((sec_id, ts.id))
+                            ctx.locked_slot_indices_by_section_day[(sec_id, day)].add(int(ts.slot_index))
+                            ctx.allowed_slots_by_section[sec_id].discard(ts.id)
 
                     for _subj_id, teacher_id in pairs:
-                        ctx.locked_teacher_slots.add((teacher_id, sa.slot_id))
-                        ctx.locked_teacher_slot_day[(teacher_id, sa.slot_id)] = day
+                        for ts in covered_slots:
+                            ctx.locked_teacher_slots.add((teacher_id, ts.id))
+                            ctx.locked_teacher_slot_day[(teacher_id, ts.id)] = day
 
-                    ctx.locked_block_theory_room_demand_by_slot[sa.slot_id] += int(
-                        max(0, len(pairs) - 1)
-                    )
+                    for ts in covered_slots:
+                        ctx.locked_block_theory_room_demand_by_slot[ts.id] += int(
+                            max(0, len(pairs) - 1)
+                        )
 
                 ctx.forced_room_by_block_batch_subject_slot[(block_id, int(batch_idx), sa.subject_id, sa.slot_id)] = sa.room_id
                 continue
 
         ctx.locked_theory_sessions_by_sec_subj[(sa.section_id, sa.subject_id)] += 1
         ctx.locked_theory_sessions_by_sec_subj_day[(sa.section_id, sa.subject_id, day)] += 1
-        ctx.locked_section_slots.add((sa.section_id, sa.slot_id))
-        ctx.locked_teacher_slots.add((sa.teacher_id, sa.slot_id))
-        ctx.locked_teacher_slot_day[(sa.teacher_id, sa.slot_id)] = day
-        ctx.locked_slot_indices_by_section_day[(sa.section_id, day)].add(int(slot_idx))
+        for ts in covered_slots:
+            ctx.locked_section_slots.add((sa.section_id, ts.id))
+            ctx.locked_teacher_slots.add((sa.teacher_id, ts.id))
+            ctx.locked_teacher_slot_day[(sa.teacher_id, ts.id)] = day
+            ctx.locked_slot_indices_by_section_day[(sa.section_id, day)].add(int(ts.slot_index))
 
-        ctx.allowed_slots_by_section[sa.section_id].discard(sa.slot_id)
-        ctx.special_room_by_section_slot[(sa.section_id, sa.slot_id)] = sa.room_id
-        ctx.special_entries_to_write.append(
-            (sa.section_id, sa.subject_id, sa.teacher_id, sa.room_id, sa.slot_id)
-        )
+            ctx.allowed_slots_by_section[sa.section_id].discard(ts.id)
+            ctx.special_room_by_section_slot[(sa.section_id, ts.id)] = sa.room_id
+            ctx.special_entries_to_write.append(
+                (sa.section_id, sa.subject_id, sa.teacher_id, sa.room_id, ts.id)
+            )
 
 
 def _apply_fixed_entries(ctx: SolverContext) -> None:
@@ -209,6 +224,12 @@ def _apply_fixed_entries(ctx: SolverContext) -> None:
         if di is None:
             continue
         day, slot_idx = int(di[0]), int(di[1])
+        section = ctx.section_by_id.get(fe.section_id)
+        track = str(getattr(section, "track", "CORE") or "CORE")
+        block = max(1, int(ctx.duration_for(fe.subject_id, track=track) or 1))
+        covered_slots = _covered_slots_for_block(ctx, day=day, start_idx=slot_idx, block=block)
+        if not covered_slots:
+            continue
 
         # Skip combined THEORY here; handled later by forcing combined_x.
         gid = ctx.combined_gid_by_sec_subj.get((fe.section_id, fe.subject_id))
@@ -231,37 +252,32 @@ def _apply_fixed_entries(ctx: SolverContext) -> None:
                     ctx.locked_elective_sessions_by_block_batch_day[(block_id, int(batch_idx), day)] += 1
 
                     for sec_id in ctx.elective_batches_by_block.get(block_id, [])[int(batch_idx)]:
-                        ctx.locked_section_slots.add((sec_id, fe.slot_id))
-                        ctx.locked_slot_indices_by_section_day[(sec_id, day)].add(int(slot_idx))
-                        ctx.allowed_slots_by_section[sec_id].discard(fe.slot_id)
+                        for ts in covered_slots:
+                            ctx.locked_section_slots.add((sec_id, ts.id))
+                            ctx.locked_slot_indices_by_section_day[(sec_id, day)].add(int(ts.slot_index))
+                            ctx.allowed_slots_by_section[sec_id].discard(ts.id)
 
                     for _subj_id, teacher_id in pairs:
-                        ctx.locked_teacher_slots.add((teacher_id, fe.slot_id))
-                        ctx.locked_teacher_slot_day[(teacher_id, fe.slot_id)] = day
+                        for ts in covered_slots:
+                            ctx.locked_teacher_slots.add((teacher_id, ts.id))
+                            ctx.locked_teacher_slot_day[(teacher_id, ts.id)] = day
 
-                    ctx.locked_block_theory_room_demand_by_slot[fe.slot_id] += int(len(pairs))
+                    for ts in covered_slots:
+                        ctx.locked_block_theory_room_demand_by_slot[ts.id] += int(len(pairs))
 
                 ctx.forced_room_by_block_batch_subject_slot[(block_id, int(batch_idx), fe.subject_id, fe.slot_id)] = fe.room_id
                 ctx.locked_fixed_entry_ids.add(str(fe.id))
                 continue
 
         if str(subj.subject_type) == "LAB":
-            block = ctx.lab_block_for(fe.subject_id)
-            if block < 1:
-                block = 1
-
             ctx.locked_lab_sessions_by_sec_subj[(fe.section_id, fe.subject_id)] += 1
             ctx.locked_lab_sessions_by_sec_subj_day[(fe.section_id, fe.subject_id, day)] += 1
 
-            for j in range(block):
-                ts = ctx.slot_by_day_index.get((day, slot_idx + j))
-                if ts is None:
-                    continue
-
+            for ts in covered_slots:
                 ctx.locked_section_slots.add((fe.section_id, ts.id))
                 ctx.locked_teacher_slots.add((fe.teacher_id, ts.id))
                 ctx.locked_teacher_slot_day[(fe.teacher_id, ts.id)] = day
-                ctx.locked_slot_indices_by_section_day[(fe.section_id, day)].add(int(slot_idx + j))
+                ctx.locked_slot_indices_by_section_day[(fe.section_id, day)].add(int(ts.slot_index))
 
                 ctx.allowed_slots_by_section[fe.section_id].discard(ts.id)
                 ctx.fixed_room_by_section_slot[(fe.section_id, ts.id)] = fe.room_id
@@ -274,16 +290,17 @@ def _apply_fixed_entries(ctx: SolverContext) -> None:
         # THEORY (and any other non-LAB)
         ctx.locked_theory_sessions_by_sec_subj[(fe.section_id, fe.subject_id)] += 1
         ctx.locked_theory_sessions_by_sec_subj_day[(fe.section_id, fe.subject_id, day)] += 1
-        ctx.locked_section_slots.add((fe.section_id, fe.slot_id))
-        ctx.locked_teacher_slots.add((fe.teacher_id, fe.slot_id))
-        ctx.locked_teacher_slot_day[(fe.teacher_id, fe.slot_id)] = day
-        ctx.locked_slot_indices_by_section_day[(fe.section_id, day)].add(int(slot_idx))
+        for ts in covered_slots:
+            ctx.locked_section_slots.add((fe.section_id, ts.id))
+            ctx.locked_teacher_slots.add((fe.teacher_id, ts.id))
+            ctx.locked_teacher_slot_day[(fe.teacher_id, ts.id)] = day
+            ctx.locked_slot_indices_by_section_day[(fe.section_id, day)].add(int(ts.slot_index))
 
-        ctx.allowed_slots_by_section[fe.section_id].discard(fe.slot_id)
-        ctx.fixed_room_by_section_slot[(fe.section_id, fe.slot_id)] = fe.room_id
-        ctx.fixed_entries_to_write.append(
-            (fe.section_id, fe.subject_id, fe.teacher_id, fe.room_id, fe.slot_id)
-        )
+            ctx.allowed_slots_by_section[fe.section_id].discard(ts.id)
+            ctx.fixed_room_by_section_slot[(fe.section_id, ts.id)] = fe.room_id
+            ctx.fixed_entries_to_write.append(
+                (fe.section_id, fe.subject_id, fe.teacher_id, fe.room_id, ts.id)
+            )
         ctx.locked_fixed_entry_ids.add(str(fe.id))
 
 

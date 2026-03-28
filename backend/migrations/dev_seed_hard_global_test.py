@@ -75,6 +75,24 @@ def _get_id(cur, sql: str, params: tuple) -> str:
     return str(row[0])
 
 
+def _resolve_tenant_id(cur) -> str:
+    cur.execute("SELECT id FROM tenants ORDER BY created_at ASC LIMIT 1")
+    row = cur.fetchone()
+    if row and row[0]:
+        return str(row[0])
+
+    return _upsert_returning_id(
+        cur,
+        """
+INSERT INTO tenants (slug, name)
+VALUES (%s, %s)
+ON CONFLICT (slug) DO UPDATE SET name = EXCLUDED.name
+RETURNING id;
+""",
+        ("default", "Default College"),
+    )
+
+
 def main() -> int:
     backend_dir = Path(__file__).resolve().parents[1]
     _load_env_file(backend_dir / ".env")
@@ -144,16 +162,18 @@ def main() -> int:
 
     with psycopg2.connect(conninfo) as conn:
         with conn.cursor() as cur:
+            tenant_id = _resolve_tenant_id(cur)
+
             # Program
             program_id = _upsert_returning_id(
                 cur,
                 """
-INSERT INTO programs (code, name)
-VALUES (%s, %s)
-ON CONFLICT (code) DO UPDATE SET name = EXCLUDED.name
+INSERT INTO programs (tenant_id, code, name)
+VALUES (%s, %s, %s)
+ON CONFLICT (tenant_id, code) DO UPDATE SET name = EXCLUDED.name
 RETURNING id;
 """,
-                (program_code, program_name),
+                (tenant_id, program_code, program_name),
             )
 
             # Academic years
@@ -162,12 +182,12 @@ RETURNING id;
                 year_ids[y] = _upsert_returning_id(
                     cur,
                     """
-INSERT INTO academic_years (year_number, is_active)
-VALUES (%s, TRUE)
-ON CONFLICT (year_number) DO UPDATE SET is_active = TRUE
+INSERT INTO academic_years (tenant_id, year_number, is_active)
+VALUES (%s, %s, TRUE)
+ON CONFLICT (tenant_id, year_number) DO UPDATE SET is_active = TRUE
 RETURNING id;
 """,
-                    (int(y),),
+                    (tenant_id, int(y)),
                 )
 
             # Rooms
@@ -176,16 +196,16 @@ RETURNING id;
                 room_ids[code] = _upsert_returning_id(
                     cur,
                     """
-INSERT INTO rooms (code, name, room_type, capacity, is_active)
-VALUES (%s, %s, %s, %s, TRUE)
-ON CONFLICT (code) DO UPDATE SET
+INSERT INTO rooms (tenant_id, code, name, room_type, capacity, is_active)
+VALUES (%s, %s, %s, %s, %s, TRUE)
+ON CONFLICT (tenant_id, code) DO UPDATE SET
   name = EXCLUDED.name,
   room_type = EXCLUDED.room_type,
   capacity = EXCLUDED.capacity,
   is_active = TRUE
 RETURNING id;
 """,
-                    (code, name, room_type, 0),
+                                        (tenant_id, code, name, room_type, 0),
                 )
 
             # Time slots
@@ -195,13 +215,13 @@ RETURNING id;
                     end_h = start_h + 1
                     cur.execute(
                         """
-INSERT INTO time_slots (day_of_week, slot_index, start_time, end_time)
-VALUES (%s, %s, %s, %s)
-ON CONFLICT (day_of_week, slot_index) DO UPDATE SET
+INSERT INTO time_slots (tenant_id, day_of_week, slot_index, start_time, end_time)
+VALUES (%s, %s, %s, %s, %s)
+ON CONFLICT (tenant_id, day_of_week, slot_index) DO UPDATE SET
   start_time = EXCLUDED.start_time,
   end_time = EXCLUDED.end_time;
 """,
-                        (int(d), int(slot_index), time(start_h, 0), time(end_h, 0)),
+                                                (tenant_id, int(d), int(slot_index), time(start_h, 0), time(end_h, 0)),
                     )
 
             # Teachers
@@ -210,9 +230,9 @@ ON CONFLICT (day_of_week, slot_index) DO UPDATE SET
                 teacher_ids[t.code] = _upsert_returning_id(
                     cur,
                     """
-INSERT INTO teachers (code, full_name, weekly_off_day, max_per_day, max_per_week, max_continuous, is_active)
-VALUES (%s, %s, %s, %s, %s, %s, TRUE)
-ON CONFLICT (code) DO UPDATE SET
+INSERT INTO teachers (tenant_id, code, full_name, weekly_off_day, max_per_day, max_per_week, max_continuous, is_active)
+VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE)
+ON CONFLICT (tenant_id, code) DO UPDATE SET
   full_name = EXCLUDED.full_name,
   weekly_off_day = EXCLUDED.weekly_off_day,
   max_per_day = EXCLUDED.max_per_day,
@@ -222,6 +242,7 @@ ON CONFLICT (code) DO UPDATE SET
 RETURNING id;
 """,
                     (
+                        tenant_id,
                         t.code,
                         t.full_name,
                         t.weekly_off_day,
@@ -237,19 +258,25 @@ RETURNING id;
                 subject_ids[s.code] = _upsert_returning_id(
                     cur,
                     """
-INSERT INTO subjects (program_id, academic_year_id, code, name, subject_type, sessions_per_week, max_per_day, lab_block_size_slots, is_active)
-VALUES (%s, %s, %s, %s, %s, %s, %s, %s, TRUE)
-ON CONFLICT (academic_year_id, code) DO UPDATE SET
+INSERT INTO subjects (
+    tenant_id, program_id, academic_year_id, code, name,
+    subject_type, sessions_per_week, max_per_day, duration_slots, lab_block_size_slots, is_active
+)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE)
+ON CONFLICT (tenant_id, code) DO UPDATE SET
   program_id = EXCLUDED.program_id,
+    academic_year_id = EXCLUDED.academic_year_id,
   name = EXCLUDED.name,
   subject_type = EXCLUDED.subject_type,
   sessions_per_week = EXCLUDED.sessions_per_week,
   max_per_day = EXCLUDED.max_per_day,
+    duration_slots = EXCLUDED.duration_slots,
   lab_block_size_slots = EXCLUDED.lab_block_size_slots,
   is_active = TRUE
 RETURNING id;
 """,
                     (
+                                                tenant_id,
                         program_id,
                         year_ids[s.year],
                         s.code,
@@ -257,6 +284,7 @@ RETURNING id;
                         s.subject_type,
                         s.sessions_per_week,
                         s.max_per_day,
+                        s.lab_block_size_slots,
                         s.lab_block_size_slots,
                     ),
                 )
@@ -268,10 +296,11 @@ RETURNING id;
                     section_ids[c] = _upsert_returning_id(
                         cur,
                         """
-INSERT INTO sections (program_id, academic_year_id, code, name, strength, track, is_active)
-VALUES (%s, %s, %s, %s, %s, %s, TRUE)
-ON CONFLICT (academic_year_id, code) DO UPDATE SET
+INSERT INTO sections (tenant_id, program_id, academic_year_id, code, name, strength, track, is_active)
+VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE)
+ON CONFLICT (tenant_id, code) DO UPDATE SET
   program_id = EXCLUDED.program_id,
+    academic_year_id = EXCLUDED.academic_year_id,
   name = EXCLUDED.name,
   strength = EXCLUDED.strength,
   track = EXCLUDED.track,
@@ -279,6 +308,7 @@ ON CONFLICT (academic_year_id, code) DO UPDATE SET
 RETURNING id;
 """,
                         (
+                                                        tenant_id,
                             program_id,
                             year_ids[y],
                             c,
@@ -293,28 +323,28 @@ RETURNING id;
             for s in subjects:
                 cur.execute(
                     """
-INSERT INTO track_subjects (program_id, academic_year_id, track, subject_id, is_elective, sessions_override)
-VALUES (%s, %s, %s, %s, FALSE, NULL)
-ON CONFLICT (program_id, academic_year_id, track, subject_id) DO NOTHING;
+INSERT INTO track_subjects (tenant_id, program_id, academic_year_id, track, subject_id, is_elective, sessions_override)
+VALUES (%s, %s, %s, %s, %s, FALSE, NULL)
+ON CONFLICT DO NOTHING;
 """,
-                    (program_id, year_ids[s.year], "CORE", subject_ids[s.code]),
+                    (tenant_id, program_id, year_ids[s.year], "CORE", subject_ids[s.code]),
                 )
 
             # Section time windows: allow all slots Mon–Fri (0..7)
             all_section_ids = list(section_ids.values())
             if all_section_ids:
                 cur.execute(
-                    "DELETE FROM section_time_windows WHERE section_id = ANY(%s::uuid[])",
-                    (all_section_ids,),
+                    "DELETE FROM section_time_windows WHERE tenant_id = %s AND section_id = ANY(%s::uuid[])",
+                    (tenant_id, all_section_ids),
                 )
                 for sec_code, sec_id in section_ids.items():
                     for d in days:
                         cur.execute(
                             """
-INSERT INTO section_time_windows (section_id, day_of_week, start_slot_index, end_slot_index)
-VALUES (%s, %s, %s, %s);
+INSERT INTO section_time_windows (tenant_id, section_id, day_of_week, start_slot_index, end_slot_index)
+VALUES (%s, %s, %s, %s, %s);
 """,
-                            (sec_id, int(d), 0, 7),
+                            (tenant_id, sec_id, int(d), 0, 7),
                         )
 
             # Strict teacher-subject-section assignments
@@ -322,10 +352,13 @@ VALUES (%s, %s, %s, %s);
             cur.execute(
                 """
 DELETE FROM teacher_subject_sections
-WHERE subject_id = ANY(%s::uuid[])
-    OR section_id = ANY(%s::uuid[]);
+WHERE tenant_id = %s
+    AND (
+        subject_id = ANY(%s::uuid[])
+    OR section_id = ANY(%s::uuid[])
+    )
 """,
-                (list(subject_ids.values()), list(section_ids.values())),
+                                (tenant_id, list(subject_ids.values()), list(section_ids.values())),
             )
 
             def assign(teacher_code: str, subject_code: str, section_code_list: list[str]):
@@ -335,11 +368,10 @@ WHERE subject_id = ANY(%s::uuid[])
                     secid = section_ids[sc]
                     cur.execute(
                         """
-INSERT INTO teacher_subject_sections (teacher_id, subject_id, section_id, is_active)
-VALUES (%s, %s, %s, TRUE)
-ON CONFLICT (teacher_id, subject_id, section_id) DO UPDATE SET is_active = TRUE;
+INSERT INTO teacher_subject_sections (tenant_id, teacher_id, subject_id, section_id, is_active)
+VALUES (%s, %s, %s, %s, TRUE)
 """,
-                        (tid, sid, secid),
+                        (tenant_id, tid, sid, secid),
                     )
 
             # Year 1
@@ -368,51 +400,54 @@ ON CONFLICT (teacher_id, subject_id, section_id) DO UPDATE SET is_active = TRUE;
             ai_subject_id = subject_ids["AI"]
             ai_teacher_id = teacher_ids["T9"]
             cur.execute(
-                """
-INSERT INTO combined_groups (academic_year_id, subject_id, teacher_id)
-VALUES (%s, %s, %s)
-ON CONFLICT (id) DO NOTHING
-RETURNING id;
-""",
-                (ai_year_id, ai_subject_id, ai_teacher_id),
+                "SELECT id FROM combined_groups WHERE tenant_id = %s AND academic_year_id = %s AND subject_id = %s AND teacher_id = %s LIMIT 1",
+                (tenant_id, ai_year_id, ai_subject_id, ai_teacher_id),
             )
             row = cur.fetchone()
             if row and row[0]:
                 group_id = str(row[0])
             else:
-                group_id = _get_id(
-                    cur,
-                    "SELECT id FROM combined_groups WHERE academic_year_id = %s AND subject_id = %s AND teacher_id = %s",
-                    (ai_year_id, ai_subject_id, ai_teacher_id),
+                cur.execute(
+                    """
+INSERT INTO combined_groups (tenant_id, academic_year_id, subject_id, teacher_id)
+VALUES (%s, %s, %s, %s)
+RETURNING id;
+""",
+                    (tenant_id, ai_year_id, ai_subject_id, ai_teacher_id),
                 )
+                row = cur.fetchone()
+                if not row or not row[0]:
+                    raise RuntimeError("Failed to create combined group for AI")
+                group_id = str(row[0])
 
             for sc in ["Y3-D", "Y3-E", "Y3-F"]:
                 cur.execute(
                     """
-INSERT INTO combined_group_sections (combined_group_id, subject_id, section_id)
-VALUES (%s, %s, %s)
-ON CONFLICT (combined_group_id, section_id) DO NOTHING;
+INSERT INTO combined_group_sections (tenant_id, combined_group_id, subject_id, section_id)
+VALUES (%s, %s, %s, %s)
+ON CONFLICT DO NOTHING;
 """,
-                    (group_id, ai_subject_id, section_ids[sc]),
+                    (tenant_id, group_id, ai_subject_id, section_ids[sc]),
                 )
 
             # Special allotment: Y3-A OS locked (avoid T5 weekly off day = Monday)
             slot_id = _get_id(
                 cur,
-                "SELECT id FROM time_slots WHERE day_of_week = %s AND slot_index = %s",
-                (DAY["TUE"], 2),
+                "SELECT id FROM time_slots WHERE tenant_id = %s AND day_of_week = %s AND slot_index = %s",
+                (tenant_id, DAY["TUE"], 2),
             )
             # Clear any prior OS special allotment for this section so the lock is unique.
             cur.execute(
-                "DELETE FROM special_allotments WHERE section_id = %s AND subject_id = %s",
-                (section_ids["Y3-A"], subject_ids["OS"]),
+                "DELETE FROM special_allotments WHERE tenant_id = %s AND section_id = %s AND subject_id = %s",
+                (tenant_id, section_ids["Y3-A"], subject_ids["OS"]),
             )
             cur.execute(
                 """
-INSERT INTO special_allotments (section_id, subject_id, teacher_id, room_id, slot_id, reason, is_active)
-VALUES (%s, %s, %s, %s, %s, %s, TRUE);
+INSERT INTO special_allotments (tenant_id, section_id, subject_id, teacher_id, room_id, slot_id, reason, is_active)
+VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE);
 """,
                 (
+                    tenant_id,
                     section_ids["Y3-A"],
                     subject_ids["OS"],
                     teacher_ids["T5"],
@@ -426,24 +461,31 @@ VALUES (%s, %s, %s, %s, %s, %s, TRUE);
             cur.execute(
                 """
 SELECT
-  (SELECT count(*) FROM sections WHERE program_id = %s AND academic_year_id = ANY(%s::uuid[])) AS sections,
-  (SELECT count(*) FROM subjects WHERE program_id = %s AND academic_year_id = ANY(%s::uuid[])) AS subjects,
-  (SELECT count(*) FROM teachers WHERE code = ANY(%s)) AS teachers,
-  (SELECT count(*) FROM rooms WHERE code = ANY(%s)) AS rooms,
-  (SELECT count(*) FROM time_slots WHERE day_of_week = ANY(%s) AND slot_index BETWEEN 0 AND 7) AS time_slots,
-    (SELECT count(*) FROM combined_groups WHERE academic_year_id = %s AND subject_id = %s) AS combined_groups,
-  (SELECT count(*) FROM special_allotments WHERE section_id = %s AND slot_id = %s AND is_active IS TRUE) AS special_allotments
+    (SELECT count(*) FROM sections WHERE tenant_id = %s AND program_id = %s AND academic_year_id = ANY(%s::uuid[])) AS sections,
+    (SELECT count(*) FROM subjects WHERE tenant_id = %s AND program_id = %s AND academic_year_id = ANY(%s::uuid[])) AS subjects,
+    (SELECT count(*) FROM teachers WHERE tenant_id = %s AND code = ANY(%s)) AS teachers,
+    (SELECT count(*) FROM rooms WHERE tenant_id = %s AND code = ANY(%s)) AS rooms,
+    (SELECT count(*) FROM time_slots WHERE tenant_id = %s AND day_of_week = ANY(%s) AND slot_index BETWEEN 0 AND 7) AS time_slots,
+    (SELECT count(*) FROM combined_groups WHERE tenant_id = %s AND academic_year_id = %s AND subject_id = %s) AS combined_groups,
+    (SELECT count(*) FROM special_allotments WHERE tenant_id = %s AND section_id = %s AND slot_id = %s AND is_active IS TRUE) AS special_allotments
 """,
                 (
+                                        tenant_id,
                     program_id,
                     [year_ids[y] for y in years],
+                                        tenant_id,
                     program_id,
                     [year_ids[y] for y in years],
+                                        tenant_id,
                     [t.code for t in teachers],
+                                        tenant_id,
                     [r[0] for r in rooms],
+                                        tenant_id,
                     days,
+                                        tenant_id,
                     year_ids[3],
                     subject_ids["AI"],
+                                        tenant_id,
                     section_ids["Y3-A"],
                     slot_id,
                 ),

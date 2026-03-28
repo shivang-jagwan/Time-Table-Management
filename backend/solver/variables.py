@@ -227,50 +227,86 @@ def _create_theory_vars(
     assigned_teacher_id: Any,
     sessions_per_week: int,
 ) -> None:
-    """Create theory BoolVars using the pruned valid_slots_by_section_subject set.
-
-    OPTIMIZATION: valid_slots_by_section_subject already filters out
-    teacher-blocked slots, so the inner `if slot_id in teacher_disallowed`
-    check from the old implementation is eliminated.  Variable names also use
-    integer indices to reduce CP-SAT model-string overhead.
-    """
+    """Create theory start BoolVars (duration-aware) using pruned starts."""
     model = ctx.model
     sec_i = ctx.section_idx.get(section.id, section.id)
     subj_i = ctx.subject_idx.get(subject_id, subject_id)
+    track = str(getattr(section, "track", "CORE") or "CORE")
+    block = int(ctx.duration_for(subject_id, track=track) or 1)
+    if block < 1:
+        block = 1
 
-    # Use pre-pruned slot list; fall back to old logic if not available.
+    # Use pre-pruned start list; fall back to inline pruning if not available.
     pruned_slots: list[Any] = ctx.valid_slots_by_section_subject.get(
         (section.id, subject_id),
         None,  # sentinel: not computed
     )
 
     if pruned_slots is None:
-        # Fallback: filter inline (original behaviour)
         teacher_blocked = ctx.teacher_disallowed_slot_ids.get(assigned_teacher_id, set())
-        pruned_slots = [
-            slot_id for slot_id in sorted(ctx.allowed_slots_by_section[section.id])
-            if slot_id not in teacher_blocked
-        ]
+        if block <= 1:
+            pruned_slots = [
+                slot_id for slot_id in sorted(ctx.allowed_slots_by_section[section.id])
+                if slot_id not in teacher_blocked
+            ]
+        else:
+            from solver.pre_solve_locks import contiguous_starts
 
-    for slot_id in pruned_slots:
-        slot_i = ctx.slot_idx_map.get(slot_id, slot_id)
+            pruned_slots = []
+            for day in range(6):
+                indices = ctx.allowed_slot_indices_by_section_day.get((section.id, day), [])
+                if len(indices) < block:
+                    continue
+                for start_idx in contiguous_starts(indices, block):
+                    ok = True
+                    for j in range(block):
+                        ts = ctx.slot_by_day_index.get((day, start_idx + j))
+                        if ts is None or ts.id in teacher_blocked:
+                            ok = False
+                            break
+                    if not ok:
+                        continue
+                    start_ts = ctx.slot_by_day_index.get((day, start_idx))
+                    if start_ts is not None:
+                        pruned_slots.append(start_ts.id)
+
+    for start_slot_id in pruned_slots:
+        di = ctx.slot_info.get(start_slot_id)
+        if di is None:
+            continue
+        day, start_idx = int(di[0]), int(di[1])
+
+        covered_slot_ids: list[Any] = []
+        for j in range(block):
+            ts = ctx.slot_by_day_index.get((day, start_idx + j))
+            if ts is None:
+                covered_slot_ids = []
+                break
+            covered_slot_ids.append(ts.id)
+        if not covered_slot_ids:
+            continue
+
+        slot_i = ctx.slot_idx_map.get(start_slot_id, start_slot_id)
         xv = model.NewBoolVar(f"x_{sec_i}_{subj_i}_{slot_i}")
-        ctx.x[(section.id, subject_id, slot_id)] = xv
-        ctx.section_slot_terms[(section.id, slot_id)].append(xv)
+        key = (section.id, subject_id, start_slot_id)
+        ctx.x[key] = xv
+        ctx.x_block_size_by_key[key] = int(block)
+        ctx.x_covered_slots[key] = list(covered_slot_ids)
 
-        # Consumes one THEORY-capable room in this slot.
-        ctx.room_terms_by_slot[slot_id].append(xv)
+        for covered_slot_id in covered_slot_ids:
+            ctx.section_slot_terms[(section.id, covered_slot_id)].append(xv)
+            # Consumes one THEORY-capable room in every occupied slot.
+            ctx.room_terms_by_slot[covered_slot_id].append(xv)
 
-        ctx.teacher_slot_terms[(assigned_teacher_id, slot_id)].append(xv)
-        ctx.teacher_all_terms[assigned_teacher_id].append(xv)
-        d = ctx.slot_info.get(slot_id, (None, None))[0]
-        if d is not None:
-            ctx.teacher_day_terms[(assigned_teacher_id, int(d))].append(xv)
-            ctx.teacher_active_days[assigned_teacher_id].add(int(d))
+            ctx.teacher_slot_terms[(assigned_teacher_id, covered_slot_id)].append(xv)
+            ctx.teacher_all_terms[assigned_teacher_id].append(xv)
+            d = ctx.slot_info.get(covered_slot_id, (None, None))[0]
+            if d is not None:
+                ctx.teacher_day_terms[(assigned_teacher_id, int(d))].append(xv)
+                ctx.teacher_active_days[assigned_teacher_id].add(int(d))
 
         ctx.x_by_sec_subj[(section.id, subject_id)].append(xv)
-        if d is not None:
-            ctx.x_by_sec_subj_day[(section.id, subject_id, int(d))].append(xv)
+        ctx.x_by_sec_subj_day[(section.id, subject_id, int(day))].append(xv)
 
     terms = ctx.x_by_sec_subj.get((section.id, subject_id), [])
     locked = int(ctx.locked_theory_sessions_by_sec_subj.get((section.id, subject_id), 0) or 0)
@@ -329,6 +365,16 @@ def _create_combined_theory_vars(ctx: SolverContext) -> None:
 
         ctx.effective_teacher_by_gid[group_id] = assigned_teacher_id
 
+        duration_values: set[int] = set()
+        for sid in sec_ids:
+            sec = ctx.section_by_id.get(sid)
+            track = str(getattr(sec, "track", "CORE") or "CORE")
+            duration_values.add(max(1, int(ctx.duration_for(subj_id, track=track) or 1)))
+        if len(duration_values) > 1:
+            model.Add(0 == 1)
+            continue
+        block = next(iter(duration_values), 1)
+
         # OPTIMIZATION: use the pre-computed valid slot list from build_pruned_slots
         # (section-window intersection minus teacher-blocked slots, computed once
         # before model build).  Falls back to inline computation for test bypasses.
@@ -342,29 +388,74 @@ def _create_combined_theory_vars(ctx: SolverContext) -> None:
             if not allowed:
                 continue
             teacher_blocked = ctx.teacher_disallowed_slot_ids.get(assigned_teacher_id, set())
-            valid_combined = sorted(allowed - teacher_blocked)
+            if block <= 1:
+                valid_combined = sorted(allowed - teacher_blocked)
+            else:
+                from solver.pre_solve_locks import contiguous_starts
+
+                valid_combined = []
+                for day in range(6):
+                    day_indices = sorted(
+                        int(ctx.slot_info[sid][1])
+                        for sid in allowed
+                        if int(ctx.slot_info.get(sid, (-1, -1))[0]) == day and sid not in teacher_blocked
+                    )
+                    if len(day_indices) < block:
+                        continue
+                    for start_idx in contiguous_starts(day_indices, block):
+                        ok = True
+                        for j in range(block):
+                            ts = ctx.slot_by_day_index.get((day, start_idx + j))
+                            if ts is None or ts.id not in allowed or ts.id in teacher_blocked:
+                                ok = False
+                                break
+                        if not ok:
+                            continue
+                        ts0 = ctx.slot_by_day_index.get((day, start_idx))
+                        if ts0 is not None:
+                            valid_combined.append(ts0.id)
         elif not valid_combined:
             continue
 
-        for slot_id in valid_combined:
-            slot_i = ctx.slot_idx_map.get(slot_id, slot_id)
+        for start_slot_id in valid_combined:
+            di = ctx.slot_info.get(start_slot_id)
+            if di is None:
+                continue
+            day, start_idx = int(di[0]), int(di[1])
+
+            covered_slot_ids: list[Any] = []
+            for j in range(block):
+                ts = ctx.slot_by_day_index.get((day, start_idx + j))
+                if ts is None:
+                    covered_slot_ids = []
+                    break
+                covered_slot_ids.append(ts.id)
+            if not covered_slot_ids:
+                continue
+
+            slot_i = ctx.slot_idx_map.get(start_slot_id, start_slot_id)
             gv = model.NewBoolVar(f"cg_{group_i}_{slot_i}")
-            ctx.combined_x[(group_id, slot_id)] = gv
+            key = (group_id, start_slot_id)
+            ctx.combined_x[key] = gv
+            ctx.combined_block_size_by_key[key] = int(block)
+            ctx.combined_covered_slots[key] = list(covered_slot_ids)
             ctx.combined_vars_by_gid[group_id].append(gv)
-            d = ctx.slot_info.get(slot_id, (None, None))[0]
-            if d is not None:
-                ctx.combined_vars_by_gid_day[(group_id, int(d))].append(gv)
+            ctx.combined_vars_by_gid_day[(group_id, int(day))].append(gv)
 
             for sid in sec_ids:
-                ctx.section_slot_terms[(sid, slot_id)].append(gv)
+                for covered_slot_id in covered_slot_ids:
+                    ctx.section_slot_terms[(sid, covered_slot_id)].append(gv)
 
-            ctx.teacher_slot_terms[(assigned_teacher_id, slot_id)].append(gv)
-            ctx.teacher_all_terms[assigned_teacher_id].append(gv)
-            if d is not None:
-                ctx.teacher_day_terms[(assigned_teacher_id, int(d))].append(gv)
-                ctx.teacher_active_days[assigned_teacher_id].add(int(d))
+            for covered_slot_id in covered_slot_ids:
+                ctx.teacher_slot_terms[(assigned_teacher_id, covered_slot_id)].append(gv)
+                ctx.teacher_all_terms[assigned_teacher_id].append(gv)
+                d = ctx.slot_info.get(covered_slot_id, (None, None))[0]
+                if d is not None:
+                    ctx.teacher_day_terms[(assigned_teacher_id, int(d))].append(gv)
+                    ctx.teacher_active_days[assigned_teacher_id].add(int(d))
 
-            ctx.room_terms_by_slot[slot_id].append(gv)
+            for covered_slot_id in covered_slot_ids:
+                ctx.room_terms_by_slot[covered_slot_id].append(gv)
 
         model.Add(sum(ctx.combined_vars_by_gid.get(group_id, [])) == int(sessions_per_week))
 
@@ -403,6 +494,11 @@ def _create_elective_block_vars(ctx: SolverContext) -> None:
         if max_per_day < 0:
             max_per_day = 0
 
+        duration_vals = [max(1, int(ctx.duration_for(s.id) or 1)) for s in subj_objs]
+        if len(set(duration_vals)) != 1:
+            continue
+        block = int(duration_vals[0])
+
         # Pre-compute the set of teacher-blocked slots across ALL elective teachers
         # so we can filter the intersection in O(1) instead of per-slot.
         all_teacher_blocked: set[Any] = set()
@@ -423,32 +519,77 @@ def _create_elective_block_vars(ctx: SolverContext) -> None:
                     allowed = s_allowed if allowed is None else (allowed & s_allowed)
                 if not allowed:
                     continue
-                valid_batch = sorted(allowed - all_teacher_blocked)
+                if block <= 1:
+                    valid_batch = sorted(allowed - all_teacher_blocked)
+                else:
+                    from solver.pre_solve_locks import contiguous_starts
+
+                    valid_batch = []
+                    for day in range(6):
+                        day_indices = sorted(
+                            int(ctx.slot_info[sid][1])
+                            for sid in allowed
+                            if int(ctx.slot_info.get(sid, (-1, -1))[0]) == day and sid not in all_teacher_blocked
+                        )
+                        if len(day_indices) < block:
+                            continue
+                        for start_idx in contiguous_starts(day_indices, block):
+                            ok = True
+                            for j in range(block):
+                                ts = ctx.slot_by_day_index.get((day, start_idx + j))
+                                if ts is None or ts.id not in allowed or ts.id in all_teacher_blocked:
+                                    ok = False
+                                    break
+                            if not ok:
+                                continue
+                            ts0 = ctx.slot_by_day_index.get((day, start_idx))
+                            if ts0 is not None:
+                                valid_batch.append(ts0.id)
             elif not valid_batch:
                 continue
 
-            for slot_id in valid_batch:
-                slot_i = ctx.slot_idx_map.get(slot_id, slot_id)
+            for start_slot_id in valid_batch:
+                di = ctx.slot_info.get(start_slot_id)
+                if di is None:
+                    continue
+                day, start_idx = int(di[0]), int(di[1])
+
+                covered_slot_ids: list[Any] = []
+                for j in range(block):
+                    ts = ctx.slot_by_day_index.get((day, start_idx + j))
+                    if ts is None:
+                        covered_slot_ids = []
+                        break
+                    covered_slot_ids.append(ts.id)
+                if not covered_slot_ids:
+                    continue
+
+                slot_i = ctx.slot_idx_map.get(start_slot_id, start_slot_id)
                 zv = model.NewBoolVar(f"z_{slot_i}_{batch_idx}")
-                ctx.z[(block_id, int(batch_idx), slot_id)] = zv
+                key = (block_id, int(batch_idx), start_slot_id)
+                ctx.z[key] = zv
+                ctx.z_block_size_by_key[key] = int(block)
+                ctx.z_covered_slots[key] = list(covered_slot_ids)
                 ctx.z_by_block_batch[(block_id, int(batch_idx))].append(zv)
 
                 for sec_id in batch_sec_ids:
-                    ctx.section_slot_terms[(sec_id, slot_id)].append(zv)
+                    for covered_slot_id in covered_slot_ids:
+                        ctx.section_slot_terms[(sec_id, covered_slot_id)].append(zv)
 
-                # One elective batch occurrence consumes one THEORY room.
-                ctx.room_terms_by_slot[slot_id].append(zv)
+                # One elective batch occurrence consumes one THEORY room for each occupied slot.
+                for covered_slot_id in covered_slot_ids:
+                    ctx.room_terms_by_slot[covered_slot_id].append(zv)
 
-                d = ctx.slot_info.get(slot_id, (None, None))[0]
-                if d is not None:
-                    ctx.z_by_block_batch_day[(block_id, int(batch_idx), int(d))].append(zv)
+                ctx.z_by_block_batch_day[(block_id, int(batch_idx), int(day))].append(zv)
 
                 for _subj_id, teacher_id in pairs:
-                    ctx.teacher_slot_terms[(teacher_id, slot_id)].append(zv)
-                    ctx.teacher_all_terms[teacher_id].append(zv)
-                    if d is not None:
-                        ctx.teacher_day_terms[(teacher_id, int(d))].append(zv)
-                        ctx.teacher_active_days[teacher_id].add(int(d))
+                    for covered_slot_id in covered_slot_ids:
+                        ctx.teacher_slot_terms[(teacher_id, covered_slot_id)].append(zv)
+                        ctx.teacher_all_terms[teacher_id].append(zv)
+                        d = ctx.slot_info.get(covered_slot_id, (None, None))[0]
+                        if d is not None:
+                            ctx.teacher_day_terms[(teacher_id, int(d))].append(zv)
+                            ctx.teacher_active_days[teacher_id].add(int(d))
 
             terms = ctx.z_by_block_batch.get((block_id, int(batch_idx)), [])
             locked = int(ctx.locked_elective_sessions_by_block_batch.get((block_id, int(batch_idx)), 0) or 0)
@@ -570,9 +711,18 @@ def _create_room_assignment_vars(ctx: SolverContext) -> None:
 
     # Theory x-variables
     for (sec_id, subj_id, slot_id), xv in ctx.x.items():
-        fixed_room = ctx.fixed_room_by_section_slot.get((sec_id, slot_id))
-        if fixed_room is not None:
-            candidates = [fixed_room]
+        block_slot_ids = list(ctx.x_covered_slots.get((sec_id, subj_id, slot_id), [slot_id]))
+
+        fixed_rooms = {
+            ctx.fixed_room_by_section_slot.get((sec_id, sid))
+            for sid in block_slot_ids
+            if ctx.fixed_room_by_section_slot.get((sec_id, sid)) is not None
+        }
+        if len(fixed_rooms) > 1:
+            model.Add(0 == 1)
+            continue
+        if fixed_rooms:
+            candidates = [next(iter(fixed_rooms))]
         else:
             candidates = _candidate_theory_rooms(ctx, subject_id=subj_id)
         if not candidates:
@@ -584,7 +734,8 @@ def _create_room_assignment_vars(ctx: SolverContext) -> None:
             rv = model.NewBoolVar(f"xr_{sec_id}_{subj_id}_{slot_id}_{rid}")
             ctx.x_room[(sec_id, subj_id, slot_id, rid)] = rv
             room_vars.append(rv)
-            ctx.room_slot_terms[(rid, slot_id)].append(rv)
+            for sid in block_slot_ids:
+                ctx.room_slot_terms[(rid, sid)].append(rv)
         model.Add(sum(room_vars) == xv)
 
     # Combined theory variables
@@ -593,10 +744,14 @@ def _create_room_assignment_vars(ctx: SolverContext) -> None:
         if subj_id is None:
             model.Add(gv == 0)
             continue
+
+        block_slot_ids = list(ctx.combined_covered_slots.get((gid, slot_id), [slot_id]))
+
         fixed_rooms = {
-            ctx.fixed_room_by_section_slot.get((sid, slot_id))
+            ctx.fixed_room_by_section_slot.get((sid, covered_sid))
             for sid in ctx.group_sections.get(gid, [])
-            if ctx.fixed_room_by_section_slot.get((sid, slot_id)) is not None
+            for covered_sid in block_slot_ids
+            if ctx.fixed_room_by_section_slot.get((sid, covered_sid)) is not None
         }
         if len(fixed_rooms) > 1:
             model.Add(0 == 1)
@@ -614,11 +769,13 @@ def _create_room_assignment_vars(ctx: SolverContext) -> None:
             rv = model.NewBoolVar(f"cgr_{gid}_{slot_id}_{rid}")
             ctx.combined_room[(gid, slot_id, rid)] = rv
             room_vars.append(rv)
-            ctx.room_slot_terms[(rid, slot_id)].append(rv)
+            for covered_sid in block_slot_ids:
+                ctx.room_slot_terms[(rid, covered_sid)].append(rv)
         model.Add(sum(room_vars) == gv)
 
     # Elective batch vars (theory rooms)
     for (block_id, batch_idx, slot_id), zv in ctx.z.items():
+        block_slot_ids = list(ctx.z_covered_slots.get((block_id, int(batch_idx), slot_id), [slot_id]))
         candidates = _candidate_theory_rooms(ctx, subject_id=None)
         if not candidates:
             model.Add(zv == 0)
@@ -629,12 +786,15 @@ def _create_room_assignment_vars(ctx: SolverContext) -> None:
             rv = model.NewBoolVar(f"zr_{block_id}_{batch_idx}_{slot_id}_{rid}")
             ctx.z_room[(block_id, int(batch_idx), slot_id, rid)] = rv
             room_vars.append(rv)
-            ctx.room_slot_terms[(rid, slot_id)].append(rv)
+            for covered_sid in block_slot_ids:
+                ctx.room_slot_terms[(rid, covered_sid)].append(rv)
         model.Add(sum(room_vars) == zv)
 
     # Lab start vars choose one lab room for the full block.
     for (sec_id, subj_id, day, start_idx), sv in ctx.lab_start.items():
-        block = ctx.lab_block_for(subj_id)
+        section = ctx.section_by_id.get(sec_id)
+        track = str(getattr(section, "track", "CORE") or "CORE")
+        block = ctx.lab_block_for(subj_id, track=track)
         if block < 1:
             block = 1
 

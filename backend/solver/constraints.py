@@ -243,8 +243,10 @@ def _add_fixed_entry_hard_constraints(ctx: SolverContext) -> None:
                 continue
             model.Add(gv == 1)
 
+            covered_slots = ctx.combined_covered_slots.get((gid, fe.slot_id), [fe.slot_id])
             for sid in ctx.group_sections.get(gid, []):
-                ctx.fixed_room_by_section_slot[(sid, fe.slot_id)] = fe.room_id
+                for covered_sid in covered_slots:
+                    ctx.fixed_room_by_section_slot[(sid, covered_sid)] = fe.room_id
             continue
 
         if str(subj.subject_type) == "LAB":
@@ -261,7 +263,9 @@ def _add_fixed_entry_hard_constraints(ctx: SolverContext) -> None:
                 continue
             model.Add(sv == 1)
 
-            block = ctx.lab_block_for(fe.subject_id)
+            section = ctx.section_by_id.get(fe.section_id)
+            track = str(getattr(section, "track", "CORE") or "CORE")
+            block = ctx.lab_block_for(fe.subject_id, track=track)
             if block < 1:
                 block = 1
             for j in range(block):
@@ -271,8 +275,9 @@ def _add_fixed_entry_hard_constraints(ctx: SolverContext) -> None:
                 ctx.fixed_room_by_section_slot[(fe.section_id, ts.id)] = fe.room_id
             continue
 
-        # Regular THEORY
-        xv = ctx.x.get((fe.section_id, fe.subject_id, fe.slot_id))
+        # Regular THEORY start variable (duration-aware)
+        key = (fe.section_id, fe.subject_id, fe.slot_id)
+        xv = ctx.x.get(key)
         if xv is None:
             _make_infeasible(
                 model,
@@ -284,7 +289,9 @@ def _add_fixed_entry_hard_constraints(ctx: SolverContext) -> None:
             )
             continue
         model.Add(xv == 1)
-        ctx.fixed_room_by_section_slot[(fe.section_id, fe.slot_id)] = fe.room_id
+        covered_slots = ctx.x_covered_slots.get(key, [fe.slot_id])
+        for covered_sid in covered_slots:
+            ctx.fixed_room_by_section_slot[(fe.section_id, covered_sid)] = fe.room_id
 
 
 # ── Section no-overlap ──────────────────────────────────────────────────────
@@ -655,6 +662,9 @@ def _add_no_consecutive_same_subject(ctx: SolverContext) -> None:
             subj_id = subj.id
             if str(getattr(subj, "subject_type", "THEORY")) != "THEORY":
                 continue
+            track = str(getattr(section, "track", "CORE") or "CORE")
+            if int(ctx.duration_for(subj_id, track=track) or 1) > 1:
+                continue
             for day in range(6):
                 day_slots = ctx.slots_by_day.get(day, [])
                 for i in range(len(day_slots) - 1):
@@ -672,6 +682,11 @@ def _add_no_consecutive_same_subject(ctx: SolverContext) -> None:
     for gid, subj_id in ctx.group_subject.items():
         subj = ctx.subject_by_id.get(subj_id)
         if subj is None or str(getattr(subj, "subject_type", "THEORY")) != "THEORY":
+            continue
+        group_sections = ctx.group_sections.get(gid, [])
+        sample_section = ctx.section_by_id.get(group_sections[0]) if group_sections else None
+        track = str(getattr(sample_section, "track", "CORE") or "CORE")
+        if int(ctx.duration_for(subj_id, track=track) or 1) > 1:
             continue
         for day in range(6):
             day_slots = ctx.slots_by_day.get(day, [])

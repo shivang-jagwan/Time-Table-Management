@@ -185,6 +185,11 @@ class TimetableEntryOut(BaseModel):
     slot_index: int
     start_time: str
     end_time: str
+    duration_slots: int = 1
+    is_block_start: bool = True
+    block_start_slot_index: int | None = None
+    block_end_slot_index: int | None = None
+    block_end_time: str | None = None
 
     combined_class_id: uuid.UUID | None = None
     elective_block_id: uuid.UUID | None = None

@@ -584,43 +584,38 @@ def build_pruned_slots(ctx: SolverContext) -> None:
                 continue
 
             teacher_blocked: set[Any] = dallowed.get(teacher_id, set())
-            subject_type = str(subj.subject_type)
+            track = str(getattr(section, "track", "CORE") or "CORE")
+            block = int(ctx.duration_for(subject_id, track=track) or 1)
+            if block < 1:
+                block = 1
 
-            if subject_type == "LAB":
-                # For LAB, valid positions are contiguous blocks that fit entirely
-                # within allowed slots and contain no teacher-blocked slot.
-                block = int(getattr(subj, "lab_block_size_slots", 1) or 1)
-                if block < 1:
-                    block = 1
-                pruned: list[Any] = []
-                for day in range(6):
-                    indices = ctx.allowed_slot_indices_by_section_day.get((sec_id, day), [])
-                    if len(indices) < block:
-                        continue
-                    from solver.pre_solve_locks import contiguous_starts
-                    for start_idx in contiguous_starts(indices, block):
-                        # Collect all slots in this block; reject if any slot is
-                        # teacher-blocked or doesn't exist in the grid.
-                        ok = True
-                        for j in range(block):
-                            ts = ctx.slot_by_day_index.get((day, start_idx + j))
-                            if ts is None or ts.id in teacher_blocked:
-                                ok = False
-                                break
-                        if ok:
-                            # Store the *start* slot_id (matches lab_start key convention)
-                            start_ts = ctx.slot_by_day_index.get((day, start_idx))
-                            if start_ts is not None:
-                                pruned.append(start_ts.id)
-                ctx.valid_slots_by_section_subject[(sec_id, subject_id)] = pruned
-
-            else:
-                # THEORY: simply remove teacher-blocked slots from allowed set
-                pruned_theory = [
+            if block <= 1:
+                pruned_single = [
                     slot_id for slot_id in sorted(allowed)
                     if slot_id not in teacher_blocked
                 ]
-                ctx.valid_slots_by_section_subject[(sec_id, subject_id)] = pruned_theory
+                ctx.valid_slots_by_section_subject[(sec_id, subject_id)] = pruned_single
+                continue
+
+            pruned: list[Any] = []
+            from solver.pre_solve_locks import contiguous_starts
+            for day in range(6):
+                indices = ctx.allowed_slot_indices_by_section_day.get((sec_id, day), [])
+                if len(indices) < block:
+                    continue
+                for start_idx in contiguous_starts(indices, block):
+                    ok = True
+                    for j in range(block):
+                        ts = ctx.slot_by_day_index.get((day, start_idx + j))
+                        if ts is None or ts.id in teacher_blocked or ts.id not in allowed:
+                            ok = False
+                            break
+                    if not ok:
+                        continue
+                    start_ts = ctx.slot_by_day_index.get((day, start_idx))
+                    if start_ts is not None:
+                        pruned.append(start_ts.id)
+            ctx.valid_slots_by_section_subject[(sec_id, subject_id)] = pruned
 
 
     # ── Combined-group pruning ────────────────────────────────────────────
@@ -652,6 +647,16 @@ def build_pruned_slots(ctx: SolverContext) -> None:
             ctx.valid_slots_for_combined_group[group_id] = []
             continue
 
+        duration_values: set[int] = set()
+        for sid in sec_ids:
+            section = ctx.section_by_id.get(sid)
+            track = str(getattr(section, "track", "CORE") or "CORE")
+            duration_values.add(max(1, int(ctx.duration_for(subj_id, track=track) or 1)))
+        if len(duration_values) > 1:
+            ctx.valid_slots_for_combined_group[group_id] = []
+            continue
+        block = next(iter(duration_values), 1)
+
         combined_allowed: set[Any] | None = None
         for sid in sec_ids:
             s_allowed = set(ctx.allowed_slots_by_section.get(sid, set()))
@@ -661,7 +666,33 @@ def build_pruned_slots(ctx: SolverContext) -> None:
             continue
 
         teacher_blocked_cg: set[Any] = dallowed.get(assigned_teacher_id, set())
-        ctx.valid_slots_for_combined_group[group_id] = sorted(combined_allowed - teacher_blocked_cg)
+        if block <= 1:
+            ctx.valid_slots_for_combined_group[group_id] = sorted(combined_allowed - teacher_blocked_cg)
+        else:
+            from solver.pre_solve_locks import contiguous_starts
+
+            starts: list[Any] = []
+            for day in range(6):
+                day_indices = sorted(
+                    int(ctx.slot_info[sid][1])
+                    for sid in combined_allowed
+                    if int(ctx.slot_info.get(sid, (-1, -1))[0]) == day and sid not in teacher_blocked_cg
+                )
+                if len(day_indices) < block:
+                    continue
+                for start_idx in contiguous_starts(day_indices, block):
+                    ok = True
+                    for j in range(block):
+                        ts = ctx.slot_by_day_index.get((day, start_idx + j))
+                        if ts is None or ts.id not in combined_allowed or ts.id in teacher_blocked_cg:
+                            ok = False
+                            break
+                    if not ok:
+                        continue
+                    ts0 = ctx.slot_by_day_index.get((day, start_idx))
+                    if ts0 is not None:
+                        starts.append(ts0.id)
+            ctx.valid_slots_for_combined_group[group_id] = starts
 
     # ── Elective-batch pruning ────────────────────────────────────────────
     # apply_pre_solve_locks() already called _ensure_elective_batches(), so
@@ -681,6 +712,11 @@ def build_pruned_slots(ctx: SolverContext) -> None:
         if any(str(s.subject_type) != "THEORY" for s in eb_subj_objs):
             continue
 
+        duration_values = [max(1, int(ctx.duration_for(s.id) or 1)) for s in eb_subj_objs]
+        if len(set(duration_values)) != 1:
+            continue
+        block = int(duration_values[0])
+
         eb_blocked: set[Any] = set()
         for _subj_id, teacher_id in pairs:
             eb_blocked.update(dallowed.get(teacher_id, set()))
@@ -693,5 +729,33 @@ def build_pruned_slots(ctx: SolverContext) -> None:
             if not eb_allowed:
                 ctx.valid_slots_for_elective_batch[(block_id, batch_idx)] = []
                 continue
-            ctx.valid_slots_for_elective_batch[(block_id, batch_idx)] = sorted(eb_allowed - eb_blocked)
+
+            if block <= 1:
+                ctx.valid_slots_for_elective_batch[(block_id, batch_idx)] = sorted(eb_allowed - eb_blocked)
+                continue
+
+            from solver.pre_solve_locks import contiguous_starts
+
+            starts: list[Any] = []
+            for day in range(6):
+                day_indices = sorted(
+                    int(ctx.slot_info[sid][1])
+                    for sid in eb_allowed
+                    if int(ctx.slot_info.get(sid, (-1, -1))[0]) == day and sid not in eb_blocked
+                )
+                if len(day_indices) < block:
+                    continue
+                for start_idx in contiguous_starts(day_indices, block):
+                    ok = True
+                    for j in range(block):
+                        ts = ctx.slot_by_day_index.get((day, start_idx + j))
+                        if ts is None or ts.id not in eb_allowed or ts.id in eb_blocked:
+                            ok = False
+                            break
+                    if not ok:
+                        continue
+                    ts0 = ctx.slot_by_day_index.get((day, start_idx))
+                    if ts0 is not None:
+                        starts.append(ts0.id)
+            ctx.valid_slots_for_elective_batch[(block_id, batch_idx)] = starts
 

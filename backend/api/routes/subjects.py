@@ -100,7 +100,7 @@ def _validate_subject_constraints(
     subject_type: str,
     sessions_per_week: int,
     max_per_day: int,
-    lab_block_size_slots: int,
+    duration_slots: int,
 ) -> None:
     errors: list[str] = []
 
@@ -114,17 +114,18 @@ def _validate_subject_constraints(
         errors.append("MAX_PER_DAY_GT_SESSIONS_PER_WEEK")
     if int(sessions_per_week) > 6:
         errors.append("SESSIONS_PER_WEEK_GT_6")
+    if int(duration_slots) < 1:
+        errors.append("DURATION_LT_1")
 
     if st == "THEORY":
-        if int(lab_block_size_slots) != 1:
-            errors.append("THEORY_LAB_BLOCK_MUST_BE_1")
+        pass
     elif st == "LAB":
-        if int(lab_block_size_slots) < 2:
+        if int(duration_slots) < 2:
             errors.append("LAB_BLOCK_SIZE_LT_2")
     else:
         errors.append("INVALID_SUBJECT_TYPE")
 
-    if int(sessions_per_week) * int(lab_block_size_slots) > 12:
+    if int(sessions_per_week) * int(duration_slots) > 12:
         errors.append("WEEKLY_SLOT_LOAD_EXCEEDS_12")
 
     if errors:
@@ -135,6 +136,24 @@ def _validate_subject_constraints(
                 "errors": errors,
             },
         )
+
+
+def _resolve_duration_slots(*, duration: int | None, lab_block_size_slots: int | None) -> int:
+    if duration is None and lab_block_size_slots is None:
+        return 1
+    if duration is None:
+        return int(lab_block_size_slots or 1)
+    if lab_block_size_slots is None:
+        return int(duration)
+    if int(duration) != int(lab_block_size_slots):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "DURATION_CONFLICT",
+                "message": "duration and lab_block_size_slots must match when both are provided",
+            },
+        )
+    return int(duration)
 
 
 def _get_program(db: Session, program_code: str, *, tenant_id: uuid.UUID | None) -> Program:
@@ -234,11 +253,16 @@ def create_subject(
     program = _get_program(db, payload.program_code, tenant_id=tenant_id)
     ay = _get_or_create_academic_year(db, int(payload.academic_year_number), tenant_id=tenant_id)
 
+    duration_slots = _resolve_duration_slots(
+        duration=payload.duration,
+        lab_block_size_slots=payload.lab_block_size_slots,
+    )
+
     _validate_subject_constraints(
         subject_type=payload.subject_type,
         sessions_per_week=int(payload.sessions_per_week),
         max_per_day=int(payload.max_per_day),
-        lab_block_size_slots=int(payload.lab_block_size_slots),
+        duration_slots=int(duration_slots),
     )
 
     subject = Subject(
@@ -250,7 +274,8 @@ def create_subject(
         subject_type=payload.subject_type,
         sessions_per_week=payload.sessions_per_week,
         max_per_day=payload.max_per_day,
-        lab_block_size_slots=payload.lab_block_size_slots,
+        duration_slots=duration_slots,
+        lab_block_size_slots=duration_slots,
         is_active=payload.is_active,
         credits=payload.credits,
     )
@@ -278,6 +303,15 @@ def update_subject(
         raise HTTPException(status_code=404, detail="SUBJECT_NOT_FOUND")
 
     updates = payload.model_dump(exclude_unset=True)
+    duration_override = updates.pop("duration", None)
+    if duration_override is not None:
+        current_or_override = updates.get("lab_block_size_slots", subject.lab_block_size_slots)
+        updates["lab_block_size_slots"] = _resolve_duration_slots(
+            duration=int(duration_override),
+            lab_block_size_slots=int(current_or_override),
+        )
+    if "lab_block_size_slots" in updates:
+        updates["duration_slots"] = int(updates["lab_block_size_slots"])
     for k, v in updates.items():
         setattr(subject, k, v)
 
@@ -291,7 +325,7 @@ def update_subject(
             subject_type=str(subject.subject_type),
             sessions_per_week=int(subject.sessions_per_week),
             max_per_day=int(subject.max_per_day),
-            lab_block_size_slots=int(subject.lab_block_size_slots),
+            duration_slots=int(subject.lab_block_size_slots),
         )
 
     try:
@@ -316,18 +350,24 @@ def put_subject(
     if subject is None:
         raise HTTPException(status_code=404, detail="SUBJECT_NOT_FOUND")
 
+    duration_slots = _resolve_duration_slots(
+        duration=payload.duration,
+        lab_block_size_slots=payload.lab_block_size_slots,
+    )
+
     _validate_subject_constraints(
         subject_type=payload.subject_type,
         sessions_per_week=int(payload.sessions_per_week),
         max_per_day=int(payload.max_per_day),
-        lab_block_size_slots=int(payload.lab_block_size_slots),
+        duration_slots=int(duration_slots),
     )
 
     subject.name = payload.name
     subject.subject_type = payload.subject_type
     subject.sessions_per_week = int(payload.sessions_per_week)
     subject.max_per_day = int(payload.max_per_day)
-    subject.lab_block_size_slots = int(payload.lab_block_size_slots)
+    subject.duration_slots = int(duration_slots)
+    subject.lab_block_size_slots = int(duration_slots)
     subject.is_active = bool(payload.is_active)
     subject.credits = int(payload.credits)
 

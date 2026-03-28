@@ -47,6 +47,28 @@ class ValidationConflict:
     metadata: dict[str, Any] | None = None
 
 
+def _duration_slots(subj: Any) -> int:
+    duration_raw = getattr(subj, "duration_slots", None)
+    legacy_raw = getattr(subj, "lab_block_size_slots", None)
+    duration = int(duration_raw or 0) if duration_raw is not None else 0
+    legacy = int(legacy_raw or 0) if legacy_raw is not None else 0
+    if duration < 1:
+        duration = legacy
+    if legacy >= 1 and duration != legacy:
+        duration = legacy
+    if duration < 1:
+        duration = 1
+    return duration
+
+
+def _required_weekly_slots(subj: Any, sessions_per_week: int | None = None) -> int:
+    if sessions_per_week is None:
+        sessions = int(getattr(subj, "sessions_per_week", 0) or 0)
+    else:
+        sessions = int(sessions_per_week or 0)
+    return int(sessions) * int(_duration_slots(subj))
+
+
 def persist_conflicts(db: Session, *, run: TimetableRun, conflicts: Iterable[ValidationConflict]) -> None:
     tenant_id = getattr(run, "tenant_id", None)
     for c in conflicts:
@@ -906,11 +928,7 @@ def validate_prereqs(
                 teacher_affected_sections[teacher_id].add(sec_id)
                 teacher_affected_subjects[teacher_id].add(subj_id)
                 spw = int(getattr(subj, "sessions_per_week", 0) or 0)
-                block = int(getattr(subj, "lab_block_size_slots", 1) or 1)
-                if str(getattr(subj, "subject_type", "")).upper() == "LAB":
-                    teacher_required_slots[teacher_id] += spw * max(block, 1)
-                else:
-                    teacher_required_slots[teacher_id] += spw
+                teacher_required_slots[teacher_id] += int(_required_weekly_slots(subj, spw))
 
             # 2) Count combined THEORY groups once per group.
             for gid in sorted(list(combined_gids_seen), key=lambda x: str(x)):
@@ -943,7 +961,7 @@ def validate_prereqs(
                 if teacher_id is None:
                     continue
 
-                teacher_required_slots[teacher_id] += int(spw)
+                teacher_required_slots[teacher_id] += int(_required_weekly_slots(subj, spw))
                 for sid in sec_ids:
                     teacher_affected_sections[teacher_id].add(sid)
                 teacher_affected_subjects[teacher_id].add(subj_id)
@@ -964,8 +982,7 @@ def validate_prereqs(
                             spw = int(getattr(subj, "sessions_per_week", 0) or 0)
                             if spw <= 0:
                                 continue
-                            block = int(getattr(subj, "lab_block_size_slots", 1) or 1)
-                            slots = spw * max(block, 1) if str(getattr(subj, "subject_type", "")).upper() == "LAB" else spw
+                            slots = int(_required_weekly_slots(subj, spw))
                             teacher_required_slots[teacher_id] += int(slots)
                             teacher_affected_sections[teacher_id].add(sec_id)
                             teacher_affected_subjects[teacher_id].add(subj_id)
@@ -1307,21 +1324,23 @@ def validate_prereqs(
                         )
                     )
 
-                # LAB: the fixed slot represents the LAB start; must fit contiguously.
-                if str(subj.subject_type) == "LAB":
-                    block = int(getattr(subj, "lab_block_size_slots", 1) or 1)
-                    if block < 1:
-                        block = 1
-                    # Mark the entire LAB block as occupied.
+                # Fixed entry slot represents a class start; validate full contiguous duration.
+                block = int(_duration_slots(subj))
+                if block > 1:
                     for j in range(block):
                         if (int(d), int(si) + int(j)) in slot_id_by_day_index:
                             locked_indices_by_section_day[(fe.section_id, int(d))].add(int(si) + int(j))
                     end_idx = int(si) + block - 1
+                    is_lab = str(subj.subject_type) == "LAB"
                     if w is None or end_idx > int(w.end_slot_index):
                         conflicts.append(
                             ValidationConflict(
-                                conflict_type="FIXED_LAB_BLOCK_DOES_NOT_FIT",
-                                message="Fixed lab does not fit fully inside the section window as a contiguous block.",
+                                conflict_type="FIXED_LAB_BLOCK_DOES_NOT_FIT" if is_lab else "FIXED_BLOCK_DOES_NOT_FIT",
+                                message=(
+                                    "Fixed lab does not fit fully inside the section window as a contiguous block."
+                                    if is_lab
+                                    else "Fixed class does not fit fully inside the section window as a contiguous block."
+                                ),
                                 section_id=fe.section_id,
                                 teacher_id=fe.teacher_id,
                                 subject_id=fe.subject_id,
@@ -1335,8 +1354,12 @@ def validate_prereqs(
                             if int(si) + j not in valid_indices:
                                 conflicts.append(
                                     ValidationConflict(
-                                        conflict_type="FIXED_LAB_BLOCK_SLOT_MISSING",
-                                        message="Fixed lab block references a missing time slot index.",
+                                        conflict_type="FIXED_LAB_BLOCK_SLOT_MISSING" if is_lab else "FIXED_BLOCK_SLOT_MISSING",
+                                        message=(
+                                            "Fixed lab block references a missing time slot index."
+                                            if is_lab
+                                            else "Fixed class block references a missing time slot index."
+                                        ),
                                         section_id=fe.section_id,
                                         teacher_id=fe.teacher_id,
                                         subject_id=fe.subject_id,
@@ -1346,13 +1369,16 @@ def validate_prereqs(
                                 )
                                 break
 
-                            # LAB block must not overlap breaks.
                             covered_slot_id = slot_id_by_day_index.get((int(d), int(si) + int(j)))
                             if covered_slot_id is not None and covered_slot_id in break_slot_ids_by_section.get(fe.section_id, set()):
                                 conflicts.append(
                                     ValidationConflict(
-                                        conflict_type="FIXED_LAB_OVERLAPS_BREAK",
-                                        message="Fixed lab block overlaps a section break; move the fixed lab or adjust breaks.",
+                                        conflict_type="FIXED_LAB_OVERLAPS_BREAK" if is_lab else "FIXED_BLOCK_OVERLAPS_BREAK",
+                                        message=(
+                                            "Fixed lab block overlaps a section break; move the fixed lab or adjust breaks."
+                                            if is_lab
+                                            else "Fixed class block overlaps a section break; move the fixed entry or adjust breaks."
+                                        ),
                                         section_id=fe.section_id,
                                         teacher_id=fe.teacher_id,
                                         subject_id=fe.subject_id,
@@ -1528,21 +1554,24 @@ def validate_prereqs(
                     )
                     continue
 
-                # For LAB special allotments, the entire block must not overlap breaks.
-                if subj is not None and str(subj.subject_type) == "LAB":
+                # For multi-slot special allotments, the entire block must not overlap breaks.
+                if subj is not None and int(_duration_slots(subj)) > 1:
                     di = slot_id_to_day_index.get(sa.slot_id)
                     if di is not None:
                         d, si = int(di[0]), int(di[1])
-                        block = int(getattr(subj, "lab_block_size_slots", 1) or 1)
-                        if block < 1:
-                            block = 1
+                        block = int(_duration_slots(subj))
+                        is_lab = str(subj.subject_type) == "LAB"
                         for j in range(block):
                             covered_slot_id = slot_id_by_day_index.get((int(d), int(si) + int(j)))
                             if covered_slot_id is not None and covered_slot_id in break_slot_ids_by_section.get(sa.section_id, set()):
                                 conflicts.append(
                                     ValidationConflict(
-                                        conflict_type="SPECIAL_LAB_OVERLAPS_BREAK",
-                                        message="Special lab block overlaps a section break; move the special allotment or adjust breaks.",
+                                        conflict_type="SPECIAL_LAB_OVERLAPS_BREAK" if is_lab else "SPECIAL_BLOCK_OVERLAPS_BREAK",
+                                        message=(
+                                            "Special lab block overlaps a section break; move the special allotment or adjust breaks."
+                                            if is_lab
+                                            else "Special class block overlaps a section break; move the special allotment or adjust breaks."
+                                        ),
                                         section_id=sa.section_id,
                                         teacher_id=sa.teacher_id,
                                         subject_id=sa.subject_id,
@@ -1708,21 +1737,23 @@ def validate_prereqs(
                         )
                     )
 
-                # LAB: slot represents LAB start; must fit contiguously.
-                if str(subj.subject_type) == "LAB":
-                    block = int(getattr(subj, "lab_block_size_slots", 1) or 1)
-                    if block < 1:
-                        block = 1
-                    # Mark the entire LAB block as occupied.
+                # Special entry slot represents a class start; validate full contiguous duration.
+                block = int(_duration_slots(subj))
+                if block > 1:
                     for j in range(block):
                         if (int(d), int(si) + int(j)) in slot_id_by_day_index:
                             locked_indices_by_section_day[(sa.section_id, int(d))].add(int(si) + int(j))
                     end_idx = int(si) + block - 1
+                    is_lab = str(subj.subject_type) == "LAB"
                     if w is None or end_idx > int(w.end_slot_index):
                         conflicts.append(
                             ValidationConflict(
-                                conflict_type="SPECIAL_LAB_BLOCK_DOES_NOT_FIT",
-                                message="Special lab does not fit fully inside the section window as a contiguous block.",
+                                conflict_type="SPECIAL_LAB_BLOCK_DOES_NOT_FIT" if is_lab else "SPECIAL_BLOCK_DOES_NOT_FIT",
+                                message=(
+                                    "Special lab does not fit fully inside the section window as a contiguous block."
+                                    if is_lab
+                                    else "Special class does not fit fully inside the section window as a contiguous block."
+                                ),
                                 section_id=sa.section_id,
                                 teacher_id=sa.teacher_id,
                                 subject_id=sa.subject_id,
@@ -1736,8 +1767,12 @@ def validate_prereqs(
                             if int(si) + j not in valid_indices:
                                 conflicts.append(
                                     ValidationConflict(
-                                        conflict_type="SPECIAL_LAB_BLOCK_SLOT_MISSING",
-                                        message="Special lab block references a missing time slot index.",
+                                        conflict_type="SPECIAL_LAB_BLOCK_SLOT_MISSING" if is_lab else "SPECIAL_BLOCK_SLOT_MISSING",
+                                        message=(
+                                            "Special lab block references a missing time slot index."
+                                            if is_lab
+                                            else "Special class block references a missing time slot index."
+                                        ),
                                         section_id=sa.section_id,
                                         teacher_id=sa.teacher_id,
                                         subject_id=sa.subject_id,
@@ -1853,7 +1888,7 @@ def validate_prereqs(
                     break
 
     # Teacher capacity validation (strict mode helper): ensure total required weekly load can be covered.
-    # We estimate load in *slots* per week: LAB counts as lab_block_size_slots per session.
+    # We estimate load in *slots* per week using generic duration_slots per session.
     # This prevents wasting solver time when eligibility is too sparse.
     q_subjects = select(Subject).where(Subject.program_id == program_id).where(Subject.is_active.is_(True))
     if solve_year_ids:
@@ -1874,9 +1909,9 @@ def validate_prereqs(
                     continue
                 valid_mapped_subjects += 1
                 sessions = int(subj.sessions_per_week)
-                block = int(subj.lab_block_size_slots) if str(subj.subject_type) == "LAB" else 1
-                required_slots_by_subject[subj.id] += sessions * block
-                section_weekly_load += sessions * block
+                required_slots = int(_required_weekly_slots(subj, sessions))
+                required_slots_by_subject[subj.id] += int(required_slots)
+                section_weekly_load += int(required_slots)
 
             if valid_mapped_subjects <= 0:
                 conflicts.append(
@@ -1928,10 +1963,7 @@ def validate_prereqs(
                 continue
             any_subject = True
             sessions = r.sessions_override if r.sessions_override is not None else subj.sessions_per_week
-            if str(subj.subject_type) == "LAB":
-                required_slots_by_subject[subj.id] += int(sessions) * int(subj.lab_block_size_slots)
-            else:
-                required_slots_by_subject[subj.id] += int(sessions)
+            required_slots_by_subject[subj.id] += int(_required_weekly_slots(subj, int(sessions)))
 
         # Elective blocks: section load is one slot per block occurrence (shared across parallel electives).
         # We estimate required slots based on sessions_per_week of subjects in the block.
@@ -1944,7 +1976,8 @@ def validate_prereqs(
                 if subj is None:
                     continue
                 any_subject = True
-                required_slots_by_subject[subj.id] += int(getattr(subj, "sessions_per_week", 0) or 0)
+                sessions = int(getattr(subj, "sessions_per_week", 0) or 0)
+                required_slots_by_subject[subj.id] += int(_required_weekly_slots(subj, sessions))
 
         if not any_subject:
             conflicts.append(
@@ -1983,8 +2016,7 @@ def validate_prereqs(
                 if subj is None:
                     continue
                 sessions = int(subj.sessions_per_week)
-                block = int(subj.lab_block_size_slots) if str(subj.subject_type) == "LAB" else 1
-                required_slots += sessions * block
+                required_slots += int(_required_weekly_slots(subj, sessions))
         else:
             effective_year_id = academic_year_id if academic_year_id is not None else section.academic_year_id
             track_rows = (
@@ -2007,8 +2039,7 @@ def validate_prereqs(
                 if subj is None:
                     continue
                 sessions = r.sessions_override if r.sessions_override is not None else subj.sessions_per_week
-                block = int(subj.lab_block_size_slots) if str(subj.subject_type) == "LAB" else 1
-                required_slots += int(sessions) * block
+                required_slots += int(_required_weekly_slots(subj, int(sessions)))
 
             # Add elective block load: one slot per block occurrence.
             sec_block_ids = blocks_by_section.get(section.id, [])
@@ -2020,7 +2051,8 @@ def validate_prereqs(
                     subj = subject_by_id.get(pairs[0][0])
                     if subj is None:
                         continue
-                    required_slots += int(getattr(subj, "sessions_per_week", 0) or 0)
+                    sessions = int(getattr(subj, "sessions_per_week", 0) or 0)
+                    required_slots += int(_required_weekly_slots(subj, sessions))
 
         if required_slots > len(allowed):
             conflicts.append(

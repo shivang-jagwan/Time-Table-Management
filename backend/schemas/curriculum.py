@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class TrackSubjectBase(BaseModel):
@@ -47,6 +47,7 @@ class CurriculumSubjectBase(BaseModel):
     subject_code: str = Field(min_length=1)
     sessions_per_week: int = Field(default=0, ge=0)
     max_per_day: int = Field(default=1, ge=0)
+    duration: int | None = Field(default=None, ge=1)
     lab_block_size_slots: int = Field(default=1, ge=1)
     is_elective: bool = False
 
@@ -58,6 +59,7 @@ class CurriculumSubjectCreate(CurriculumSubjectBase):
 class CurriculumSubjectUpdate(BaseModel):
     sessions_per_week: int | None = Field(default=None, ge=0)
     max_per_day: int | None = Field(default=None, ge=0)
+    duration: int | None = Field(default=None, ge=1)
     lab_block_size_slots: int | None = Field(default=None, ge=1)
     is_elective: bool | None = None
     track: str | None = None
@@ -71,7 +73,14 @@ class CurriculumSubjectOut(BaseModel):
     subject_id: uuid.UUID
     sessions_per_week: int
     max_per_day: int
+    duration: int | None = None
     lab_block_size_slots: int
     is_elective: bool
     created_at: datetime
     model_config = ConfigDict(from_attributes=True)
+
+    @model_validator(mode="after")
+    def _populate_duration(self):
+        if self.duration is None:
+            self.duration = int(self.lab_block_size_slots)
+        return self

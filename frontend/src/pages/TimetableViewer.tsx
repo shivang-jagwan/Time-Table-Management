@@ -42,6 +42,12 @@ function groupForCell(entries: TimetableEntry[]) {
   const electiveByBlock = new Map<string, { name: string; items: TimetableEntry[] }>()
 
   for (const e of entries) {
+    const isBlockStart = (e as any).is_block_start
+    if (isBlockStart === false) {
+      // Hide continuation rows in the primary cell cards; starts carry the full block info.
+      continue
+    }
+
     const blockId = (e as any).elective_block_id as string | undefined
     if (!blockId) {
       nonElective.push(e)
@@ -403,6 +409,13 @@ export function TimetableViewer({ onToast }: { onToast: (msg: string) => void })
                       const key = `${day}:${idx}`
                       const cell = cellMap.get(key) ?? []
                       const grouped = groupForCell(cell)
+                      const continuationOnly =
+                        cell.length > 0 &&
+                        grouped.nonElective.length === 0 &&
+                        grouped.electiveGroups.every((g) => g.items.length === 0)
+                      const continuationSample = cell.find((e) => (e as any).is_block_start === false) as
+                        | TimetableEntry
+                        | undefined
                       const fixedInfo = fixedByCell.get(key) ?? null
                       return (
                         <td
@@ -429,6 +442,12 @@ export function TimetableViewer({ onToast }: { onToast: (msg: string) => void })
                             ) : (
                               <div className="h-10 rounded-lg bg-slate-50" />
                             )
+                          ) : continuationOnly ? (
+                            <div className="rounded-lg border border-slate-200 bg-slate-50 px-2 py-1">
+                              <div className="text-[11px] font-medium text-slate-600">
+                                ↳ {continuationSample?.subject_code ?? 'Class'} block continuation
+                              </div>
+                            </div>
                           ) : (
                             <div className="space-y-1">
                               {grouped.electiveGroups.map((g) => (
@@ -440,6 +459,9 @@ export function TimetableViewer({ onToast }: { onToast: (msg: string) => void })
                                   <div className="mt-0.5 space-y-0.5">
                                     {g.items.slice(0, 3).map((e) => (
                                       <div key={e.id} className="text-[11px] text-slate-700">
+                                        {Number((e as any).duration_slots ?? 1) > 1
+                                          ? `${e.start_time}–${String((e as any).block_end_time ?? e.end_time)} `
+                                          : ''}
                                         {e.subject_code} • {e.teacher_code} • {e.room_code}
                                       </div>
                                     ))}
@@ -457,6 +479,9 @@ export function TimetableViewer({ onToast }: { onToast: (msg: string) => void })
                                     {e.subject_code}
                                   </div>
                                   <div className="text-[11px] text-slate-600">
+                                    {Number((e as any).duration_slots ?? 1) > 1
+                                      ? `${e.start_time}–${String((e as any).block_end_time ?? e.end_time)} • `
+                                      : ''}
                                     {e.teacher_code} • {e.room_code}
                                   </div>
                                 </div>

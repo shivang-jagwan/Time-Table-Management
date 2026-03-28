@@ -67,6 +67,24 @@ def _get_subject(
     return subject
 
 
+def _resolve_duration_slots(*, duration: int | None, lab_block_size_slots: int | None) -> int:
+    if duration is None and lab_block_size_slots is None:
+        return 1
+    if duration is None:
+        return int(lab_block_size_slots or 1)
+    if lab_block_size_slots is None:
+        return int(duration)
+    if int(duration) != int(lab_block_size_slots):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "DURATION_CONFLICT",
+                "message": "duration and lab_block_size_slots must match when both are provided",
+            },
+        )
+    return int(duration)
+
+
 @router.get("/track-subjects", response_model=list[TrackSubjectOut])
 def list_track_subjects(
     program_code: str = Query(min_length=1),
@@ -191,6 +209,10 @@ def create_curriculum_subject(
     program = _get_program(db, payload.program_code, tenant_id=tenant_id)
     ay = _get_academic_year(db, int(payload.academic_year_number), tenant_id=tenant_id)
     subject = _get_subject(db, program.id, ay.id, payload.subject_code, tenant_id=tenant_id)
+    duration_slots = _resolve_duration_slots(
+        duration=payload.duration,
+        lab_block_size_slots=payload.lab_block_size_slots,
+    )
 
     row = CurriculumSubject(
         tenant_id=tenant_id,
@@ -200,7 +222,8 @@ def create_curriculum_subject(
         subject_id=subject.id,
         sessions_per_week=payload.sessions_per_week,
         max_per_day=payload.max_per_day,
-        lab_block_size_slots=payload.lab_block_size_slots,
+        duration_slots=duration_slots,
+        lab_block_size_slots=duration_slots,
         is_elective=payload.is_elective,
     )
     db.add(row)
@@ -226,6 +249,15 @@ def update_curriculum_subject(
         raise HTTPException(status_code=404, detail="CURRICULUM_SUBJECT_NOT_FOUND")
 
     updates = payload.model_dump(exclude_unset=True)
+    duration_override = updates.pop("duration", None)
+    if duration_override is not None:
+        current_or_override = updates.get("lab_block_size_slots", row.lab_block_size_slots)
+        updates["lab_block_size_slots"] = _resolve_duration_slots(
+            duration=int(duration_override),
+            lab_block_size_slots=int(current_or_override),
+        )
+    if "lab_block_size_slots" in updates:
+        updates["duration_slots"] = int(updates["lab_block_size_slots"])
     for k, v in updates.items():
         setattr(row, k, v)
 

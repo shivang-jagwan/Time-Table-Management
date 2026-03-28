@@ -5,6 +5,7 @@ import csv
 import io
 import threading
 import uuid
+from collections import defaultdict
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
@@ -307,16 +308,23 @@ def _validate_fixed_entry_refs(
         if not assigned:
             raise HTTPException(status_code=400, detail="TEACHER_NOT_ASSIGNED_TO_SECTION_SUBJECT")
 
-    # LAB block must fit (entry represents LAB start).
-    if str(subject.subject_type) == "LAB":
-        block = int(getattr(subject, "lab_block_size_slots", 1) or 1)
-        if block < 1:
-            block = 1
-
-        # Need a window that covers the full block on the same day.
+    # Duration block must fit (entry represents block start).
+    duration_raw = getattr(subject, "duration_slots", None)
+    legacy_raw = getattr(subject, "lab_block_size_slots", None)
+    block = int(duration_raw or 0) if duration_raw is not None else 0
+    legacy = int(legacy_raw or 0) if legacy_raw is not None else 0
+    if block < 1:
+        block = legacy
+    if legacy >= 1 and block != legacy:
+        block = legacy
+    if block < 1:
+        block = 1
+    if block > 1:
         end_idx = int(slot.slot_index) + block - 1
         if end_idx > int(w.end_slot_index):
-            raise HTTPException(status_code=400, detail="LAB_BLOCK_DOES_NOT_FIT")
+            if str(subject.subject_type) == "LAB":
+                raise HTTPException(status_code=400, detail="LAB_BLOCK_DOES_NOT_FIT")
+            raise HTTPException(status_code=400, detail="CLASS_BLOCK_DOES_NOT_FIT")
 
         # Ensure all covered time slots exist (contiguous indices).
         for j in range(block):
@@ -335,7 +343,9 @@ def _validate_fixed_entry_refs(
                 is not None
             )
             if not exists:
-                raise HTTPException(status_code=400, detail="LAB_BLOCK_SLOT_MISSING")
+                if str(subject.subject_type) == "LAB":
+                    raise HTTPException(status_code=400, detail="LAB_BLOCK_SLOT_MISSING")
+                raise HTTPException(status_code=400, detail="CLASS_BLOCK_SLOT_MISSING")
 
 
 def _validate_special_allotment_refs(
@@ -1816,8 +1826,58 @@ def list_run_entries(
     q = q.order_by(Section.code.asc(), TimeSlot.day_of_week.asc(), TimeSlot.slot_index.asc())
 
     rows = db.execute(q).all()
+
+    block_meta_by_entry_id: dict[uuid.UUID, dict[str, Any]] = {}
+    grouped: dict[tuple[Any, Any, Any, Any, Any, Any, int], list[tuple[int, uuid.UUID, str]]] = defaultdict(list)
+    for te, _sec, _subj, _teacher, _room, slot, _eb in rows:
+        sig = (
+            te.section_id,
+            te.subject_id,
+            te.teacher_id,
+            te.room_id,
+            getattr(te, "elective_block_id", None),
+            te.combined_class_id,
+            int(slot.day_of_week),
+        )
+        grouped[sig].append((int(slot.slot_index), te.id, slot.end_time.strftime("%H:%M")))
+
+    for items in grouped.values():
+        if not items:
+            continue
+        items.sort(key=lambda x: x[0])
+        run_start = 0
+        n = len(items)
+        for i in range(1, n + 1):
+            is_break = i == n or int(items[i][0]) != int(items[i - 1][0]) + 1
+            if not is_break:
+                continue
+            run_items = items[run_start:i]
+            span = len(run_items)
+            start_slot_index = int(run_items[0][0])
+            end_slot_index = int(run_items[-1][0])
+            end_time = str(run_items[-1][2])
+            for j, (slot_index, entry_id, _end_time) in enumerate(run_items):
+                block_meta_by_entry_id[entry_id] = {
+                    "duration_slots": int(span),
+                    "is_block_start": bool(j == 0),
+                    "block_start_slot_index": int(start_slot_index),
+                    "block_end_slot_index": int(end_slot_index),
+                    "block_end_time": str(end_time),
+                }
+            run_start = i
+
     entries: list[TimetableEntryOut] = []
     for te, sec, subj, teacher, room, slot, eb in rows:
+        meta = block_meta_by_entry_id.get(
+            te.id,
+            {
+                "duration_slots": 1,
+                "is_block_start": True,
+                "block_start_slot_index": int(slot.slot_index),
+                "block_end_slot_index": int(slot.slot_index),
+                "block_end_time": slot.end_time.strftime("%H:%M"),
+            },
+        )
         entries.append(
             TimetableEntryOut(
                 id=te.id,
@@ -1841,6 +1901,11 @@ def list_run_entries(
                 slot_index=int(slot.slot_index),
                 start_time=slot.start_time.strftime("%H:%M"),
                 end_time=slot.end_time.strftime("%H:%M"),
+                duration_slots=int(meta.get("duration_slots", 1) or 1),
+                is_block_start=bool(meta.get("is_block_start", True)),
+                block_start_slot_index=int(meta.get("block_start_slot_index", int(slot.slot_index))),
+                block_end_slot_index=int(meta.get("block_end_slot_index", int(slot.slot_index))),
+                block_end_time=str(meta.get("block_end_time", slot.end_time.strftime("%H:%M"))),
                 combined_class_id=te.combined_class_id,
                 elective_block_id=getattr(te, "elective_block_id", None),
                 elective_block_name=(eb.name if eb is not None else None),

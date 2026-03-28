@@ -212,11 +212,17 @@ class SolverContext:
     x: dict[tuple[Any, Any, Any], Any] = field(default_factory=dict)
     x_by_sec_subj: dict[tuple[Any, Any], list] = field(default_factory=lambda: defaultdict(list))
     x_by_sec_subj_day: dict[tuple[Any, Any, int], list] = field(default_factory=lambda: defaultdict(list))
+    # Start-variable metadata for theory blocks (duration >= 1)
+    x_block_size_by_key: dict[tuple[Any, Any, Any], int] = field(default_factory=dict)
+    x_covered_slots: dict[tuple[Any, Any, Any], list[Any]] = field(default_factory=dict)
 
     # Elective block vars
     z: dict[tuple[Any, int, Any], Any] = field(default_factory=dict)
     z_by_block_batch: dict[tuple[Any, int], list] = field(default_factory=lambda: defaultdict(list))
     z_by_block_batch_day: dict[tuple[Any, int, int], list] = field(default_factory=lambda: defaultdict(list))
+    # Start-variable metadata for elective block occurrences
+    z_block_size_by_key: dict[tuple[Any, int, Any], int] = field(default_factory=dict)
+    z_covered_slots: dict[tuple[Any, int, Any], list[Any]] = field(default_factory=dict)
 
     # Lab vars
     lab_start: dict[tuple[Any, Any, int, int], Any] = field(default_factory=dict)
@@ -229,6 +235,9 @@ class SolverContext:
     combined_vars_by_gid: dict[Any, list] = field(default_factory=lambda: defaultdict(list))
     combined_vars_by_gid_day: dict[tuple[Any, int], list] = field(default_factory=lambda: defaultdict(list))
     effective_teacher_by_gid: dict[Any, Any] = field(default_factory=dict)
+    # Start-variable metadata for combined theory blocks
+    combined_block_size_by_key: dict[tuple[Any, Any], int] = field(default_factory=dict)
+    combined_covered_slots: dict[tuple[Any, Any], list[Any]] = field(default_factory=dict)
 
     # Aggregate terms for constraints
     teacher_slot_terms: dict[tuple[Any, Any], list] = field(default_factory=lambda: defaultdict(list))
@@ -434,13 +443,32 @@ class SolverContext:
         s = self.subject_by_id.get(subject_id)
         return int(getattr(s, "max_per_day", 1) or 1) if s else 1
 
-    def lab_block_for(self, subject_id: Any, track: str = "CORE") -> int:
-        """Resolve lab_block_size_slots from curriculum → legacy subject column."""
+    def duration_for(self, subject_id: Any, track: str = "CORE") -> int:
+        """Resolve generic per-session duration (in consecutive slots)."""
+        def _resolve(row: Any | None) -> int:
+            if row is None:
+                return 1
+            duration_raw = getattr(row, "duration_slots", None)
+            legacy_raw = getattr(row, "lab_block_size_slots", None)
+            duration = int(duration_raw or 0) if duration_raw is not None else 0
+            legacy = int(legacy_raw or 0) if legacy_raw is not None else 0
+            if duration < 1:
+                duration = legacy
+            if legacy >= 1 and duration != legacy:
+                duration = legacy
+            if duration < 1:
+                duration = 1
+            return duration
+
         cs = self._curriculum_for(subject_id, track)
         if cs is not None:
-            return int(cs.lab_block_size_slots)
+            return _resolve(cs)
         s = self.subject_by_id.get(subject_id)
-        return int(getattr(s, "lab_block_size_slots", 1) or 1) if s else 1
+        return _resolve(s)
+
+    def lab_block_for(self, subject_id: Any, track: str = "CORE") -> int:
+        """Resolve lab_block_size_slots from curriculum → legacy subject column."""
+        return self.duration_for(subject_id, track)
 
 
 # ── Task 8: Lightweight sub-context view facades ─────────────────────────────

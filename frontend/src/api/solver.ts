@@ -180,6 +180,11 @@ export type TimetableEntry = {
   slot_index: number
   start_time: string
   end_time: string
+  duration_slots?: number
+  is_block_start?: boolean
+  block_start_slot_index?: number | null
+  block_end_slot_index?: number | null
+  block_end_time?: string | null
 
   combined_class_id?: string | null
   elective_block_id?: string | null

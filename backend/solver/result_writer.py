@@ -677,7 +677,16 @@ def _write_theory_entries(ctx: SolverContext, solver: cp_model.CpSolver) -> None
         teacher_id = ctx.assigned_teacher_by_section_subject.get((sec_id, subj_id))
         if teacher_id is None or subj is None:
             continue
-        fixed_room = ctx.fixed_room_by_section_slot.get((sec_id, slot_id))
+
+        block_slot_ids = list(ctx.x_covered_slots.get((sec_id, subj_id, slot_id), [slot_id]))
+        fixed_rooms = {
+            ctx.fixed_room_by_section_slot.get((sec_id, sid))
+            for sid in block_slot_ids
+            if ctx.fixed_room_by_section_slot.get((sec_id, sid)) is not None
+        }
+        if len(fixed_rooms) > 1:
+            continue
+        fixed_room = next(iter(fixed_rooms)) if fixed_rooms else None
         if fixed_room is not None:
             room_id, ok_room = fixed_room, True
         else:
@@ -686,11 +695,21 @@ def _write_theory_entries(ctx: SolverContext, solver: cp_model.CpSolver) -> None
                 room_id, ok_room = cp_room, True
             else:
                 room_id, ok_room = pick_room(ctx, slot_id, str(subj.subject_type), section_id=sec_id, subject_id=subj_id)
+                # Fallback path: preserve a single room across the full block.
+                if room_id is not None and len(block_slot_ids) > 1:
+                    rid = str(room_id)
+                    for covered_sid in block_slot_ids[1:]:
+                        sid = str(covered_sid)
+                        if rid in ctx.used_rooms_by_slot[sid]:
+                            ok_room = False
+                        ctx.used_rooms_by_slot[sid].add(rid)
         if room_id is None:
             continue
 
         combined_conflict_id = None
-        if fixed_room is not None and (str(sec_id), str(slot_id)) in ctx.conflicting_fixed_room_slots:
+        if fixed_room is not None and any(
+            (str(sec_id), str(sid)) in ctx.conflicting_fixed_room_slots for sid in block_slot_ids
+        ):
             combined_conflict_id = room_conflict_group_id(
                 run_id=run.id, room_id=room_id, slot_id=slot_id
             )
@@ -699,33 +718,34 @@ def _write_theory_entries(ctx: SolverContext, solver: cp_model.CpSolver) -> None
                 run_id=run.id, room_id=room_id, slot_id=slot_id
             )
 
-        if not ok_room:
-            ctx.db.add(
-                TimetableConflict(
-                    tenant_id=tenant_id,
-                    run_id=run.id,
-                    severity="WARN",
-                    conflict_type="NO_ROOM_AVAILABLE",
-                    message="No free room available for this slot; assigned a conflicting room.",
-                    section_id=sec_id,
-                    subject_id=subj_id,
-                    room_id=room_id,
-                    slot_id=slot_id,
-                    metadata_json={"subject_type": str(subj.subject_type)},
+        for covered_sid in block_slot_ids:
+            if not ok_room:
+                ctx.db.add(
+                    TimetableConflict(
+                        tenant_id=tenant_id,
+                        run_id=run.id,
+                        severity="WARN",
+                        conflict_type="NO_ROOM_AVAILABLE",
+                        message="No free room available for this slot; assigned a conflicting room.",
+                        section_id=sec_id,
+                        subject_id=subj_id,
+                        room_id=room_id,
+                        slot_id=covered_sid,
+                        metadata_json={"subject_type": str(subj.subject_type)},
+                    )
                 )
+            _make_entry(
+                ctx,
+                tenant_id=tenant_id,
+                run_id=run.id,
+                academic_year_id=ctx.section_year_by_id.get(sec_id) or run.academic_year_id,
+                section_id=sec_id,
+                subject_id=subj_id,
+                teacher_id=teacher_id,
+                room_id=room_id,
+                slot_id=covered_sid,
+                combined_class_id=combined_conflict_id,
             )
-        _make_entry(
-            ctx,
-            tenant_id=tenant_id,
-            run_id=run.id,
-            academic_year_id=ctx.section_year_by_id.get(sec_id) or run.academic_year_id,
-            section_id=sec_id,
-            subject_id=subj_id,
-            teacher_id=teacher_id,
-            room_id=room_id,
-            slot_id=slot_id,
-            combined_class_id=combined_conflict_id,
-        )
 
 
 def _emit_block_batch_occurrence(ctx: SolverContext, solver: cp_model.CpSolver, block_id: Any, batch_idx: int, slot_id: Any) -> None:
@@ -739,6 +759,8 @@ def _emit_block_batch_occurrence(ctx: SolverContext, solver: cp_model.CpSolver, 
         return
     if not sec_ids:
         return
+
+    block_slot_ids = list(ctx.z_covered_slots.get((block_id, int(batch_idx), slot_id), [slot_id]))
 
     from solver.room_assigner import _sid, _rid
 
@@ -770,10 +792,13 @@ def _emit_block_batch_occurrence(ctx: SolverContext, solver: cp_model.CpSolver, 
     for (subj_id, teacher_id), pair_sections in sections_by_pair.items():
         forced = ctx.forced_room_by_block_batch_subject_slot.get((block_id, int(batch_idx), subj_id, slot_id))
         if forced is not None:
-            sid = _sid(slot_id)
             rid = _rid(forced)
-            ok_room = rid not in ctx.used_rooms_by_slot[sid]
-            ctx.used_rooms_by_slot[sid].add(rid)
+            ok_room = True
+            for covered_sid in block_slot_ids:
+                sid = _sid(covered_sid)
+                if rid in ctx.used_rooms_by_slot[sid]:
+                    ok_room = False
+                ctx.used_rooms_by_slot[sid].add(rid)
             if (not ok_room) and getattr(settings, "solver_strict_mode", False):
                 raise SolverInvariantError(
                     "NO_ROOM_AVAILABLE",
@@ -787,6 +812,13 @@ def _emit_block_batch_occurrence(ctx: SolverContext, solver: cp_model.CpSolver, 
                 room_id, ok_room = cp_room, True
             else:
                 room_id, ok_room = pick_lt_room(ctx, slot_id, subject_id=subj_id)
+                if room_id is not None and len(block_slot_ids) > 1:
+                    rid = _rid(room_id)
+                    for covered_sid in block_slot_ids[1:]:
+                        sid = _sid(covered_sid)
+                        if rid in ctx.used_rooms_by_slot[sid]:
+                            ok_room = False
+                        ctx.used_rooms_by_slot[sid].add(rid)
                 if room_id is None:
                     continue
 
@@ -817,19 +849,20 @@ def _emit_block_batch_occurrence(ctx: SolverContext, solver: cp_model.CpSolver, 
             )
 
         for sec_id in pair_sections:
-            _make_entry(
-                ctx,
-                tenant_id=tenant_id,
-                run_id=run.id,
-                academic_year_id=ctx.section_year_by_id.get(sec_id) or run.academic_year_id,
-                section_id=sec_id,
-                subject_id=subj_id,
-                teacher_id=teacher_id,
-                room_id=room_id,
-                slot_id=slot_id,
-                combined_class_id=combined_conflict_id,
-                elective_block_id=block_id,
-            )
+            for covered_sid in block_slot_ids:
+                _make_entry(
+                    ctx,
+                    tenant_id=tenant_id,
+                    run_id=run.id,
+                    academic_year_id=ctx.section_year_by_id.get(sec_id) or run.academic_year_id,
+                    section_id=sec_id,
+                    subject_id=subj_id,
+                    teacher_id=teacher_id,
+                    room_id=room_id,
+                    slot_id=covered_sid,
+                    combined_class_id=combined_conflict_id,
+                    elective_block_id=block_id,
+                )
 
 
 def _write_elective_block_entries(ctx: SolverContext, solver: cp_model.CpSolver) -> None:
@@ -872,9 +905,12 @@ def _write_combined_theory_entries(ctx: SolverContext, solver: cp_model.CpSolver
         if chosen_t is None:
             continue
 
+        block_slot_ids = list(ctx.combined_covered_slots.get((group_id, slot_id), [slot_id]))
+
         fixed_rooms = [
-            ctx.fixed_room_by_section_slot.get((sid, slot_id))
+            ctx.fixed_room_by_section_slot.get((sid, covered_sid))
             for sid in ctx.group_sections.get(group_id, [])
+            for covered_sid in block_slot_ids
         ]
         fixed_rooms = [r for r in fixed_rooms if r is not None]
         if fixed_rooms:
@@ -885,6 +921,13 @@ def _write_combined_theory_entries(ctx: SolverContext, solver: cp_model.CpSolver
                 room_id, ok_room = cp_room, True
             else:
                 room_id, ok_room = pick_lt_room(ctx, slot_id, subject_id=subj_id)
+                if room_id is not None and len(block_slot_ids) > 1:
+                    rid = str(room_id)
+                    for covered_sid in block_slot_ids[1:]:
+                        sid = str(covered_sid)
+                        if rid in ctx.used_rooms_by_slot[sid]:
+                            ok_room = False
+                        ctx.used_rooms_by_slot[sid].add(rid)
         if room_id is None:
             continue
         if not ok_room:
@@ -904,18 +947,19 @@ def _write_combined_theory_entries(ctx: SolverContext, solver: cp_model.CpSolver
             )
 
         for sec_id in ctx.group_sections.get(group_id, []):
-            _make_entry(
-                ctx,
-                tenant_id=tenant_id,
-                run_id=run.id,
-                academic_year_id=ctx.section_year_by_id.get(sec_id) or run.academic_year_id,
-                section_id=sec_id,
-                subject_id=subj_id,
-                teacher_id=chosen_t,
-                room_id=ctx.fixed_room_by_section_slot.get((sec_id, slot_id)) or room_id,
-                slot_id=slot_id,
-                combined_class_id=group_id,
-            )
+            for covered_sid in block_slot_ids:
+                _make_entry(
+                    ctx,
+                    tenant_id=tenant_id,
+                    run_id=run.id,
+                    academic_year_id=ctx.section_year_by_id.get(sec_id) or run.academic_year_id,
+                    section_id=sec_id,
+                    subject_id=subj_id,
+                    teacher_id=chosen_t,
+                    room_id=ctx.fixed_room_by_section_slot.get((sec_id, covered_sid)) or room_id,
+                    slot_id=covered_sid,
+                    combined_class_id=group_id,
+                )
 
 
 def _write_lab_entries(ctx: SolverContext, solver: cp_model.CpSolver) -> None:
@@ -927,7 +971,9 @@ def _write_lab_entries(ctx: SolverContext, solver: cp_model.CpSolver) -> None:
         subj = ctx.subject_by_id.get(subj_id)
         if subj is None:
             continue
-        block = ctx.lab_block_for(subj_id)
+        section = ctx.section_by_id.get(sec_id)
+        track = str(getattr(section, "track", "CORE") or "CORE")
+        block = ctx.lab_block_for(subj_id, track=track)
         if block < 1:
             block = 1
         chosen_t = ctx.assigned_teacher_by_section_subject.get((sec_id, subj_id))

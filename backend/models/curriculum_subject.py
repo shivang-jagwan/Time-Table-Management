@@ -40,6 +40,7 @@ class CurriculumSubject(Base):
     )
     sessions_per_week = Column(Integer, nullable=False, default=0)
     max_per_day = Column(Integer, nullable=False, default=1)
+    duration_slots = Column(Integer, nullable=False, default=1)
     lab_block_size_slots = Column(Integer, nullable=False, default=1)
     is_elective = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
@@ -51,5 +52,6 @@ class CurriculumSubject(Base):
         ),
         CheckConstraint("sessions_per_week >= 0", name="ck_curriculum_subjects_sessions"),
         CheckConstraint("max_per_day >= 0", name="ck_curriculum_subjects_max_per_day"),
+        CheckConstraint("duration_slots >= 1", name="ck_curriculum_subjects_duration_slots"),
         CheckConstraint("lab_block_size_slots >= 1", name="ck_curriculum_subjects_lab_block"),
     )

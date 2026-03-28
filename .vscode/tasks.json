@@ -19,18 +19,18 @@
 		{
 			"label": "db: list programs",
 			"type": "shell",
-			"command": "D:/gpt/backend/.venv/Scripts/python.exe",
+			"command": "${workspaceFolder}/backend/.venv/Scripts/python.exe",
 			"args": [
-				"D:/gpt/backend/migrations/list_programs.py"
+				"${workspaceFolder}/backend/migrations/list_programs.py"
 			],
 			"isBackground": false
 		},
 		{
 			"label": "Seed hard global dataset",
 			"type": "shell",
-			"command": "D:\\gpt\\backend\\.venv\\Scripts\\python.exe",
+			"command": "${workspaceFolder}/backend/.venv/Scripts/python.exe",
 			"args": [
-				"D:\\gpt\\backend\\migrations\\dev_seed_hard_global_test.py"
+				"${workspaceFolder}/backend/migrations/dev_seed_hard_global_test.py"
 			],
 			"isBackground": false,
 			"problemMatcher": [],
@@ -39,9 +39,9 @@
 		{
 			"label": "Reseed hard global dataset",
 			"type": "shell",
-			"command": "D:\\gpt\\backend\\.venv\\Scripts\\python.exe",
+			"command": "${workspaceFolder}/backend/.venv/Scripts/python.exe",
 			"args": [
-				"D:\\gpt\\backend\\migrations\\dev_seed_hard_global_test.py"
+				"${workspaceFolder}/backend/migrations/dev_seed_hard_global_test.py"
 			],
 			"isBackground": false,
 			"problemMatcher": [],
@@ -50,8 +50,10 @@
 		{
 			"label": "Backend (uvicorn)",
 			"type": "shell",
-			"command": "D:\\gpt\\backend\\.venv\\Scripts\\uvicorn.exe",
+			"command": "${workspaceFolder}/backend/.venv/Scripts/python.exe",
 			"args": [
+				"-m",
+				"uvicorn",
 				"main:app",
 				"--host",
 				"0.0.0.0",
@@ -69,7 +71,7 @@
 		{
 			"label": "Backend (uvicorn, backend cwd)",
 			"type": "shell",
-			"command": "D:\\gpt\\backend\\.venv\\Scripts\\python.exe",
+			"command": "${workspaceFolder}/backend/.venv/Scripts/python.exe",
 			"args": [
 				"-m",
 				"uvicorn",
@@ -90,7 +92,7 @@
 		{
 			"label": "Backend (uvicorn, explicit app path)",
 			"type": "shell",
-			"command": "D:\\gpt\\backend\\.venv\\Scripts\\python.exe",
+			"command": "${workspaceFolder}/backend/.venv/Scripts/python.exe",
 			"args": [
 				"-m",
 				"uvicorn",

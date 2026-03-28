@@ -29,6 +29,7 @@ class Subject(Base):
     subject_type = Column(SUBJECT_TYPE, nullable=False)
     sessions_per_week = Column(Integer, nullable=False)
     max_per_day = Column(Integer, nullable=False, default=1)
+    duration_slots = Column(Integer, nullable=False, default=1)
     lab_block_size_slots = Column(Integer, nullable=False)
     is_active = Column(Boolean, nullable=False, default=True)
     # Academic credit value (0 = not set).
@@ -39,6 +40,7 @@ class Subject(Base):
         CheckConstraint("sessions_per_week >= 0", name="ck_subjects_sessions_per_week"),
         UniqueConstraint("tenant_id", "code", name="uq_subjects_tenant_code"),
         CheckConstraint("max_per_day >= 0", name="ck_subjects_max_per_day"),
+        CheckConstraint("duration_slots >= 1", name="ck_subjects_duration_slots"),
         CheckConstraint("lab_block_size_slots >= 1", name="ck_subjects_lab_block_size"),
         CheckConstraint("credits >= 0", name="ck_subjects_credits"),
     )
