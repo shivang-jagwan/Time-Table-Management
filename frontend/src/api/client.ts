@@ -2,7 +2,7 @@
 // when the backend is bound to IPv4 only.
 // Also normalize any env-provided localhost base to 127.0.0.1 (common source of “CORS”/ERR_FAILED in dev).
 const RAW_API_BASE = import.meta.env.VITE_API_BASE ?? ''
-const RAW_FALLBACK_API_BASE = import.meta.env.VITE_FALLBACK_API_BASE ?? 'https://time-table-management-wd6i.onrender.com'
+const RAW_FALLBACK_API_BASE = import.meta.env.VITE_FALLBACK_API_BASE ?? 'https://time-table-management-bh6t.onrender.com'
 
 function normalizeApiBase(raw: string): string {
   if (!raw) return ''
