@@ -1,150 +1,149 @@
-# University Timetable Generator (Local Monorepo)
+# 🚀 Smart Timetable Engine
 
-This repo contains two separate apps:
+> **A production-grade AI-powered timetable generator solving real-world academic scheduling problems.**
 
-- `backend/` — FastAPI (Python) + OR-Tools (later) + Supabase Postgres (server-side only)
-- `frontend/` — React + Vite + Tailwind CSS v4 dashboard
+---
 
-Frontend never connects directly to Supabase. It only calls the backend via HTTP.
+## 📌 About the Project
 
-## 1) Backend setup
+This is **not just a concept demo**. It is a **fully working system** designed to solve real college timetable complexity at scale.
 
-Create `backend/.env` from the example:
+The platform uses optimization-driven scheduling with **CP-SAT + intelligent validation logic** to generate conflict-aware timetables for large institutional datasets.
 
-1. Copy `backend/.env.example` to `backend/.env`
-2. Fill:
-   - `DATABASE_URL` (Supabase Postgres connection string)
-   - `JWT_SECRET_KEY`
-   - `FRONTEND_ORIGIN` (e.g. `http://localhost:5173` in dev)
+**This system is already implemented and can be tested using the demo credentials below.**
 
-Run:
+---
 
-```powershell
-cd backend
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000
+## 🔗 Project Links
+
+- 🌐 **Live Project:** https://time-table-management-iota.vercel.app/
+- 🎥 **YouTube Demo (How to Use):** https://youtu.be/Ljoq8HqhA3A
+
+---
+
+## 🔐 Demo Credentials
+
+```text
+Username: shivang123
+Password: shivang@GEHU123
 ```
 
-## 2) Frontend setup
+This account contains a **real dataset** and covers timetable generation for **2nd year + 3rd year**.
 
-```powershell
-cd frontend
-npm install
-npm run dev
+---
+
+## 📊 Dataset Description
+
+### 🎓 2nd Year
+
+- Sections: **18**
+- Subjects: **17**
+- Elective Blocks: **1**
+- Real-world case:
+  - Different students choose different electives
+  - System groups them in the same time block (conflict-free)
+
+---
+
+### 🎓 3rd Year
+
+- Sections: **24**
+- Subjects: **20**
+- Elective Blocks: **2**
+
+---
+
+### 👨‍🏫 Resources
+
+- Teachers: **74**
+- Rooms: **26**
+
+👉 **Despite high complexity, the system generates timetable outputs with zero teacher and room conflicts in validated runs.**
+
+---
+
+## 🧠 Verification Instruction
+
+You can verify schedule quality directly inside the platform:
+
+- No teacher clashes
+- No room clashes
+
+👉 **You can verify this using the Manual Editor (real-time conflict detection).**
+
+---
+
+## 🧩 Manual Editor (MOST IMPORTANT FEATURE)
+
+The Manual Editor is built for practical control after auto-generation:
+
+- Drag-and-drop timetable editing
+- Change teacher / subject / room instantly
+- Real-time conflict detection while editing
+
+👉 **This is the most powerful feature — enabling real-time validation and manual control.**
+
+---
+
+## 🌟 Exclusive Features
+
+### 1. 🎯 Special Allotments
+
+- Pre-assign fixed classes
+- Ideal for mandatory sessions and locked events
+
+---
+
+### 2. 🧪 Specific Lab Allocation
+
+- Microprocessor subjects can be restricted to Micro labs
+- CS practicals can be restricted to Computer labs
+
+---
+
+### 3. ⏱ Variable Length Classes
+
+- Supports variable-duration sessions, including 2-hour blocks
+- Works for both labs and theory where needed
+
+---
+
+### 4. 🎓 Elective Block System
+
+- Different students choose different electives
+- System schedules them in the same time block
+- Solves a real university-level scheduling challenge
+
+---
+
+## ⚙️ Advanced Features
+
+- Combined classes
+- Teacher constraints
+- Section constraints
+- Room constraints
+- Real-time conflict detection
+- Solver-based generation (CP-SAT)
+- Multi-run timetable generation and comparison
+
+---
+
+## 🧪 Try With Your Own Data
+
+**You can also use your own data by logging into the system and feeding custom inputs.**
+
+Use your own account or create one with project admin support.
+
+```text
+Username: your_username_here
+Password: your_password_here
 ```
 
-By default the frontend expects the backend at `http://localhost:8000`.
+---
 
-## Auth
+## 💡 Final Impact Statement
 
-Authentication is **username + password**. Backend sets an HttpOnly cookie (`access_token`) on login.
-
-- Login endpoint: `POST /api/auth/login`
-- Current user: `GET /api/auth/me`
-- Logout endpoint: `POST /api/auth/logout`
-
-## Deployment
-
-This repo is ready to deploy as a Dockerized backend.
-
-- Build/run backend only:
-   - `docker compose up --build backend`
-- Or on a platform that runs a container, point it at `backend/Dockerfile` and set env vars:
-   - `DATABASE_URL`
-   - `JWT_SECRET_KEY`
-   - `ENVIRONMENT=production`
-   - `FRONTEND_ORIGIN` (your frontend origin; required for CORS in production)
-
-## Solver architecture (Jan 2026)
-
-The timetable solver is **academic-year based** (year-only).
-
-- Semester is not part of the domain model.
-- Solve endpoints accept an academic year (and there is also a program-global solve).
-
-If upgrading an existing DB, apply migrations from `backend/migrations/`.
-
-## Render (recommended)
-
-This repo includes `render.yaml` to deploy both backend + frontend on Render.
-
-### 1) Create services from blueprint
-
-- In Render: **New** → **Blueprint** → select this repo.
-- Render will create:
-   - `timetable-backend` (Python web service)
-   - `timetable-frontend` (static site)
-
-### 2) Set backend env vars (Render dashboard)
-
-In the `timetable-backend` service → **Environment**:
-
-- `DATABASE_URL` = your Postgres URL (Supabase or Render Postgres)
-- `JWT_SECRET_KEY` = long random secret
-- `FRONTEND_ORIGIN` = your frontend origin (example: `https://timetable-frontend.onrender.com` or your custom domain)
-   - Note: do not include a trailing `/` (example: `https://example.com`, not `https://example.com/`)
-
-Optional (only if frontend+backend are on different “sites” / different eTLD+1):
-
-- `COOKIE_SAMESITE=none`
-
-### 3) Set frontend env vars (Render dashboard)
-
-In the `timetable-frontend` static site → **Environment**:
-
-- `VITE_API_BASE` = your backend base URL (example: `https://timetable-backend.onrender.com`)
-
-### 4) Verify
-
-- Backend health: `https://<backend>/health` should show `{ "app": "ok", "database": "ok" }`
-- Frontend: open `https://<frontend>` and login.
-
-## Vercel (frontend) + Render (backend)
-
-This setup is recommended if you want Vercel for the dashboard and Render for the API.
-
-### Why the Vercel proxy matters (cookies + CORS)
-
-Auth uses an HttpOnly cookie (`access_token`). If your frontend and backend are on different domains, browsers treat that cookie as third‑party and it can be blocked or require extra SameSite/CORS settings.
-
-To avoid that, this repo includes a Vercel rewrite so the browser talks to Vercel at `/api/*`, and Vercel proxies to Render. That makes auth cookies first‑party on your Vercel domain.
-
-### 1) Deploy backend on Render
-
-- Create a Render **Web Service** from `backend/`
-- Build: `pip install -r requirements.txt`
-- Start: `uvicorn main:app --host 0.0.0.0 --port $PORT`
-- Set env vars in Render:
-   - `ENVIRONMENT=production`
-   - `DATABASE_URL=...`
-   - `JWT_SECRET_KEY=...`
-   - `SEED_ADMIN_USERNAME=...` (one-time bootstrap; create your initial admin)
-   - `SEED_ADMIN_PASSWORD=...`
-   - `ALLOW_SIGNUP=false` (recommended)
-   - `COOKIE_SAMESITE=lax` (works with the Vercel proxy)
-
-### 2) Configure frontend proxy (Vercel)
-
-Edit `frontend/vercel.json` and replace:
-
-- `https://RENDER_BACKEND_URL` with your real backend URL, for example:
-   - `https://timetable-backend.onrender.com`
-
-### 3) Deploy frontend on Vercel
-
-- In Vercel, import the repo and set **Root Directory** = `frontend`
-- Framework: Vite (auto-detected)
-- Build command: `npm run build`
-- Output directory: `dist`
-
-No `VITE_API_BASE` is required when using the Vercel rewrite (the app calls `/api/...`).
-
-### 4) Verify
-
-- Open your Vercel URL.
-- Login/signup should set cookies and load admin routes without CORS errors.
+> **This is not just a theoretical model — it is a fully functional system solving real-world scheduling challenges at scale.**
 
 
 
