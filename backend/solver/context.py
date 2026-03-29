@@ -269,6 +269,10 @@ class SolverContext:
     slot_deviation_terms: list[Any] = field(default_factory=list)
     slot_overload_terms: list[Any] = field(default_factory=list)
     slot_overload_by_slot: dict[Any, Any] = field(default_factory=dict)
+    
+    # PHASE 11: Flexible slot capacity with soft overflow and load balancing
+    slot_capacity_overflow_terms: list[Any] = field(default_factory=list)  # Soft capacity overflow penalty
+    slot_load_squared_terms: list[Any] = field(default_factory=list)  # Quadratic load balancing penalty
 
     # Compactness/gap (built in constraints phase)
     occ_by_section_day: dict[tuple[Any, int], list[tuple[int, Any]]] = field(default_factory=dict)

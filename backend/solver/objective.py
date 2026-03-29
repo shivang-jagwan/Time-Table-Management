@@ -89,6 +89,20 @@ def add_objective(ctx: SolverContext) -> None:
         for ov in ctx.lab_room_overflow_terms:
             tier_primary.append(ov * W_LAB_ROOM_OVERFLOW)
 
+    # ── 2d-PHASE11. Flexible slot capacity with soft overflow and load balancing ─
+    # PHASE 11: Soft capacity allows classes to overflow beyond room count
+    # but penalizes overflow to encourage class distribution across slots.
+    W_SLOT_CAPACITY_OVERFLOW = 300  # Penalize exceeding total room capacity
+    W_SLOT_LOAD_BALANCE_QUAD = 2    # Quadratic load balancing: discourage concentration
+    
+    if ctx.slot_capacity_overflow_terms:
+        for overflow in ctx.slot_capacity_overflow_terms:
+            tier_primary.append(overflow * W_SLOT_CAPACITY_OVERFLOW)
+    
+    if ctx.slot_load_squared_terms:
+        for load_sq in ctx.slot_load_squared_terms:
+            tier_primary.append(load_sq * W_SLOT_LOAD_BALANCE_QUAD)
+    
     # ── 2e. Session requirement soft penalties (Phase 7: Convert to soft) ─
     # Penalize under-allocation (fewer sessions than required) and over-allocation
     if ctx.theory_sessions_under_terms:

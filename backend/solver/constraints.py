@@ -8,6 +8,13 @@ Extracts lines ~1040-1345 from the original _solve_program:
 - Teacher no-overlap
 - Teacher weekly off day
 - Teacher workload soft penalties (weekly/day/consecutive/preferred-slot)
+
+PHASE 11 (2026-03): Flexible Slot Capacity
+- REMOVED hard slot cap: model.Add(load <= total_appropriate_rooms)
+- ADDED soft slot capacity overflow: allows overflow but penalizes
+- ADDED quadratic load balancing: penalizes concentration of classes in single slot
+- Classes can distribute across multiple time slots naturally
+- Overflow penalty encourages (but doesn't force) spreading across available slots
 """
 
 from __future__ import annotations
@@ -145,7 +152,7 @@ def _add_slot_load_constraints(ctx: SolverContext) -> None:
 
     for ts in ctx.slots:
         slot_id = ts.id
-        load = model.NewIntVar(0, max_slot_load, f"slot_load_{slot_id}")
+        load = model.NewIntVar(0, max_slot_load * 2, f"slot_load_{slot_id}")  # Allow overflow beyond room count
         load_terms = list(ctx.room_terms_by_slot.get(slot_id, [])) + list(ctx.lab_room_terms_by_slot.get(slot_id, []))
         load_terms.append(int(ctx.special_theory_by_slot.get(slot_id, 0) or 0))
         load_terms.append(int(ctx.fixed_theory_by_slot.get(slot_id, 0) or 0))
@@ -154,8 +161,21 @@ def _add_slot_load_constraints(ctx: SolverContext) -> None:
         load_terms.append(int(ctx.fixed_lab_by_slot.get(slot_id, 0) or 0))
 
         model.Add(load == sum(load_terms))
-        # Phase 1 mandatory hard slot cap.
-        model.Add(load <= int(total_available_rooms))
+        
+        # PHASE 11: REMOVED hard slot cap — allow flexible distribution
+        # Old: model.Add(load <= int(total_available_rooms))
+        # New: Soft capacity with overflow penalty
+
+        # Soft capacity: Allow overflow but penalize
+        overflow = model.NewIntVar(0, max_slot_load, f"slot_capacity_overflow_{slot_id}")
+        model.Add(overflow >= load - int(total_available_rooms))
+        model.Add(overflow >= 0)
+        ctx.slot_capacity_overflow_terms.append(overflow)
+
+        # Load balancing: Penalize quadratic load distribution (spread classes across slots)
+        load_squared = model.NewIntVar(0, (max_slot_load * 2) ** 2, f"slot_load_squared_{slot_id}")
+        model.AddMultiplicationEquality(load_squared, [load, load])
+        ctx.slot_load_squared_terms.append(load_squared)
 
         overload = model.NewIntVar(0, max_slot_load, f"slot_over_{slot_id}")
         model.Add(overload >= load - int(soft_threshold))
