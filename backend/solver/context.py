@@ -301,6 +301,16 @@ class SolverContext:
     teacher_weekly_overload_terms: list[Any] = field(default_factory=list)
     teacher_weekly_overload_by_teacher: dict[Any, Any] = field(default_factory=dict)
 
+    # Teacher daily overload terms (soft: allow overflow above max_per_day with penalty)
+    teacher_daily_overload_terms: list[Any] = field(default_factory=list)
+    teacher_daily_overload_by_teacher_day: dict[tuple[Any, int], Any] = field(default_factory=dict)
+
+    # Teacher continuity overload terms (soft: penalise long consecutive teaching windows)
+    teacher_continuity_overload_terms: list[Any] = field(default_factory=list)
+
+    # Teacher preferred-slot penalty terms (soft: discourage assignments in avoid slots)
+    teacher_preferred_slot_penalty_terms: list[Any] = field(default_factory=list)
+
     # --- Post-solve state (room assignment & writing) ------------------------
     used_rooms_by_slot: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
     seen_uncombined_room_slot: set[tuple[str, str]] = field(default_factory=set)
@@ -317,6 +327,14 @@ class SolverContext:
     conflicting_special_room_slots: set[tuple[str, str]] = field(default_factory=set)
     conflicting_fixed_room_slots: set[tuple[str, str]] = field(default_factory=set)
 
+    # Phase 3 Stabilization: Room assignment fallback diagnostics
+    room_type_mismatches: list[dict[str, Any]] = field(default_factory=list)
+    room_overload_conflicts: list[dict[str, Any]] = field(default_factory=list)
+    room_forced_assignments: list[dict[str, Any]] = field(default_factory=list)
+    block_room_type_mismatches: list[dict[str, Any]] = field(default_factory=list)
+    block_room_overload_conflicts: list[dict[str, Any]] = field(default_factory=list)
+    block_room_forced_assignments: list[dict[str, Any]] = field(default_factory=list)
+
     # For elective block room assignment
     chosen_room_by_block_slot_subject: dict[tuple[Any, Any, Any], tuple[Any, bool]] = field(default_factory=dict)
 
@@ -325,6 +343,34 @@ class SolverContext:
     special_lab_by_slot: dict[Any, int] = field(default_factory=lambda: defaultdict(int))
     fixed_theory_by_slot: dict[Any, int] = field(default_factory=lambda: defaultdict(int))
     fixed_lab_by_slot: dict[Any, int] = field(default_factory=lambda: defaultdict(int))
+
+    # Room capacity soft penalty terms (Phase 6 Stabilization)
+    theory_room_overflow_terms: list[Any] = field(default_factory=list)
+    lab_room_overflow_terms: list[Any] = field(default_factory=list)
+
+    # Weekly session soft penalty terms (Phase 7: Convert to soft constraints)
+    # Under: sessions fewer than required
+    # Over: sessions more than required (shouldn't happen but tracked for symmetry)
+    theory_sessions_under_terms: list[Any] = field(default_factory=list)
+    theory_sessions_over_terms: list[Any] = field(default_factory=list)
+    lab_sessions_under_terms: list[Any] = field(default_factory=list)
+    lab_sessions_over_terms: list[Any] = field(default_factory=list)
+    combined_sessions_under_terms: list[Any] = field(default_factory=list)
+    combined_sessions_over_terms: list[Any] = field(default_factory=list)
+    elective_sessions_under_terms: list[Any] = field(default_factory=list)
+    elective_sessions_over_terms: list[Any] = field(default_factory=list)
+
+    # Phase 8: Room compatibility and teacher availability soft constraints
+    # Room compatibility violations: count per entry
+    room_compatibility_violation_count: int = 0
+    room_compatibility_violations: list[dict[str, Any]] = field(default_factory=list)
+    
+    # Teacher time window soft penalties (prefer but not hard-enforce)
+    teacher_time_preference_violations: list[dict[str, Any]] = field(default_factory=list)
+    
+    # Elective synchronization soft penalties
+    elective_sync_violation_count: int = 0
+    elective_sync_violations: list[dict[str, Any]] = field(default_factory=list)
 
     # ── OPTIMIZATION: Integer index maps ──────────────────────────────────
     # Populated once by data_loader._build_index_maps() after all entities
@@ -581,6 +627,14 @@ class _AccumulatorView:
     def subject_spread_penalty_terms(self): return self._ctx.subject_spread_penalty_terms
     @property
     def daily_load_balance_terms(self): return self._ctx.daily_load_balance_terms
+    @property
+    def teacher_weekly_overload_terms(self): return self._ctx.teacher_weekly_overload_terms
+    @property
+    def teacher_daily_overload_terms(self): return self._ctx.teacher_daily_overload_terms
+    @property
+    def teacher_continuity_overload_terms(self): return self._ctx.teacher_continuity_overload_terms
+    @property
+    def teacher_preferred_slot_penalty_terms(self): return self._ctx.teacher_preferred_slot_penalty_terms
 
 
 class _SolutionView:

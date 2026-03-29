@@ -18,7 +18,6 @@ from sqlalchemy.orm import Session
 from api.deps import get_tenant_id, require_admin
 from core.database import SessionLocal
 from api.tenant import get_by_id, where_tenant
-from core.config import settings
 from core.db import (
     DatabaseUnavailableError,
     get_db,
@@ -92,11 +91,35 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
+SOLVER_HARD_MAX_SECONDS = 60.0
+SOLVER_MAX_RESTARTS = 3
+SOLVER_MAX_LNS_ITERATIONS = 5
+
+
+def _normalize_solver_runtime_controls(
+    *,
+    max_time_seconds: float,
+    multi_seed_restarts: Any,
+    lns_iterations: Any,
+) -> tuple[float, int, int]:
+    bounded_time = float(max(max_time_seconds, 1.0))
+    bounded_time = min(bounded_time, SOLVER_HARD_MAX_SECONDS)
+
+    bounded_restarts = max(1, int(multi_seed_restarts or 1))
+    bounded_restarts = min(bounded_restarts, SOLVER_MAX_RESTARTS)
+
+    bounded_lns = max(0, int(lns_iterations or 0))
+    bounded_lns = min(bounded_lns, SOLVER_MAX_LNS_ITERATIONS)
+
+    return bounded_time, bounded_restarts, bounded_lns
+
+
 def _persist_teacher_load_adjustment_report_for_run(
     db: Session,
     *,
     run: TimetableRun,
     tenant_id: uuid.UUID | None,
+    required_by_teacher: dict[Any, int] | dict[str, int] | None = None,
 ) -> None:
     """Persist per-teacher load adjustment rows as structured conflicts for one run."""
     q_delete = delete(TimetableConflict).where(
@@ -121,19 +144,28 @@ def _persist_teacher_load_adjustment_report_for_run(
     q_teachers = where_tenant(select(Teacher).where(Teacher.id.in_(teacher_ids)), Teacher, tenant_id)
     teachers = db.execute(q_teachers).scalars().all()
 
+    required_lookup: dict[str, int] = {}
+    for tid, val in (required_by_teacher or {}).items():
+        required_lookup[str(tid)] = int(val or 0)
+
     for teacher in teachers:
         assigned_load = int(load_by_teacher.get(teacher.id, 0) or 0)
-        original_limit = int(getattr(teacher, "max_per_week", 0) or 0)
-        extended_limit = max(original_limit, assigned_load)
-        overload = max(0, assigned_load - original_limit)
+        preferred_limit = int(getattr(teacher, "max_per_week", 0) or 0)
+        required_load = int(required_lookup.get(str(teacher.id), assigned_load) or assigned_load)
+        effective_limit = max(int(preferred_limit), int(required_load))
+        overload = max(0, int(assigned_load) - int(preferred_limit))
         payload = {
             "teacher_id": str(teacher.id),
             "teacher_code": str(getattr(teacher, "code", "") or ""),
             "teacher_name": str(getattr(teacher, "full_name", "") or ""),
-            "original_limit": int(original_limit),
+            "required_load": int(required_load),
+            "preferred_limit": int(preferred_limit),
             "assigned_load": int(assigned_load),
-            "extended_limit": int(extended_limit),
+            "effective_limit": int(effective_limit),
             "overload": int(overload),
+            # Legacy aliases for older clients.
+            "original_limit": int(preferred_limit),
+            "extended_limit": int(effective_limit),
         }
         db.add(
             TimetableConflict(
@@ -181,10 +213,13 @@ def _get_teacher_load_adjustment_rows(
                 teacher_id=teacher_uuid,
                 teacher_code=payload.get("teacher_code"),
                 teacher_name=payload.get("teacher_name"),
-                original_limit=int(payload.get("original_limit", 0) or 0),
+                required_load=int(payload.get("required_load", payload.get("assigned_load", 0)) or 0),
+                preferred_limit=int(payload.get("preferred_limit", payload.get("original_limit", 0)) or 0),
                 assigned_load=int(payload.get("assigned_load", 0) or 0),
-                extended_limit=int(payload.get("extended_limit", 0) or 0),
+                effective_limit=int(payload.get("effective_limit", payload.get("extended_limit", 0)) or 0),
                 overload=int(payload.get("overload", 0) or 0),
+                original_limit=int(payload.get("original_limit", payload.get("preferred_limit", 0)) or 0),
+                extended_limit=int(payload.get("extended_limit", payload.get("effective_limit", 0)) or 0),
             )
         )
 
@@ -1531,6 +1566,7 @@ def list_runs(
     return ListRunsResponse(runs=runs)
 
 
+@router.get("/reports/teacher-load", response_model=TeacherLoadAdjustmentReportResponse)
 @router.get("/reports/teacher-load-adjustments", response_model=TeacherLoadAdjustmentReportResponse)
 def get_teacher_load_adjustment_report(
     run_id: uuid.UUID | None = Query(default=None),
@@ -1568,9 +1604,10 @@ def get_teacher_load_adjustment_report(
             "Teacher ID",
             "Name",
             "Code",
-            "Original Limit",
+            "Required",
+            "Preferred",
             "Assigned Load",
-            "Extended Limit",
+            "Effective Limit",
             "Overload",
         ])
         for row in report_rows:
@@ -1578,12 +1615,13 @@ def get_teacher_load_adjustment_report(
                 str(row.teacher_id) if row.teacher_id is not None else "",
                 row.teacher_name or "",
                 row.teacher_code or "",
-                int(row.original_limit),
+                int(row.required_load),
+                int(row.preferred_limit),
                 int(row.assigned_load),
-                int(row.extended_limit),
+                int(row.effective_limit),
                 int(row.overload),
             ])
-        filename = f"teacher-load-adjustments-{chosen_run_id}.csv"
+        filename = f"teacher-load-{chosen_run_id}.csv"
         return Response(
             content=buf.getvalue(),
             media_type="text/csv",
@@ -1595,6 +1633,7 @@ def get_teacher_load_adjustment_report(
         run_id=chosen_run_id,
         total_teachers=len(report_rows),
         adjusted_teachers=adjusted_count,
+        overloaded_teachers=adjusted_count,
         rows=report_rows,
     )
 
@@ -2259,8 +2298,21 @@ def validate_timetable(
         error_conflicts = [_to_conflict(c) for c in errors]
         warning_conflicts = [_to_conflict(c) for c in warn_from_prereqs]
 
-        has_block = bool(error_conflicts) or bool(capacity_issues)
-        has_warn = bool(warning_conflicts)
+        def _is_non_blocking_teacher_overload(issue: ValidationIssue) -> bool:
+            return (
+                str(issue.type or "") == "CAPACITY_OVERLOAD"
+                and str(issue.resource_type or "").upper() == "TEACHER"
+            )
+
+        blocking_capacity_issues = [
+            issue for issue in capacity_issues if not _is_non_blocking_teacher_overload(issue)
+        ]
+        warning_capacity_issues = [
+            issue for issue in capacity_issues if _is_non_blocking_teacher_overload(issue)
+        ]
+
+        has_block = bool(error_conflicts) or bool(blocking_capacity_issues)
+        has_warn = bool(warning_conflicts) or bool(warning_capacity_issues)
 
         if has_block:
             status = "INVALID"
@@ -2504,10 +2556,14 @@ def solve_timetable(
 ):
     run: TimetableRun | None = None
     try:
-        max_time_seconds = float(payload.max_time_seconds)
-        if settings.environment.lower() == "production":
-            # Enforce 5-minute ceiling in production; callers may request less.
-            max_time_seconds = min(max_time_seconds, 300.0)
+        requested_max_time_seconds = float(payload.max_time_seconds)
+        requested_restarts = int(getattr(payload, "multi_seed_restarts", 1) or 1)
+        requested_lns_iterations = int(getattr(payload, "lns_iterations", 0) or 0)
+        max_time_seconds, multi_seed_restarts, lns_iterations = _normalize_solver_runtime_controls(
+            max_time_seconds=requested_max_time_seconds,
+            multi_seed_restarts=requested_restarts,
+            lns_iterations=requested_lns_iterations,
+        )
 
         # Explicit connectivity validation before creating any rows.
         validate_db_connection(db)
@@ -2523,13 +2579,17 @@ def solve_timetable(
                 "program_code": payload.program_code,
                 "academic_year_number": payload.academic_year_number,
                 "max_time_seconds": max_time_seconds,
+                "requested_max_time_seconds": requested_max_time_seconds,
+                "hard_time_cap_seconds": SOLVER_HARD_MAX_SECONDS,
                 "relax_teacher_load_limits": payload.relax_teacher_load_limits,
                 "require_optimal": payload.require_optimal,
                 "hybrid_init_enabled": bool(getattr(payload, "hybrid_init_enabled", False)),
                 "hybrid_population_size": int(getattr(payload, "hybrid_population_size", 24) or 24),
                 "hybrid_generations": int(getattr(payload, "hybrid_generations", 20) or 20),
-                "multi_seed_restarts": int(getattr(payload, "multi_seed_restarts", 1) or 1),
-                "lns_iterations": int(getattr(payload, "lns_iterations", 0) or 0),
+                "multi_seed_restarts": int(multi_seed_restarts),
+                "requested_multi_seed_restarts": int(requested_restarts),
+                "lns_iterations": int(lns_iterations),
+                "requested_lns_iterations": int(requested_lns_iterations),
                 "lns_keep_fraction": float(getattr(payload, "lns_keep_fraction", 0.7) or 0.7),
                 "scope": "ACADEMIC_YEAR",
                 **({"tenant_id": str(tenant_id)} if tenant_id is not None else {}),
@@ -2713,16 +2773,18 @@ def solve_timetable(
             hybrid_init_enabled=bool(getattr(payload, "hybrid_init_enabled", False)),
             hybrid_population_size=int(getattr(payload, "hybrid_population_size", 24) or 24),
             hybrid_generations=int(getattr(payload, "hybrid_generations", 20) or 20),
-            multi_seed_restarts=int(getattr(payload, "multi_seed_restarts", 1) or 1),
-            lns_iterations=int(getattr(payload, "lns_iterations", 0) or 0),
+            multi_seed_restarts=int(multi_seed_restarts),
+            lns_iterations=int(lns_iterations),
             lns_keep_fraction=float(getattr(payload, "lns_keep_fraction", 0.7) or 0.7),
         )
 
         if str(result.status) in {"FEASIBLE", "SUBOPTIMAL", "OPTIMAL"}:
+            required_by_teacher = ((cap.get("summary", {}) or {}).get("required_by_teacher", {}) or {})
             _persist_teacher_load_adjustment_report_for_run(
                 db,
                 run=run,
                 tenant_id=tenant_id,
+                required_by_teacher=required_by_teacher,
             )
             db.commit()
 
@@ -2913,6 +2975,14 @@ def _global_solve_body(
             logger.error("_global_solve_body: run %s not found", run_id)
             return
 
+        requested_restarts = int(getattr(payload, "multi_seed_restarts", 1) or 1)
+        requested_lns_iterations = int(getattr(payload, "lns_iterations", 0) or 0)
+        max_time_seconds, multi_seed_restarts, lns_iterations = _normalize_solver_runtime_controls(
+            max_time_seconds=float(max_time_seconds),
+            multi_seed_restarts=requested_restarts,
+            lns_iterations=requested_lns_iterations,
+        )
+
         # Lightweight heartbeat that the worker thread has started.
         try:
             run.notes = "SOLVER_WORKER_STARTED"
@@ -3040,16 +3110,18 @@ def _global_solve_body(
             hybrid_init_enabled=bool(getattr(payload, "hybrid_init_enabled", False)),
             hybrid_population_size=int(getattr(payload, "hybrid_population_size", 24) or 24),
             hybrid_generations=int(getattr(payload, "hybrid_generations", 20) or 20),
-            multi_seed_restarts=int(getattr(payload, "multi_seed_restarts", 1) or 1),
-            lns_iterations=int(getattr(payload, "lns_iterations", 0) or 0),
+            multi_seed_restarts=int(multi_seed_restarts),
+            lns_iterations=int(lns_iterations),
             lns_keep_fraction=float(getattr(payload, "lns_keep_fraction", 0.7) or 0.7),
         )
 
         if str(result.status) in {"FEASIBLE", "SUBOPTIMAL", "OPTIMAL"}:
+            required_by_teacher = ((cap.get("summary", {}) or {}).get("required_by_teacher", {}) or {})
             _persist_teacher_load_adjustment_report_for_run(
                 db,
                 run=run,
                 tenant_id=tenant_id,
+                required_by_teacher=required_by_teacher,
             )
 
         # Persist solver stats so the polling endpoint can surface them.
@@ -3101,9 +3173,14 @@ def solve_timetable_global(
     Poll GET /api/solver/runs/{run_id} to track completion.
     """
     try:
-        max_time_seconds = float(payload.max_time_seconds)
-        if settings.environment.lower() == "production":
-            max_time_seconds = min(max_time_seconds, 300.0)
+        requested_max_time_seconds = float(payload.max_time_seconds)
+        requested_restarts = int(getattr(payload, "multi_seed_restarts", 1) or 1)
+        requested_lns_iterations = int(getattr(payload, "lns_iterations", 0) or 0)
+        max_time_seconds, multi_seed_restarts, lns_iterations = _normalize_solver_runtime_controls(
+            max_time_seconds=requested_max_time_seconds,
+            multi_seed_restarts=requested_restarts,
+            lns_iterations=requested_lns_iterations,
+        )
 
         validate_db_connection(db)
 
@@ -3115,13 +3192,17 @@ def solve_timetable_global(
             parameters={
                 "program_code": payload.program_code,
                 "max_time_seconds": max_time_seconds,
+                "requested_max_time_seconds": requested_max_time_seconds,
+                "hard_time_cap_seconds": SOLVER_HARD_MAX_SECONDS,
                 "relax_teacher_load_limits": payload.relax_teacher_load_limits,
                 "require_optimal": payload.require_optimal,
                 "hybrid_init_enabled": bool(getattr(payload, "hybrid_init_enabled", False)),
                 "hybrid_population_size": int(getattr(payload, "hybrid_population_size", 24) or 24),
                 "hybrid_generations": int(getattr(payload, "hybrid_generations", 20) or 20),
-                "multi_seed_restarts": int(getattr(payload, "multi_seed_restarts", 1) or 1),
-                "lns_iterations": int(getattr(payload, "lns_iterations", 0) or 0),
+                "multi_seed_restarts": int(multi_seed_restarts),
+                "requested_multi_seed_restarts": int(requested_restarts),
+                "lns_iterations": int(lns_iterations),
+                "requested_lns_iterations": int(requested_lns_iterations),
                 "lns_keep_fraction": float(getattr(payload, "lns_keep_fraction", 0.7) or 0.7),
                 "scope": "PROGRAM_GLOBAL",
                 **({"tenant_id": str(tenant_id)} if tenant_id is not None else {}),

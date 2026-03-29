@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import logging
 import random
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
 
 from solver.context import SolverContext
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -176,12 +180,23 @@ def generate_hybrid_hints(
     seed: int | None,
     population_size: int,
     generations: int,
+    deadline_monotonic: float | None = None,
 ) -> dict[Any, int]:
     """Generate optional warm-start hints using a lightweight GA over theory slots.
 
     This keeps runtime bounded and safe for production while still providing
     meaningful CP-SAT hints on large instances.
+    
+    PHASE 10 CRITICAL FIX: Added deadline_monotonic parameter.
+    GA now respects time budget and will terminate early if deadline exceeded.
     """
+    # Early exit if deadline already exceeded
+    if deadline_monotonic is not None:
+        remaining = max(0.0, float(deadline_monotonic) - time.monotonic())
+        if remaining <= 0.0:
+            logger.warning("[solver] Hybrid GA: deadline exceeded at start, returning empty hints")
+            return {}
+    
     tasks = _build_theory_tasks(ctx)
     if not tasks:
         return {}
@@ -193,7 +208,30 @@ def generate_hybrid_hints(
 
     tasks_by_key = {(t.section_id, t.subject_id): t for t in tasks}
 
-    for _ in range(max(1, generations)):
+    # Adaptive generation count: reduce if near deadline
+    max_generations = max(1, generations)
+    if deadline_monotonic is not None:
+        remaining = max(0.0, float(deadline_monotonic) - time.monotonic())
+        # If < 2 seconds remaining, do max 2 generations; < 5 seconds, max 5 generations
+        if remaining < 2.0:
+            max_generations = min(max_generations, 1)
+        elif remaining < 5.0:
+            max_generations = min(max_generations, 2)
+    
+    gen_completed = 0
+    for gen_idx in range(max_generations):
+        # PHASE 10 CRITICAL: Check deadline before each generation
+        if deadline_monotonic is not None:
+            remaining = max(0.0, float(deadline_monotonic) - time.monotonic())
+            if remaining <= 0.5:  # Leave 500ms buffer
+                logger.warning(
+                    "[solver] Hybrid GA: deadline approaching (%.1fs left), terminating after %d/%d generations",
+                    remaining,
+                    gen_idx,
+                    max_generations,
+                )
+                break
+        
         new_population: list[dict[tuple[Any, Any], set[Any]]] = []
         while len(new_population) < len(population):
             p1 = _tournament_select(population, tasks, rng)
@@ -204,6 +242,7 @@ def generate_hybrid_hints(
             _repair_conflicts(child, tasks_by_key, ctx)
             new_population.append(child)
         population = new_population
+        gen_completed += 1
 
     best = max(population, key=lambda c: _fitness(c, tasks))
 

@@ -208,6 +208,14 @@ def write_results(
     # constraints: use solver num_constraints if available, else None
     if hasattr(solver, "NumBooleans"):
         run.total_constraints = None  # CP-SAT doesn't expose this directly
+    
+    # Phase 8: Add post-solve penalties for soft constraint violations
+    post_solve_penalty = _compute_post_solve_penalties(ctx)
+    if ctx.objective_score is not None and post_solve_penalty > 0:
+        ctx.objective_score = int(ctx.objective_score) + post_solve_penalty
+        if post_solve_penalty > 0:
+            ctx.warnings.append(f"Post-solve penalty added: {post_solve_penalty} (room compatibility, teacher availability, elective sync violations)")
+    
     run.objective_value = float(ctx.objective_score) if ctx.objective_score is not None else None
     try:
         db.commit()
@@ -236,19 +244,46 @@ def write_results(
 
 def _compute_warnings(ctx: SolverContext, solver: cp_model.CpSolver) -> None:
     try:
+        day_names = {
+            0: "Monday",
+            1: "Tuesday",
+            2: "Wednesday",
+            3: "Thursday",
+            4: "Friday",
+            5: "Saturday",
+        }
+
         for teacher_id, teacher in ctx.teacher_by_id.items():
             max_week = int(getattr(teacher, "max_per_week", 0) or 0)
-            if max_week <= 0:
-                continue
             used = 0
             for term in ctx.teacher_all_terms.get(teacher_id, []):
                 if isinstance(term, int):
                     used += term
                 else:
                     used += int(solver.Value(term))
-            if used >= int(0.9 * max_week):
+
+            if max_week > 0:
+                overload = max(0, int(used) - int(max_week))
+                if overload > 0:
+                    ctx.warnings.append(
+                        f"Teacher {getattr(teacher, 'code', teacher_id)} weekly overload +{overload} (assigned {used}, preferred {max_week})"
+                    )
+                elif used >= int(0.9 * max_week):
+                    ctx.warnings.append(
+                        f"Teacher {getattr(teacher, 'code', teacher_id)} assigned {used}/{max_week} weekly load"
+                    )
+
+            daily_over_days: list[str] = []
+            for day in range(0, 6):
+                dv = ctx.teacher_daily_overload_by_teacher_day.get((teacher_id, day))
+                if dv is None:
+                    continue
+                day_over = int(solver.Value(dv))
+                if day_over > 0:
+                    daily_over_days.append(f"{day_names.get(day, str(day))}(+{day_over})")
+            if daily_over_days:
                 ctx.warnings.append(
-                    f"Teacher {getattr(teacher, 'code', teacher_id)} assigned {used}/{max_week} weekly load"
+                    f"Teacher {getattr(teacher, 'code', teacher_id)} daily overload on {', '.join(daily_over_days)}"
                 )
 
         theory_room_capacity = len(ctx.rooms_by_type.get("CLASSROOM", [])) + len(
@@ -325,6 +360,10 @@ def _compute_solver_stats(ctx: SolverContext, solver: cp_model.CpSolver, status:
         ),
         "require_optimal": bool(ctx.require_optimal),
     }
+    termination_reason = getattr(ctx, "_termination_reason", None)
+    if termination_reason is not None:
+        ctx.solver_stats["termination_reason"] = str(termination_reason)
+    ctx.solver_stats["effective_time_budget_seconds"] = float(getattr(ctx, "max_time_seconds", 0.0) or 0.0)
 
     # Slot-load and congestion metrics
     try:
@@ -474,6 +513,36 @@ def _compute_solver_stats(ctx: SolverContext, solver: cp_model.CpSolver, status:
 
     # ── Composite quality score (0-100) ──────────────────────────────────
     _compute_quality_score(ctx)
+
+
+def _compute_post_solve_penalties(ctx: SolverContext) -> int:
+    """Compute penalty costs for soft constraint violations discovered during room assignment.
+    
+    Phase 8: Constraint relaxation post-solve penalties
+    - Room compatibility violations (assigning to non-allowed rooms)
+    - Teacher time preference violations  
+    - Elective synchronization violations
+    
+    Returns: total penalty cost to add to objective score
+    """
+    penalty_cost = 0
+    W_ROOM_COMPATIBILITY_VIOLATION = 150
+    W_TEACHER_TIME_PREFERENCE_VIOLATION = 80
+    W_ELECTIVE_SYNC_VIOLATION = 120
+    
+    # Room compatibility violations
+    if hasattr(ctx, 'room_compatibility_violations') and ctx.room_compatibility_violations:
+        penalty_cost += len(ctx.room_compatibility_violations) * W_ROOM_COMPATIBILITY_VIOLATION
+    
+    # Teacher time preference violations
+    if hasattr(ctx, 'teacher_time_preference_violations') and ctx.teacher_time_preference_violations:
+        penalty_cost += len(ctx.teacher_time_preference_violations) * W_TEACHER_TIME_PREFERENCE_VIOLATION
+    
+    # Elective synchronization violations
+    if hasattr(ctx, 'elective_sync_violations') and ctx.elective_sync_violations:
+        penalty_cost += len(ctx.elective_sync_violations) * W_ELECTIVE_SYNC_VIOLATION
+    
+    return int(penalty_cost)
 
 
 def _compute_quality_score(ctx: SolverContext) -> None:

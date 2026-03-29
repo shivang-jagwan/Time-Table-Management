@@ -141,12 +141,17 @@ export async function solveTimetable(payload: SolveTimetableRequest): Promise<So
 }
 
 export async function solveTimetableGlobal(payload: SolveGlobalTimetableRequest): Promise<SolveTimetableResponse> {
+  const rawMaxTime = Number(payload.max_time_seconds ?? 60)
+  const maxTimeSeconds = Number.isFinite(rawMaxTime)
+    ? Math.min(60, Math.max(0.1, rawMaxTime))
+    : 60
+
   return apiFetch<SolveTimetableResponse>('/api/solver/solve-global', {
     method: 'POST',
     body: JSON.stringify({
       program_code: payload.program_code,
       seed: payload.seed ?? null,
-      max_time_seconds: payload.max_time_seconds ?? 300,
+      max_time_seconds: maxTimeSeconds,
       relax_teacher_load_limits: Boolean(payload.relax_teacher_load_limits),
       require_optimal: Boolean(payload.require_optimal),
     }),

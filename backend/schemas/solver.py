@@ -24,7 +24,7 @@ class GenerateGlobalTimetableRequest(BaseModel):
 
 
 class SolveTimetableRequest(GenerateTimetableRequest):
-    max_time_seconds: float = Field(default=300.0, gt=0)
+    max_time_seconds: float = Field(default=30.0, gt=0, le=60.0)
     relax_teacher_load_limits: bool = False
     require_optimal: bool = True
     # New: debug capacity tables and smart relaxation mode
@@ -36,13 +36,13 @@ class SolveTimetableRequest(GenerateTimetableRequest):
     hybrid_init_enabled: bool = False
     hybrid_population_size: int = Field(default=24, ge=4, le=200)
     hybrid_generations: int = Field(default=20, ge=1, le=500)
-    multi_seed_restarts: int = Field(default=1, ge=1, le=20)
-    lns_iterations: int = Field(default=0, ge=0, le=10)
+    multi_seed_restarts: int = Field(default=1, ge=1, le=3)
+    lns_iterations: int = Field(default=0, ge=0, le=5)
     lns_keep_fraction: float = Field(default=0.7, ge=0.0, le=1.0)
 
 
 class SolveGlobalTimetableRequest(GenerateGlobalTimetableRequest):
-    max_time_seconds: float = Field(default=300.0, gt=0)
+    max_time_seconds: float = Field(default=30.0, gt=0, le=60.0)
     relax_teacher_load_limits: bool = False
     require_optimal: bool = True
     debug_capacity_mode: bool = False
@@ -53,8 +53,8 @@ class SolveGlobalTimetableRequest(GenerateGlobalTimetableRequest):
     hybrid_init_enabled: bool = False
     hybrid_population_size: int = Field(default=24, ge=4, le=200)
     hybrid_generations: int = Field(default=20, ge=1, le=500)
-    multi_seed_restarts: int = Field(default=1, ge=1, le=20)
-    lns_iterations: int = Field(default=0, ge=0, le=10)
+    multi_seed_restarts: int = Field(default=1, ge=1, le=3)
+    lns_iterations: int = Field(default=0, ge=0, le=5)
     lns_keep_fraction: float = Field(default=0.7, ge=0.0, le=1.0)
 
 
@@ -123,16 +123,21 @@ class TeacherLoadAdjustmentRow(BaseModel):
     teacher_id: uuid.UUID | None = None
     teacher_code: str | None = None
     teacher_name: str | None = None
-    original_limit: int
+    required_load: int
+    preferred_limit: int
     assigned_load: int
-    extended_limit: int
+    effective_limit: int
     overload: int
+    # Backward-compatible aliases for older clients.
+    original_limit: int | None = None
+    extended_limit: int | None = None
 
 
 class TeacherLoadAdjustmentReportResponse(BaseModel):
     run_id: uuid.UUID
     total_teachers: int = 0
     adjusted_teachers: int = 0
+    overloaded_teachers: int = 0
     rows: list[TeacherLoadAdjustmentRow] = Field(default_factory=list)
 
 

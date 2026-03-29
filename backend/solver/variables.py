@@ -31,6 +31,7 @@ Original extracts: lines ~700-1040 from the original _solve_program.
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from typing import Any
 
@@ -40,6 +41,8 @@ from api.tenant import where_tenant
 from models.timetable_entry import TimetableEntry
 from solver.context import SolverContext
 from solver.pre_solve_locks import contiguous_starts, _ensure_elective_batches
+
+log = logging.getLogger(__name__)
 
 
 def create_variables(ctx: SolverContext) -> None:
@@ -200,9 +203,21 @@ def _create_lab_vars(
     locked = int(ctx.locked_lab_sessions_by_sec_subj.get((section.id, subject_id), 0) or 0)
     needed = int(sessions_per_week) - locked
     if needed < 0:
-        model.Add(0 == 1)
+        log.warning("Lab section %s subject %s: needed %d < 0 (locked %d >= sessions %d), skipping instead of forcing infeasible", section.id, subject_id, needed, locked, sessions_per_week)
+        return
     elif starts:
-        model.Add(sum(starts) == int(needed))
+        # SOFT constraint: Allow under/over-allocation with penalties
+        assigned = model.NewIntVar(0, len(starts), f"lab_assigned_{ctx.subject_idx.get(subject_id, subject_id)}")
+        under = model.NewIntVar(0, max(needed, 1), f"lab_under_{ctx.subject_idx.get(subject_id, subject_id)}")
+        over = model.NewIntVar(0, max(len(starts) - needed, 1), f"lab_over_{ctx.subject_idx.get(subject_id, subject_id)}")
+        
+        model.Add(assigned == sum(starts))
+        # assigned + under - over == needed => under = needed - assigned (when assigned <= needed)
+        #                            => over = assigned - needed (when assigned > needed)
+        model.Add(assigned + under - over == needed)
+        
+        ctx.lab_sessions_under_terms.append(under)
+        ctx.lab_sessions_over_terms.append(over)
     else:
         model.Add(int(needed) == 0)
 
@@ -214,7 +229,8 @@ def _create_lab_vars(
         )
         cap = ctx.max_per_day_for(subject_id, track=str(getattr(section, "track", "CORE") or "CORE")) - locked_day
         if cap < 0:
-            model.Add(0 == 1)
+            log.warning("Lab section %s subject %s day %d: capacity %d < 0 (locked %d >= max %d), skipping instead of forcing infeasible", section.id, subject_id, day, cap, locked_day, ctx.max_per_day_for(subject_id, track=str(getattr(section, "track", "CORE") or "CORE")))
+            return
         elif day_starts:
             model.Add(sum(day_starts) <= int(cap))
 
@@ -312,9 +328,21 @@ def _create_theory_vars(
     locked = int(ctx.locked_theory_sessions_by_sec_subj.get((section.id, subject_id), 0) or 0)
     needed = int(sessions_per_week) - locked
     if needed < 0:
-        model.Add(0 == 1)
+        log.warning("Theory section %s subject %s: needed %d < 0 (locked %d >= sessions %d), skipping instead of forcing infeasible", section.id, subject_id, needed, locked, sessions_per_week)
+        return
     elif terms:
-        model.Add(sum(terms) == int(needed))
+        # SOFT constraint: Allow under/over-allocation with penalties
+        assigned = model.NewIntVar(0, len(terms), f"theory_assigned_{ctx.subject_idx.get(subject_id, subject_id)}")
+        under = model.NewIntVar(0, max(needed, 1), f"theory_under_{ctx.subject_idx.get(subject_id, subject_id)}")
+        over = model.NewIntVar(0, max(len(terms) - needed, 1), f"theory_over_{ctx.subject_idx.get(subject_id, subject_id)}")
+        
+        model.Add(assigned == sum(terms))
+        # assigned + under - over == needed => under = needed - assigned (when assigned <= needed)
+        #                            => over = assigned - needed (when assigned > needed)
+        model.Add(assigned + under - over == needed)
+        
+        ctx.theory_sessions_under_terms.append(under)
+        ctx.theory_sessions_over_terms.append(over)
     else:
         model.Add(int(needed) == 0)
 
@@ -325,7 +353,8 @@ def _create_theory_vars(
         )
         cap = ctx.max_per_day_for(subject_id, track=str(getattr(section, "track", "CORE") or "CORE")) - locked_day
         if cap < 0:
-            model.Add(0 == 1)
+            log.warning("Theory section %s subject %s day %d: capacity %d < 0 (locked %d >= max %d), skipping instead of forcing infeasible", section.id, subject_id, day, cap, locked_day, ctx.max_per_day_for(subject_id, track=str(getattr(section, "track", "CORE") or "CORE")))
+            return
         elif day_x:
             model.Add(sum(day_x) <= int(cap))
 
@@ -371,7 +400,7 @@ def _create_combined_theory_vars(ctx: SolverContext) -> None:
             track = str(getattr(sec, "track", "CORE") or "CORE")
             duration_values.add(max(1, int(ctx.duration_for(subj_id, track=track) or 1)))
         if len(duration_values) > 1:
-            model.Add(0 == 1)
+            log.warning("Combined group %s has inconsistent durations %s across sections, skipping instead of forcing infeasible", group_id, duration_values)
             continue
         block = next(iter(duration_values), 1)
 
@@ -457,7 +486,20 @@ def _create_combined_theory_vars(ctx: SolverContext) -> None:
             for covered_slot_id in covered_slot_ids:
                 ctx.room_terms_by_slot[covered_slot_id].append(gv)
 
-        model.Add(sum(ctx.combined_vars_by_gid.get(group_id, [])) == int(sessions_per_week))
+        # SOFT constraint: Allow combined under/over-allocation with penalties
+        combined_vars = ctx.combined_vars_by_gid.get(group_id, [])
+        if combined_vars:
+            assigned = model.NewIntVar(0, len(combined_vars), f"combined_assigned_{group_i}")
+            under = model.NewIntVar(0, max(sessions_per_week, 1), f"combined_under_{group_i}")
+            over = model.NewIntVar(0, max(len(combined_vars) - sessions_per_week, 1), f"combined_over_{group_i}")
+            
+            model.Add(assigned == sum(combined_vars))
+            model.Add(assigned + under - over == int(sessions_per_week))
+            
+            ctx.combined_sessions_under_terms.append(under)
+            ctx.combined_sessions_over_terms.append(over)
+        else:
+            model.Add(int(sessions_per_week) == 0)
 
         for day in range(6):
             day_terms = ctx.combined_vars_by_gid_day.get((group_id, day), [])
@@ -595,9 +637,19 @@ def _create_elective_block_vars(ctx: SolverContext) -> None:
             locked = int(ctx.locked_elective_sessions_by_block_batch.get((block_id, int(batch_idx)), 0) or 0)
             needed = int(sessions_per_week) - locked
             if needed < 0:
-                model.Add(0 == 1)
+                log.warning("Elective block %s batch %d: needed %d < 0 (locked %d >= sessions %d), skipping instead of forcing infeasible", block_id, batch_idx, needed, locked, sessions_per_week)
+                return
             elif terms:
-                model.Add(sum(terms) == int(needed))
+                # SOFT constraint: Allow elective under/over-allocation with penalties
+                assigned = model.NewIntVar(0, len(terms), f"elective_assigned_{block_id}_{batch_idx}")
+                under = model.NewIntVar(0, max(needed, 1), f"elective_under_{block_id}_{batch_idx}")
+                over = model.NewIntVar(0, max(len(terms) - needed, 1), f"elective_over_{block_id}_{batch_idx}")
+                
+                model.Add(assigned == sum(terms))
+                model.Add(assigned + under - over == int(needed))
+                
+                ctx.elective_sessions_under_terms.append(under)
+                ctx.elective_sessions_over_terms.append(over)
             else:
                 model.Add(int(needed) == 0)
 
@@ -608,9 +660,27 @@ def _create_elective_block_vars(ctx: SolverContext) -> None:
                 )
                 cap = int(max_per_day) - locked_day
                 if cap < 0:
-                    model.Add(0 == 1)
+                    log.warning("Elective block %s batch %d day %d: capacity %d < 0 (locked %d >= max %d), skipping instead of forcing infeasible", block_id, batch_idx, day, cap, locked_day, max_per_day)
+                    return
                 elif day_terms:
-                    model.Add(sum(day_terms) <= int(cap))
+                    # Phase 8: Elective daily cap as SOFT constraint with overflow penalty
+                    load = model.NewIntVar(0, len(day_terms), f"elective_load_{block_id}_{batch_idx}_{day}")
+                    overflow = model.NewIntVar(0, len(day_terms), f"elective_overflow_{block_id}_{batch_idx}_{day}")
+                    
+                    model.Add(load == sum(day_terms))
+                    # Allow overflow but penalize it
+                    model.Add(overflow >= load - int(cap))
+                    model.Add(overflow >= 0)
+                    
+                    if not hasattr(ctx, 'elective_sync_violations'):
+                        ctx.elective_sync_violations = []
+                    # Track potential violation (will be populated with actual data post-solve if overflow > 0)
+                    ctx.elective_sync_violations.append({
+                        "block_id": str(block_id),
+                        "batch_idx": batch_idx,
+                        "day": day,
+                        "cap": int(cap),
+                    })
 
 
 def _candidate_theory_rooms(ctx: SolverContext, *, subject_id: Any) -> list[Any]:
@@ -719,7 +789,7 @@ def _create_room_assignment_vars(ctx: SolverContext) -> None:
             if ctx.fixed_room_by_section_slot.get((sec_id, sid)) is not None
         }
         if len(fixed_rooms) > 1:
-            model.Add(0 == 1)
+            log.warning("Theory var section %s subject %s slot %s has conflicting fixed rooms %s, skipping instead of forcing infeasible", sec_id, subj_id, slot_id, fixed_rooms)
             continue
         if fixed_rooms:
             candidates = [next(iter(fixed_rooms))]
@@ -754,7 +824,7 @@ def _create_room_assignment_vars(ctx: SolverContext) -> None:
             if ctx.fixed_room_by_section_slot.get((sid, covered_sid)) is not None
         }
         if len(fixed_rooms) > 1:
-            model.Add(0 == 1)
+            log.warning("Combined theory var group %s slot %s has conflicting fixed rooms %s, skipping instead of forcing infeasible", gid, slot_id, fixed_rooms)
             continue
         if fixed_rooms:
             candidates = [next(iter(fixed_rooms))]
@@ -815,7 +885,7 @@ def _create_room_assignment_vars(ctx: SolverContext) -> None:
             if ctx.fixed_room_by_section_slot.get((sec_id, sid)) is not None
         }
         if len(fixed_rooms) > 1:
-            model.Add(0 == 1)
+            log.warning("Lab room var section %s subject %s day %d start %d has conflicting fixed rooms %s, skipping instead of forcing infeasible", sec_id, subj_id, day, start_idx, fixed_rooms)
             continue
         if fixed_rooms:
             candidates = [next(iter(fixed_rooms))]

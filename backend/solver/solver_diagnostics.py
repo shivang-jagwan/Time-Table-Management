@@ -16,6 +16,14 @@ class DiagnosticType(str, Enum):
     ROOM_CAPACITY_SHORTAGE = "ROOM_CAPACITY_SHORTAGE"
     SPECIAL_ROOM_MISUSE = "SPECIAL_ROOM_MISUSE"
     COMBINED_GROUP_NO_INTERSECTION = "COMBINED_GROUP_NO_INTERSECTION"
+    TEACHER_EFFECTIVE_AVAILABILITY_SHORTAGE = "TEACHER_EFFECTIVE_AVAILABILITY_SHORTAGE"
+    TEACHER_AVAILABILITY_PRESSURE = "TEACHER_AVAILABILITY_PRESSURE"
+    SECTION_SUBJECT_DOMAIN_SHORTAGE = "SECTION_SUBJECT_DOMAIN_SHORTAGE"
+    SECTION_SUBJECT_DOMAIN_PRESSURE = "SECTION_SUBJECT_DOMAIN_PRESSURE"
+    COMBINED_GROUP_DOMAIN_SHORTAGE = "COMBINED_GROUP_DOMAIN_SHORTAGE"
+    COMBINED_GROUP_DOMAIN_PRESSURE = "COMBINED_GROUP_DOMAIN_PRESSURE"
+    ELECTIVE_BATCH_DOMAIN_SHORTAGE = "ELECTIVE_BATCH_DOMAIN_SHORTAGE"
+    ELECTIVE_BATCH_DOMAIN_PRESSURE = "ELECTIVE_BATCH_DOMAIN_PRESSURE"
     DIAGNOSTICS_INCONCLUSIVE = "DIAGNOSTICS_INCONCLUSIVE"
 
 
@@ -105,6 +113,23 @@ def run_infeasibility_analysis(data: dict[str, Any]) -> list[dict[str, Any]]:
     block_subject_pairs_by_block: dict[Any, list[tuple[Any, Any]]] = dict(data.get("block_subject_pairs_by_block") or {})
 
     rooms_by_type = data.get("rooms_by_type") or {}
+    teacher_disallowed_slot_ids: dict[Any, set[Any]] = {
+        tid: set(slot_ids or [])
+        for tid, slot_ids in dict(data.get("teacher_disallowed_slot_ids") or {}).items()
+    }
+    external_teacher_blocked_slot_ids: dict[Any, set[Any]] = {
+        tid: set(slot_ids or [])
+        for tid, slot_ids in dict(data.get("external_teacher_blocked_slot_ids") or {}).items()
+    }
+    valid_slots_by_section_subject: dict[tuple[Any, Any], list[Any]] = dict(
+        data.get("valid_slots_by_section_subject") or {}
+    )
+    valid_slots_for_combined_group: dict[Any, list[Any]] = dict(
+        data.get("valid_slots_for_combined_group") or {}
+    )
+    valid_slots_for_elective_batch: dict[tuple[Any, int], list[Any]] = dict(
+        data.get("valid_slots_for_elective_batch") or {}
+    )
 
     # ------------------------
     # Helpers: section windows
@@ -999,8 +1024,315 @@ def run_infeasibility_analysis(data: dict[str, Any]) -> list[dict[str, Any]]:
                 )
             )
 
+    # ------------------------
+    # J) Targeted domain-pressure hints (for decomposed failing batch)
+    # ------------------------
+    # These are emitted only when deterministic checks above found nothing.
+    # They surface "where pressure is highest" so operators can adjust data
+    # in a focused way rather than guessing globally.
+    teacher_pressure: list[tuple[int, dict[str, Any]]] = []
+    section_subject_pressure: list[tuple[int, dict[str, Any]]] = []
+    combined_pressure: list[tuple[int, dict[str, Any]]] = []
+    elective_pressure: list[tuple[int, dict[str, Any]]] = []
+    teacher_pressure_soft: list[tuple[float, dict[str, Any]]] = []
+    section_subject_pressure_soft: list[tuple[float, dict[str, Any]]] = []
+    combined_pressure_soft: list[tuple[float, dict[str, Any]]] = []
+    elective_pressure_soft: list[tuple[float, dict[str, Any]]] = []
+
+    total_slot_ids = {getattr(ts, "id", None) for ts in slots if getattr(ts, "id", None) is not None}
+    total_slot_count = int(len(total_slot_ids))
+
+    # J1) Teacher effective availability bound.
+    # If required_slots > available_slots_after_disallowed, infeasibility is
+    # mathematically guaranteed for that teacher.
+    for teacher_id, required_slots in teacher_required_slots.items():
+        teacher = teacher_by_id.get(teacher_id)
+        if teacher is None or total_slot_count <= 0:
+            continue
+        disallowed = set(teacher_disallowed_slot_ids.get(teacher_id, set()) or set())
+        available_slots = max(0, total_slot_count - len(disallowed))
+        deficit = int(required_slots) - int(available_slots)
+        if deficit <= 0:
+            if available_slots > 0:
+                pressure_ratio = float(required_slots) / float(available_slots)
+                if pressure_ratio >= 0.70:
+                    teacher_pressure_soft.append(
+                        (
+                            float(pressure_ratio),
+                            _diag(
+                                dtype=DiagnosticType.TEACHER_AVAILABILITY_PRESSURE,
+                                teacher_id=str(teacher_id),
+                                teacher=getattr(teacher, "code", None),
+                                required_slots=int(required_slots),
+                                available_slots=int(available_slots),
+                                disallowed_slots=int(len(disallowed)),
+                                blocked_from_prior_batches=int(len(external_teacher_blocked_slot_ids.get(teacher_id, set()) or set())),
+                                utilization_ratio=round(float(pressure_ratio), 4),
+                                explanation=(
+                                    f"Teacher {getattr(teacher, 'code', teacher_id)} is under high slot-pressure: "
+                                    f"required {int(required_slots)} vs available {int(available_slots)} "
+                                    f"({round(100.0 * float(pressure_ratio), 1)}% utilization)."
+                                ),
+                            ),
+                        )
+                    )
+            continue
+        teacher_pressure.append(
+            (
+                int(deficit),
+                _diag(
+                    dtype=DiagnosticType.TEACHER_EFFECTIVE_AVAILABILITY_SHORTAGE,
+                    teacher_id=str(teacher_id),
+                    teacher=getattr(teacher, "code", None),
+                    required_slots=int(required_slots),
+                    available_slots=int(available_slots),
+                    disallowed_slots=int(len(disallowed)),
+                    blocked_from_prior_batches=int(len(external_teacher_blocked_slot_ids.get(teacher_id, set()) or set())),
+                    explanation=(
+                        f"Teacher {getattr(teacher, 'code', teacher_id)} needs {int(required_slots)} slots, "
+                        f"but only {int(available_slots)} slots remain after off-day/window/locked-slot pruning."
+                    ),
+                ),
+            )
+        )
+
+    # J2) Section-subject domain shortage after full pruning.
+    for sec_id, reqs in section_required.items():
+        sec = section_by_id.get(sec_id)
+        for subj_id, sessions_override in reqs or []:
+            subj = subject_by_id.get(subj_id)
+            if subj is None:
+                continue
+
+            sessions_per_week = int(
+                sessions_override if sessions_override is not None else getattr(subj, "sessions_per_week", 0) or 0
+            )
+            if sessions_per_week <= 0:
+                continue
+
+            is_lab = str(getattr(subj, "subject_type", "THEORY")) == "LAB"
+            locked_sessions = int(
+                locked_lab_blocks_by_sec_subj.get((sec_id, subj_id), 0)
+                if is_lab
+                else locked_theory_by_sec_subj.get((sec_id, subj_id), 0)
+            )
+            remaining_sessions = int(sessions_per_week) - int(locked_sessions)
+            if remaining_sessions <= 0:
+                continue
+
+            domain_size = int(len(valid_slots_by_section_subject.get((sec_id, subj_id), []) or []))
+            deficit = int(remaining_sessions) - int(domain_size)
+            if deficit <= 0:
+                if domain_size > 0:
+                    pressure_ratio = float(remaining_sessions) / float(domain_size)
+                    if pressure_ratio >= 0.65:
+                        teacher_id = assigned_teacher_by_section_subject.get((sec_id, subj_id))
+                        teacher = teacher_by_id.get(teacher_id) if teacher_id is not None else None
+                        section_subject_pressure_soft.append(
+                            (
+                                float(pressure_ratio),
+                                _diag(
+                                    dtype=DiagnosticType.SECTION_SUBJECT_DOMAIN_PRESSURE,
+                                    section_id=str(sec_id),
+                                    section=getattr(sec, "code", None),
+                                    subject_id=str(subj_id),
+                                    subject=getattr(subj, "code", None),
+                                    teacher_id=str(teacher_id) if teacher_id is not None else None,
+                                    teacher=getattr(teacher, "code", None) if teacher is not None else None,
+                                    remaining_sessions=int(remaining_sessions),
+                                    valid_start_slots=int(domain_size),
+                                    pressure_ratio=round(float(pressure_ratio), 4),
+                                    explanation=(
+                                        f"Section {getattr(sec, 'code', sec_id)} / subject {getattr(subj, 'code', subj_id)} "
+                                        f"has a tight domain: {int(remaining_sessions)} remaining session(s) with only {int(domain_size)} valid start slot(s)."
+                                    ),
+                                ),
+                            )
+                        )
+                continue
+
+            teacher_id = assigned_teacher_by_section_subject.get((sec_id, subj_id))
+            teacher = teacher_by_id.get(teacher_id) if teacher_id is not None else None
+            section_subject_pressure.append(
+                (
+                    int(deficit),
+                    _diag(
+                        dtype=DiagnosticType.SECTION_SUBJECT_DOMAIN_SHORTAGE,
+                        section_id=str(sec_id),
+                        section=getattr(sec, "code", None),
+                        subject_id=str(subj_id),
+                        subject=getattr(subj, "code", None),
+                        teacher_id=str(teacher_id) if teacher_id is not None else None,
+                        teacher=getattr(teacher, "code", None) if teacher is not None else None,
+                        remaining_sessions=int(remaining_sessions),
+                        valid_start_slots=int(domain_size),
+                        blocked_from_prior_batches=int(len(external_teacher_blocked_slot_ids.get(teacher_id, set()) or set())) if teacher_id is not None else 0,
+                        explanation=(
+                            f"Section {getattr(sec, 'code', sec_id)} / subject {getattr(subj, 'code', subj_id)} "
+                            f"still needs {int(remaining_sessions)} session(s), but only {int(domain_size)} valid start slot(s) exist after pruning."
+                        ),
+                    ),
+                )
+            )
+
+    # J3) Combined-group domain shortage.
+    for gid, sec_ids in group_sections.items():
+        subj_id = group_subject.get(gid)
+        subj = subject_by_id.get(subj_id) if subj_id is not None else None
+        if subj is None or str(getattr(subj, "subject_type", "THEORY")) != "THEORY":
+            continue
+        sessions_per_week = int(getattr(subj, "sessions_per_week", 0) or 0)
+        if sessions_per_week <= 0:
+            continue
+
+        domain_size = int(len(valid_slots_for_combined_group.get(gid, []) or []))
+        deficit = int(sessions_per_week) - int(domain_size)
+        if deficit <= 0:
+            if domain_size > 0:
+                pressure_ratio = float(sessions_per_week) / float(domain_size)
+                if pressure_ratio >= 0.60:
+                    combined_pressure_soft.append(
+                        (
+                            float(pressure_ratio),
+                            _diag(
+                                dtype=DiagnosticType.COMBINED_GROUP_DOMAIN_PRESSURE,
+                                group_id=str(gid),
+                                subject_id=str(subj_id),
+                                subject=getattr(subj, "code", None),
+                                required_sessions=int(sessions_per_week),
+                                valid_start_slots=int(domain_size),
+                                pressure_ratio=round(float(pressure_ratio), 4),
+                                sections=[getattr(section_by_id.get(sid), "code", str(sid)) for sid in sec_ids],
+                                explanation=(
+                                    f"Combined group {str(gid)} ({getattr(subj, 'code', subj_id)}) is tight: "
+                                    f"{int(sessions_per_week)} session(s) over {int(domain_size)} common slot(s)."
+                                ),
+                            ),
+                        )
+                    )
+            continue
+
+        assigned_tid = None
+        for sid in sec_ids:
+            tid = assigned_teacher_by_section_subject.get((sid, subj_id))
+            if tid is None:
+                assigned_tid = None
+                break
+            if assigned_tid is None:
+                assigned_tid = tid
+            elif assigned_tid != tid:
+                assigned_tid = None
+                break
+        teacher = teacher_by_id.get(assigned_tid) if assigned_tid is not None else None
+
+        combined_pressure.append(
+            (
+                int(deficit),
+                _diag(
+                    dtype=DiagnosticType.COMBINED_GROUP_DOMAIN_SHORTAGE,
+                    group_id=str(gid),
+                    subject_id=str(subj_id),
+                    subject=getattr(subj, "code", None),
+                    teacher_id=str(assigned_tid) if assigned_tid is not None else None,
+                    teacher=getattr(teacher, "code", None) if teacher is not None else None,
+                    required_sessions=int(sessions_per_week),
+                    valid_start_slots=int(domain_size),
+                    sections=[getattr(section_by_id.get(sid), "code", str(sid)) for sid in sec_ids],
+                    explanation=(
+                        f"Combined group {str(gid)} ({getattr(subj, 'code', subj_id)}) needs {int(sessions_per_week)} session(s), "
+                        f"but only {int(domain_size)} common slot(s) remain after section-intersection and teacher pruning."
+                    ),
+                ),
+            )
+        )
+
+    # J4) Elective batch domain shortage.
+    for (block_id, batch_idx), valid_slots in valid_slots_for_elective_batch.items():
+        pairs = block_subject_pairs_by_block.get(block_id, [])
+        sessions_per_week = _derive_block_sessions_per_week(pairs, subject_by_id)
+        if not sessions_per_week:
+            continue
+        domain_size = int(len(valid_slots or []))
+        deficit = int(sessions_per_week) - int(domain_size)
+        if deficit <= 0:
+            if domain_size > 0:
+                pressure_ratio = float(sessions_per_week) / float(domain_size)
+                if pressure_ratio >= 0.60:
+                    elective_pressure_soft.append(
+                        (
+                            float(pressure_ratio),
+                            _diag(
+                                dtype=DiagnosticType.ELECTIVE_BATCH_DOMAIN_PRESSURE,
+                                block_id=str(block_id),
+                                batch_index=int(batch_idx),
+                                required_sessions=int(sessions_per_week),
+                                valid_start_slots=int(domain_size),
+                                pressure_ratio=round(float(pressure_ratio), 4),
+                                subject_codes=[
+                                    getattr(subject_by_id.get(subj_id), "code", str(subj_id))
+                                    for subj_id, _teacher_id in pairs
+                                ],
+                                teacher_codes=[
+                                    getattr(teacher_by_id.get(teacher_id), "code", str(teacher_id))
+                                    for _subj_id, teacher_id in pairs
+                                ],
+                                explanation=(
+                                    f"Elective block {str(block_id)} batch {int(batch_idx)} is tight: "
+                                    f"{int(sessions_per_week)} session(s) over {int(domain_size)} valid slot(s)."
+                                ),
+                            ),
+                        )
+                    )
+            continue
+
+        elective_pressure.append(
+            (
+                int(deficit),
+                _diag(
+                    dtype=DiagnosticType.ELECTIVE_BATCH_DOMAIN_SHORTAGE,
+                    block_id=str(block_id),
+                    batch_index=int(batch_idx),
+                    required_sessions=int(sessions_per_week),
+                    valid_start_slots=int(domain_size),
+                    subject_codes=[
+                        getattr(subject_by_id.get(subj_id), "code", str(subj_id))
+                        for subj_id, _teacher_id in pairs
+                    ],
+                    teacher_codes=[
+                        getattr(teacher_by_id.get(teacher_id), "code", str(teacher_id))
+                        for _subj_id, teacher_id in pairs
+                    ],
+                    explanation=(
+                        f"Elective block {str(block_id)} batch {int(batch_idx)} needs {int(sessions_per_week)} session(s), "
+                        f"but only {int(domain_size)} valid start slot(s) remain after intersection and teacher pruning."
+                    ),
+                ),
+            )
+        )
+
     # If everything above produced nothing, emit a single "inconclusive" diagnostic.
     if not diagnostics:
+        teacher_pressure.sort(key=lambda item: item[0], reverse=True)
+        section_subject_pressure.sort(key=lambda item: item[0], reverse=True)
+        combined_pressure.sort(key=lambda item: item[0], reverse=True)
+        elective_pressure.sort(key=lambda item: item[0], reverse=True)
+        teacher_pressure_soft.sort(key=lambda item: item[0], reverse=True)
+        section_subject_pressure_soft.sort(key=lambda item: item[0], reverse=True)
+        combined_pressure_soft.sort(key=lambda item: item[0], reverse=True)
+        elective_pressure_soft.sort(key=lambda item: item[0], reverse=True)
+
+        targeted: list[dict[str, Any]] = []
+        targeted.extend([diag for _score, diag in teacher_pressure[:2]])
+        targeted.extend([diag for _score, diag in section_subject_pressure[:2]])
+        targeted.extend([diag for _score, diag in combined_pressure[:1]])
+        targeted.extend([diag for _score, diag in elective_pressure[:1]])
+        if not targeted:
+            targeted.extend([diag for _score, diag in teacher_pressure_soft[:2]])
+            targeted.extend([diag for _score, diag in section_subject_pressure_soft[:2]])
+            targeted.extend([diag for _score, diag in combined_pressure_soft[:1]])
+            targeted.extend([diag for _score, diag in elective_pressure_soft[:1]])
+        diagnostics.extend(targeted[:6])
+
         diagnostics.append(
             _diag(
                 dtype=DiagnosticType.DIAGNOSTICS_INCONCLUSIVE,
@@ -1015,6 +1347,7 @@ def run_infeasibility_analysis(data: dict[str, Any]) -> list[dict[str, Any]]:
                     "fixed_entries": int(len(fixed_entries)),
                     "special_allotments": int(len(special_allotments)),
                     "combined_groups": int(len(group_sections)),
+                    "targeted_hints": int(len(targeted[:6])),
                 },
             )
         )

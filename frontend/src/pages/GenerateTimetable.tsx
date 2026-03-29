@@ -4,6 +4,7 @@ import { Toast } from '../components/Toast'
 import {
   generateTimetableGlobal,
   getSolverCalculations,
+  listRunConflicts,
   listTimeSlots,
   solveTimetableGlobal,
   pollRunUntilDone,
@@ -45,7 +46,7 @@ export function GenerateTimetable() {
   const [slotCount, setSlotCount] = React.useState<number | null>(null)
 
   const [seed, setSeed] = React.useState<string>('')
-  const [maxTimeSeconds, setMaxTimeSeconds] = React.useState<number>(300)
+  const [maxTimeSeconds, setMaxTimeSeconds] = React.useState<number>(60)
   const [relaxTeacherLoadLimits, setRelaxTeacherLoadLimits] = React.useState(false)
   const [requireOptimal, setRequireOptimal] = React.useState(true)
 
@@ -136,10 +137,13 @@ export function GenerateTimetable() {
     setLastRun(null)
     try {
       const s = seed.trim() === '' ? null : Number(seed)
+      const normalizedMaxTimeSeconds = Number.isFinite(Number(maxTimeSeconds))
+        ? Math.min(60, Math.max(0.1, Number(maxTimeSeconds)))
+        : 60
       const res = await solveTimetableGlobal({
         program_code: pc,
         seed: Number.isFinite(s as any) ? s : null,
-        max_time_seconds: Number(maxTimeSeconds),
+        max_time_seconds: normalizedMaxTimeSeconds,
         relax_teacher_load_limits: Boolean(relaxTeacherLoadLimits),
         require_optimal: Boolean(requireOptimal),
       })
@@ -156,17 +160,38 @@ export function GenerateTimetable() {
             setPollStatus(`Solving… status: ${d.status}${elapsed}`)
           },
         )
+        const runConflicts = await listRunConflicts(detail.id).catch(() => [])
+
         // Build a compatible response shape from the RunDetail + saved _solver_result
         const sr: Record<string, any> = (detail.parameters as any)?._solver_result ?? {}
+        const infeasibleConflict = runConflicts.find((c) => c.conflict_type === 'INFEASIBLE')
+        const infeasibleMeta = (infeasibleConflict?.metadata ?? {}) as Record<string, any>
+        const inferredReasonSummary =
+          typeof infeasibleMeta.reason_summary === 'string' ? infeasibleMeta.reason_summary : null
+        const inferredDiagnostics = Array.isArray(infeasibleMeta.diagnostics)
+          ? infeasibleMeta.diagnostics
+          : []
+        const warningMessagesFromConflicts = runConflicts
+          .filter((c) => c.severity === 'WARN')
+          .map((c) => c.message)
+        const mergedWarnings = Array.from(
+          new Set([
+            ...(Array.isArray(sr.warnings) ? sr.warnings : []),
+            ...warningMessagesFromConflicts,
+          ]),
+        )
+
         const finalRun: SolveTimetableResponse = {
           run_id: detail.id,
           status: detail.status as SolveTimetableResponse['status'],
           entries_written: sr.entries_written ?? detail.entries_total ?? 0,
-          conflicts: [],
-          reason_summary: sr.reason_summary ?? detail.notes ?? null,
-          diagnostics: sr.diagnostics ?? [],
+          conflicts: runConflicts,
+          reason_summary: sr.reason_summary ?? inferredReasonSummary ?? detail.notes ?? null,
+          diagnostics: Array.isArray(sr.diagnostics) && sr.diagnostics.length > 0
+            ? sr.diagnostics
+            : inferredDiagnostics,
           objective_score: sr.objective_score ?? null,
-          warnings: sr.warnings ?? [],
+          warnings: mergedWarnings,
           solver_stats: sr.solver_stats ?? {},
           best_bound: sr.best_bound ?? null,
           optimality_gap: sr.optimality_gap ?? null,
@@ -382,6 +407,7 @@ export function GenerateTimetable() {
                   id="solve_max_time"
                   type="number"
                   min={0.1}
+                  max={60}
                   step={0.1}
                   className="input-premium mt-1 w-full text-sm"
                   value={maxTimeSeconds}

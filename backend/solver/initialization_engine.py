@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import logging
 import random
+import time
 from collections import defaultdict
 from typing import Any
 
 from solver.context import SolverContext
 from solver.hybrid_initializer import generate_hybrid_hints
+
+logger = logging.getLogger(__name__)
 
 
 def build_initialization_modes(
@@ -30,12 +34,22 @@ def generate_initial_hints(
     seed: int | None,
     hybrid_population_size: int,
     hybrid_generations: int,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, set[Any]]:
     """Generate structured warm-start hints by mode.
 
     Returns sets keyed by variable family so callers can re-apply hints to
     rebuilt models in later solve passes.
+    
+    Phase 4: Respects deadline_monotonic - returns empty hints if deadline exceeded.
     """
+    # Phase 4: Check deadline upfront
+    if deadline_monotonic is not None:
+        remaining = max(0.0, float(deadline_monotonic) - time.monotonic())
+        if remaining <= 0.0:
+            logger.warning("Initialization deadline exceeded; returning empty hints")
+            return _empty_hints()
+    
     mode = str(mode or "heuristic").strip().lower()
     if mode == "hybrid":
         return _hybrid_hints(
@@ -43,9 +57,10 @@ def generate_initial_hints(
             seed=seed,
             population_size=hybrid_population_size,
             generations=hybrid_generations,
+            deadline_monotonic=deadline_monotonic,
         )
     if mode == "random":
-        return _random_hints(ctx, seed=seed)
+        return _random_hints(ctx, seed=seed, deadline_monotonic=deadline_monotonic)
     if mode == "ga":
         # GA mode currently reuses the existing hybrid generator.
         return _hybrid_hints(
@@ -53,8 +68,9 @@ def generate_initial_hints(
             seed=seed,
             population_size=hybrid_population_size,
             generations=hybrid_generations,
+            deadline_monotonic=deadline_monotonic,
         )
-    return _heuristic_hints(ctx)
+    return _heuristic_hints(ctx, deadline_monotonic=deadline_monotonic)
 
 
 def _empty_hints() -> dict[str, set[Any]]:
@@ -66,7 +82,18 @@ def _empty_hints() -> dict[str, set[Any]]:
     }
 
 
-def _heuristic_hints(ctx: SolverContext) -> dict[str, set[Any]]:
+def _heuristic_hints(ctx: SolverContext, deadline_monotonic: float | None = None) -> dict[str, set[Any]]:
+    """Generate heuristic hints from current CP-SAT model state.
+    
+    Phase 4: Returns early if deadline exceeded.
+    """
+    # Phase 4: Deadline check at start
+    if deadline_monotonic is not None:
+        remaining = max(0.0, float(deadline_monotonic) - time.monotonic())
+        if remaining <= 0.0:
+            logger.warning("Heuristic hints deadline exceeded; returning empty")
+            return _empty_hints()
+    
     hints = _empty_hints()
 
     # Simple earliest-slot greedy assignment respecting section/teacher slot usage.
@@ -106,7 +133,18 @@ def _heuristic_hints(ctx: SolverContext) -> dict[str, set[Any]]:
     return hints
 
 
-def _random_hints(ctx: SolverContext, *, seed: int | None) -> dict[str, set[Any]]:
+def _random_hints(ctx: SolverContext, *, seed: int | None, deadline_monotonic: float | None = None) -> dict[str, set[Any]]:
+    """Generate random initialization hints for multi-start exploration.
+    
+    Phase 4: Returns early if deadline exceeded.
+    """
+    # Phase 4: Deadline check at start
+    if deadline_monotonic is not None:
+        remaining = max(0.0, float(deadline_monotonic) - time.monotonic())
+        if remaining <= 0.0:
+            logger.warning("Random hints deadline exceeded; returning empty")
+            return _empty_hints()
+    
     hints = _empty_hints()
     rng = random.Random(0 if seed is None else int(seed))
 
@@ -152,13 +190,26 @@ def _hybrid_hints(
     seed: int | None,
     population_size: int,
     generations: int,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, set[Any]]:
+    """Generate hybrid GA-based hints.
+    
+    Phase 4: Returns early if deadline exceeded.
+    """
+    # Phase 4: Deadline check at start
+    if deadline_monotonic is not None:
+        remaining = max(0.0, float(deadline_monotonic) - time.monotonic())
+        if remaining <= 0.0:
+            logger.warning("Hybrid hints deadline exceeded; returning empty")
+            return _empty_hints()
+    
     hints = _empty_hints()
     var_hints = generate_hybrid_hints(
         ctx,
         seed=seed,
         population_size=int(population_size),
         generations=int(generations),
+        deadline_monotonic=deadline_monotonic,
     )
 
     x_var_to_key = {var: key for key, var in ctx.x.items()}

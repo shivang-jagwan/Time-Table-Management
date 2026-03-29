@@ -73,7 +73,7 @@ from models.timetable_run import TimetableRun  # noqa: E402
 PROGRAM_CODE = "CSE_SMOKE"
 YEAR_NUMBER = 3
 SOLVE_SEED = 42
-SOLVE_TIMEOUT = 120.0  # seconds — generous so CI doesn't time-out
+SOLVE_TIMEOUT = 60.0  # hard API cap for bounded solver runtime
 
 # Day constants (0=Mon … 5=Sat)
 MON, TUE, WED, THU, FRI, SAT = 0, 1, 2, 3, 4, 5

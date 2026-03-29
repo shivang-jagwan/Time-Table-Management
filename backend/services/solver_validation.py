@@ -438,6 +438,72 @@ def validate_prereqs(
             )
         )
 
+    # Subject-type room availability sanity: if the solve scope requires LAB
+    # subjects, at least one active non-special LAB room must exist. Likewise,
+    # THEORY subjects require at least one active CLASSROOM/LT room.
+    subject_type_by_id: dict[Any, str] = {}
+    q_scope_subjects = where_tenant(
+        select(Subject.id, Subject.subject_type)
+        .where(Subject.program_id == program_id)
+        .where(Subject.is_active.is_(True)),
+        Subject,
+        tenant_id,
+    )
+    if solve_year_ids:
+        q_scope_subjects = q_scope_subjects.where(Subject.academic_year_id.in_(solve_year_ids))
+    for subj_id, subj_type in db.execute(q_scope_subjects).all():
+        subject_type_by_id[subj_id] = str(subj_type or "THEORY").upper()
+
+    required_subject_ids_for_scope: set[Any] = set()
+    for section in sections:
+        mapped = mapped_subject_ids_by_section.get(section.id, [])
+        if mapped:
+            required_subject_ids_for_scope.update(mapped)
+            continue
+
+        effective_year_id = academic_year_id if academic_year_id is not None else section.academic_year_id
+        rows = curriculum_by_year_track.get((effective_year_id, _norm_track(section.track)), [])
+        required_subject_ids_for_scope.update(getattr(r, "subject_id", None) for r in rows if getattr(r, "subject_id", None) is not None)
+
+    requires_lab_subjects = any(
+        subject_type_by_id.get(subj_id) == "LAB"
+        for subj_id in required_subject_ids_for_scope
+    )
+    requires_theory_subjects = any(
+        subject_type_by_id.get(subj_id) != "LAB"
+        for subj_id in required_subject_ids_for_scope
+    )
+
+    q_active_rooms = where_tenant(
+        select(Room.room_type)
+        .where(Room.is_active.is_(True))
+        .where(Room.is_special.is_(False)),
+        Room,
+        tenant_id,
+    )
+    active_room_types = {str(rt or "").upper() for (rt,) in db.execute(q_active_rooms).all()}
+
+    has_lab_rooms = "LAB" in active_room_types
+    has_theory_rooms = bool({"CLASSROOM", "LT"} & active_room_types)
+
+    if requires_lab_subjects and not has_lab_rooms:
+        conflicts.append(
+            ValidationConflict(
+                conflict_type="MISSING_LAB_ROOMS",
+                message="LAB subjects are required but no active non-special LAB rooms are configured.",
+                metadata={"required_subject_types": ["LAB"]},
+            )
+        )
+
+    if requires_theory_subjects and not has_theory_rooms:
+        conflicts.append(
+            ValidationConflict(
+                conflict_type="MISSING_THEORY_ROOMS",
+                message="THEORY subjects are required but no active non-special CLASSROOM/LT rooms are configured.",
+                metadata={"required_subject_types": ["THEORY"]},
+            )
+        )
+
     # (Legacy) minimum window check is now covered by the per-day validation above.
 
     # Curriculum must exist per section unless explicit mapping is present.

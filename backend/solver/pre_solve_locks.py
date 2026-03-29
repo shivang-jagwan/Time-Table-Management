@@ -356,11 +356,14 @@ def _prune_teacher_slots(ctx: SolverContext) -> None:
             for slot_id in all_slot_ids - strict_allowed:
                 ctx.teacher_disallowed_slot_ids[teacher_id].add(slot_id)
 
-        # Soft prune: record which slots the teacher would prefer to avoid but
-        # can still use (only slots not already hard-blocked).
-        soft_outside = soft_allowed - strict_allowed - ctx.teacher_disallowed_slot_ids.get(teacher_id, set())
-        if soft_outside:
-            ctx.teacher_soft_window_slots.setdefault(teacher_id, set()).update(soft_outside)
+        # Soft preference: record assignable slots that fall OUTSIDE configured
+        # non-strict windows. These remain feasible but receive an objective
+        # penalty to guide the solver toward preferred windows.
+        if soft_allowed:
+            all_slot_ids: set = {ts.id for day_slots in ctx.slots_by_day.values() for ts in day_slots}
+            soft_avoid = (all_slot_ids - soft_allowed) - ctx.teacher_disallowed_slot_ids.get(teacher_id, set())
+            if soft_avoid:
+                ctx.teacher_soft_window_slots.setdefault(teacher_id, set()).update(soft_avoid)
 
 
 def check_teacher_window_feasibility(ctx: SolverContext) -> list[str]:
@@ -415,3 +418,79 @@ def _filter_locked_slot_indices(ctx: SolverContext) -> None:
         if not arr:
             continue
         ctx.allowed_slot_indices_by_section_day[key] = [i for i in arr if i not in locked_indices]
+
+def validate_pre_solve_locks(ctx: SolverContext) -> list[str]:
+    """Phase 9 Enhancement: Validate pre-solve locks are safe and consistent.
+    
+    Checks for:
+      1. Over-constrained sections (locked sessions exceed required sessions)
+      2. Sections with zero available slots after locking
+      3. Teachers with conflicting locked assignments
+      4. Room capacity violations from pre-locked assignments
+    
+    Returns list of warning strings (non-blocking validation).
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    warnings: list[str] = []
+    
+    # Check 1: Over-constrained sections (locked > required)
+    for (sec_id, subj_id), locked_count in ctx.locked_theory_sessions_by_sec_subj.items():
+        section = ctx.section_by_id.get(sec_id)
+        if not section:
+            continue
+        required_for_sec_subj = next(
+            (sesssions for s_id, sesssions in ctx.section_required.get(sec_id, [])
+             if s_id == subj_id),
+            0
+        )
+        if locked_count > required_for_sec_subj:
+            subj = ctx.subject_by_id.get(subj_id)
+            warnings.append(
+                f"[Phase 9] Section {section.code or sec_id} subject "
+                f"{subj.code if subj else subj_id}: locked {locked_count} sessions > "
+                f"required {required_for_sec_subj} sessions"
+            )
+    
+    # Check 2: Sections with zero available slots after locking
+    for sec_id in ctx.section_by_id.keys():
+        allowed = ctx.allowed_slots_by_section.get(sec_id, set())
+        if not allowed:
+            section = ctx.section_by_id.get(sec_id)
+            warnings.append(
+                f"[Phase 9] Section {section.code or sec_id}: NO available slots "
+                f"after pre-solve locking (all slots locked or outside window)"
+            )
+    
+    # Check 3: Teacher conflict checks — if a teacher has conflicting room assignments
+    for (teacher_id, slot_id), assigned_day in ctx.locked_teacher_slot_day.items():
+        # Count how many different rooms this teacher is locked to at this slot
+        locked_rooms = set()
+        for (sec_id, _slot_id), room_id in ctx.special_room_by_section_slot.items():
+            if _slot_id == slot_id:
+                # Check if this section's teacher is our teacher
+                for (s_id, subj_id), t_id in ctx.assigned_teacher_by_section_subject.items():
+                    if s_id == sec_id and t_id == teacher_id:
+                        locked_rooms.add(room_id)
+                        break
+        
+        if len(locked_rooms) > 1:
+            teacher = ctx.teacher_by_id.get(teacher_id)
+            warnings.append(
+                f"[Phase 9] Teacher {teacher.code if teacher else teacher_id} "
+                f"locked to {len(locked_rooms)} different rooms at same slot {slot_id}"
+            )
+    
+    # Check 4: Log lock statistics
+    total_locked_theory = sum(ctx.locked_theory_sessions_by_sec_subj.values())
+    total_locked_lab = sum(ctx.locked_lab_sessions_by_sec_subj.values())
+    logger.info(
+        "[solver] Phase 9 Pre-Solve Locks: theory=%d lab=%d teacher_slots=%d section_slots=%d warnings=%d",
+        total_locked_theory,
+        total_locked_lab,
+        len(ctx.locked_teacher_slots),
+        len(ctx.locked_section_slots),
+        len(warnings),
+    )
+    
+    return warnings

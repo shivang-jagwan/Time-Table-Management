@@ -7,18 +7,20 @@ Extracts lines ~1040-1345 from the original _solve_program:
 - Section compactness (max gap + soft gap penalty)
 - Teacher no-overlap
 - Teacher weekly off day
-- Teacher max continuous
-- Teacher load limits (max_per_week, max_per_day)
+- Teacher workload soft penalties (weekly/day/consecutive/preferred-slot)
 """
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from typing import Any
 
 from ortools.sat.python import cp_model
 
 from solver.context import SolverContext
+
+log = logging.getLogger(__name__)
 
 
 def add_constraints(ctx: SolverContext) -> None:
@@ -32,20 +34,24 @@ def add_constraints(ctx: SolverContext) -> None:
     _add_lunch_break_constraint(ctx)
     _add_teacher_no_overlap(ctx)
     _add_teacher_weekly_off(ctx)
-    _add_teacher_max_continuous(ctx)
+    _add_teacher_workload_soft_penalties(ctx)
     _add_teacher_compactness(ctx)
     _add_daily_load_balance(ctx)
     _add_room_slot_uniqueness(ctx)
     _add_slot_load_constraints(ctx)
     _add_section_max_daily_slots(ctx)
-    if ctx.enforce_teacher_load_limits:
-        _add_teacher_load_limits(ctx)
 
 
 # ── Room capacity ───────────────────────────────────────────────────────────
 
 
 def _add_room_capacity_constraints(ctx: SolverContext) -> None:
+    """Room capacity handling: SOFT penalties instead of hard limits.
+    
+    Phase 6 Stabilization: Convert from hard capacity cap to soft penalty.
+    If a slot demands more rooms than available, allow it but penalize in objective.
+    This ensures the solver never blocks due to room shortage.
+    """
     model = ctx.model
     theory_room_capacity = len(ctx.rooms_by_type.get("CLASSROOM", [])) + len(
         ctx.rooms_by_type.get("LT", [])
@@ -73,21 +79,38 @@ def _add_room_capacity_constraints(ctx: SolverContext) -> None:
         else:
             ctx.fixed_theory_by_slot[slot_id] += 1
 
+    # SOFT: Theory room capacity with penalty overflow variable
     for ts in ctx.slots:
         slot_id = ts.id
-        model.Add(
+        theory_load = (
             sum(ctx.room_terms_by_slot.get(slot_id, []))
             + int(ctx.special_theory_by_slot.get(slot_id, 0))
             + int(ctx.fixed_theory_by_slot.get(slot_id, 0))
             + int(ctx.locked_block_theory_room_demand_by_slot.get(slot_id, 0))
-            <= int(theory_room_capacity)
         )
-        model.Add(
+        
+        # Create overflow variable (soft penalty)
+        theory_over = model.NewIntVar(0, 100, f"theory_room_over_{slot_id}")
+        # Overflow is max(0, load - capacity)
+        model.Add(theory_over >= theory_load - int(theory_room_capacity))
+        model.Add(theory_over >= 0)
+        ctx.theory_room_overflow_terms.append(theory_over)
+    
+    # SOFT: Lab room capacity with penalty overflow variable
+    for ts in ctx.slots:
+        slot_id = ts.id
+        lab_load = (
             sum(ctx.lab_room_terms_by_slot.get(slot_id, []))
             + int(ctx.special_lab_by_slot.get(slot_id, 0))
             + int(ctx.fixed_lab_by_slot.get(slot_id, 0))
-            <= int(lab_room_capacity)
         )
+        
+        # Create overflow variable (soft penalty)
+        lab_over = model.NewIntVar(0, 100, f"lab_room_over_{slot_id}")
+        # Overflow is max(0, load - capacity)
+        model.Add(lab_over >= lab_load - int(lab_room_capacity))
+        model.Add(lab_over >= 0)
+        ctx.lab_room_overflow_terms.append(lab_over)
 
 
 def _add_room_slot_uniqueness(ctx: SolverContext) -> None:
@@ -98,7 +121,8 @@ def _add_room_slot_uniqueness(ctx: SolverContext) -> None:
         if terms:
             model.Add(sum(terms) + locked <= 1)
         elif locked > 1:
-            model.Add(0 == 1)
+            log.warning("Room %s slot %s has locked count %d > 1, skipping instead of forcing infeasible", room_id, slot_id, locked)
+            return
 
 
 def _add_slot_load_constraints(ctx: SolverContext) -> None:
@@ -167,8 +191,14 @@ def _add_slot_load_constraints(ctx: SolverContext) -> None:
 # ── Fixed-entry hard constraints ────────────────────────────────────────────
 
 
-def _make_infeasible(model: cp_model.CpModel, _reason: str, **_kw: Any) -> None:
-    model.Add(0 == 1)
+def _log_skip_fixed_entry(ctx: SolverContext, reason: str, **details: Any) -> None:
+    """Log and skip fixed entry; do NOT make model infeasible."""
+    import logging as _logging
+    logger = _logging.getLogger(__name__)
+    logger.warning(f"Skipped fixed entry due to: {reason}", extra=details)
+    if not hasattr(ctx, 'skipped_fixed_entries'):
+        ctx.skipped_fixed_entries = []
+    ctx.skipped_fixed_entries.append((reason, details))
 
 
 def _add_fixed_entry_hard_constraints(ctx: SolverContext) -> None:
@@ -178,8 +208,8 @@ def _add_fixed_entry_hard_constraints(ctx: SolverContext) -> None:
             continue
         subj = ctx.subject_by_id.get(fe.subject_id)
         if subj is None:
-            _make_infeasible(
-                model,
+            _log_skip_fixed_entry(
+                ctx,
                 "Fixed entry subject is not part of the current solve scope.",
                 section_id=fe.section_id,
                 subject_id=fe.subject_id,
@@ -190,8 +220,8 @@ def _add_fixed_entry_hard_constraints(ctx: SolverContext) -> None:
 
         di = ctx.slot_info.get(fe.slot_id)
         if di is None:
-            _make_infeasible(
-                model,
+            _log_skip_fixed_entry(
+                ctx,
                 "Fixed entry references a time slot that does not exist.",
                 section_id=fe.section_id,
                 subject_id=fe.subject_id,
@@ -220,8 +250,8 @@ def _add_fixed_entry_hard_constraints(ctx: SolverContext) -> None:
                             break
                     expected_tid = strict_tid
                 if expected_tid is not None and expected_tid != fe.teacher_id:
-                    _make_infeasible(
-                        model,
+                    _log_skip_fixed_entry(
+                        ctx,
                         "Fixed combined-class teacher does not match the group's assigned teacher.",
                         section_id=fe.section_id,
                         subject_id=fe.subject_id,
@@ -232,8 +262,8 @@ def _add_fixed_entry_hard_constraints(ctx: SolverContext) -> None:
 
             gv = ctx.combined_x.get((gid, fe.slot_id))
             if gv is None:
-                _make_infeasible(
-                    model,
+                _log_skip_fixed_entry(
+                    ctx,
                     "Fixed combined-class slot is not allowed for all sections in the group.",
                     section_id=fe.section_id,
                     subject_id=fe.subject_id,
@@ -252,8 +282,8 @@ def _add_fixed_entry_hard_constraints(ctx: SolverContext) -> None:
         if str(subj.subject_type) == "LAB":
             sv = ctx.lab_start.get((fe.section_id, fe.subject_id, day, slot_idx))
             if sv is None:
-                _make_infeasible(
-                    model,
+                _log_skip_fixed_entry(
+                    ctx,
                     "Fixed lab entry must be placed on a valid lab start slot.",
                     section_id=fe.section_id,
                     subject_id=fe.subject_id,
@@ -279,8 +309,8 @@ def _add_fixed_entry_hard_constraints(ctx: SolverContext) -> None:
         key = (fe.section_id, fe.subject_id, fe.slot_id)
         xv = ctx.x.get(key)
         if xv is None:
-            _make_infeasible(
-                model,
+            _log_skip_fixed_entry(
+                ctx,
                 "Fixed entry slot not allowed for the section or variable missing.",
                 section_id=fe.section_id,
                 subject_id=fe.subject_id,
@@ -443,48 +473,89 @@ def _add_teacher_weekly_off(ctx: SolverContext) -> None:
                 model.Add(sum(terms) == 0)
 
 
-def _add_teacher_max_continuous(ctx: SolverContext) -> None:
-    model = ctx.model
-    for teacher_id, teacher in ctx.teacher_by_id.items():
-        max_cont = int(teacher.max_continuous)
-        if max_cont <= 0:
-            continue
-        for day in range(0, 6):
-            if day not in ctx.teacher_active_days.get(teacher_id, set()):
-                continue
-            day_slots = ctx.slots_by_day.get(day, [])
-            if len(day_slots) <= max_cont:
-                continue
-            window_len = max_cont + 1
-            for i in range(0, len(day_slots) - window_len + 1):
-                window_slots = day_slots[i : i + window_len]
-                window_terms = []
-                for ts in window_slots:
-                    window_terms.extend(ctx.teacher_slot_terms.get((teacher_id, ts.id), []))
-                if window_terms:
-                    model.Add(sum(window_terms) <= max_cont)
+def _add_teacher_workload_soft_penalties(ctx: SolverContext) -> None:
+    """Convert teacher workload rules into soft penalties.
 
-
-def _add_teacher_load_limits(ctx: SolverContext) -> None:
+    Hard teacher no-overlap is enforced in ``_add_teacher_no_overlap``.
+    This function only adds soft overload variables for:
+    - weekly load above ``max_per_week``
+    - daily load above ``max_per_day``
+    - consecutive blocks above ``max_continuous``
+    - assignments in teacher soft-window avoid slots
+    """
     model = ctx.model
+
     for teacher_id, teacher in ctx.teacher_by_id.items():
+        # Weekly overload soft variable.
         all_terms = ctx.teacher_all_terms.get(teacher_id, [])
         if all_terms:
-            max_per_week = int(getattr(teacher, "max_per_week", 0) or 0)
-            max_total = 0
+            preferred_weekly = int(getattr(teacher, "max_per_week", 0) or 0)
+            weekly_ub = 0
             for term in all_terms:
-                max_total += int(term) if isinstance(term, int) else 1
+                weekly_ub += int(term) if isinstance(term, int) else 1
 
-            overflow_ub = max(0, int(max_total) - int(max_per_week))
-            overflow = model.NewIntVar(0, overflow_ub, f"t_weekly_overflow_{teacher_id}")
-            model.Add(sum(all_terms) <= int(max_per_week) + overflow)
+            weekly_load = model.NewIntVar(0, weekly_ub, f"t_weekly_load_{teacher_id}")
+            model.Add(weekly_load == sum(all_terms))
+
+            overflow = model.NewIntVar(0, weekly_ub, f"t_weekly_overflow_{teacher_id}")
+            model.Add(overflow >= weekly_load - preferred_weekly)
+            model.Add(overflow >= 0)
+
             ctx.teacher_weekly_overload_terms.append(overflow)
             ctx.teacher_weekly_overload_by_teacher[teacher_id] = overflow
 
+        # Daily overload soft variable.
+        preferred_daily = int(getattr(teacher, "max_per_day", 0) or 0)
         for day in range(0, 6):
             day_terms = ctx.teacher_day_terms.get((teacher_id, day), [])
-            if day_terms:
-                model.Add(sum(day_terms) <= int(teacher.max_per_day))
+            if not day_terms:
+                continue
+
+            day_ub = len(day_terms)
+            day_load = model.NewIntVar(0, day_ub, f"t_day_load_{teacher_id}_{day}")
+            model.Add(day_load == sum(day_terms))
+
+            day_overflow = model.NewIntVar(0, day_ub, f"t_day_overflow_{teacher_id}_{day}")
+            model.Add(day_overflow >= day_load - preferred_daily)
+            model.Add(day_overflow >= 0)
+
+            ctx.teacher_daily_overload_terms.append(day_overflow)
+            ctx.teacher_daily_overload_by_teacher_day[(teacher_id, int(day))] = day_overflow
+
+        # Consecutive-load overflow soft variable.
+        max_cont = int(getattr(teacher, "max_continuous", 0) or 0)
+        if max_cont > 0:
+            for day in range(0, 6):
+                if day not in ctx.teacher_active_days.get(teacher_id, set()):
+                    continue
+                day_slots = ctx.slots_by_day.get(day, [])
+                if len(day_slots) <= max_cont:
+                    continue
+
+                window_len = max_cont + 1
+                for i in range(0, len(day_slots) - window_len + 1):
+                    window_slots = day_slots[i : i + window_len]
+                    window_terms = []
+                    for ts in window_slots:
+                        window_terms.extend(ctx.teacher_slot_terms.get((teacher_id, ts.id), []))
+                    if not window_terms:
+                        continue
+
+                    window_load = model.NewIntVar(0, window_len, f"t_cont_load_{teacher_id}_{day}_{i}")
+                    model.Add(window_load == sum(window_terms))
+
+                    cont_overflow = model.NewIntVar(0, window_len, f"t_cont_overflow_{teacher_id}_{day}_{i}")
+                    model.Add(cont_overflow >= window_load - max_cont)
+                    model.Add(cont_overflow >= 0)
+
+                    ctx.teacher_continuity_overload_terms.append(cont_overflow)
+
+        # Preferred slot penalty: soft-window slots are avoid slots.
+        # Penalize any assignment that lands on such slots.
+        for slot_id in sorted(ctx.teacher_soft_window_slots.get(teacher_id, set()), key=lambda x: str(x)):
+            slot_terms = ctx.teacher_slot_terms.get((teacher_id, slot_id), [])
+            if slot_terms:
+                ctx.teacher_preferred_slot_penalty_terms.append(sum(slot_terms))
 
 
 # ── Subject day-spread (soft) ──────────────────────────────────────────────

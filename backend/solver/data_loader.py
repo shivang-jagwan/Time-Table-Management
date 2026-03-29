@@ -81,18 +81,6 @@ def load_all(ctx: SolverContext) -> None:
     for w in windows:
         ctx.windows_by_section[w.section_id].append(w)
 
-    # --- Teacher time windows ------------------------------------------------
-    # Load availability windows once per solve so _prune_teacher_slots can use
-    # them without additional DB calls.
-    if ctx.teachers:
-        q_twins = select(TeacherTimeWindow).where(
-            TeacherTimeWindow.teacher_id.in_([t.id for t in ctx.teachers])
-        )
-        q_twins = where_tenant(q_twins, TeacherTimeWindow, tenant_id)
-        twin_rows = db.execute(q_twins).scalars().all()
-        for tw in twin_rows:
-            ctx.teacher_windows_by_id[tw.teacher_id].append(tw)
-
     # --- Rooms ---------------------------------------------------------------
     q_rooms = where_tenant(select(Room).where(Room.is_active.is_(True)), Room, tenant_id)
     ctx.rooms_all = db.execute(q_rooms).scalars().all()
@@ -124,6 +112,18 @@ def load_all(ctx: SolverContext) -> None:
     q_teachers = where_tenant(select(Teacher).where(Teacher.is_active.is_(True)), Teacher, tenant_id)
     ctx.teachers = db.execute(q_teachers).scalars().all()
     ctx.teacher_by_id = {t.id: t for t in ctx.teachers}
+
+    # --- Teacher time windows ------------------------------------------------
+    # Load availability windows after teachers so strict/soft windows are
+    # available for slot pruning and preference penalties.
+    if ctx.teachers:
+        q_twins = select(TeacherTimeWindow).where(
+            TeacherTimeWindow.teacher_id.in_([t.id for t in ctx.teachers])
+        )
+        q_twins = where_tenant(q_twins, TeacherTimeWindow, tenant_id)
+        twin_rows = db.execute(q_twins).scalars().all()
+        for tw in twin_rows:
+            ctx.teacher_windows_by_id[tw.teacher_id].append(tw)
 
     # --- Teacher → section-subject assignment --------------------------------
     if ctx.sections:
@@ -545,6 +545,13 @@ def build_pruned_slots(ctx: SolverContext) -> None:
     apply_pre_solve_locks() so that teacher_disallowed_slot_ids is already
     populated.
 
+    PHASE 7 ENHANCEMENTS (2026-03):
+      Additional domain pruning for room-restricted subjects:
+      • If a subject has allowed_rooms restrictions, verify at least one
+        compatible room exists (warn if not, but don't prune slots — room
+        assignment is post-solve and greedy)
+      • Track domain reduction effectiveness metrics
+
     Stage 1 — Per-(section, subject) pruning (stored in valid_slots_by_section_subject):
       Filters out slots that violate any of:
         • section time window (captured by allowed_slots_by_section)
@@ -565,6 +572,8 @@ def build_pruned_slots(ctx: SolverContext) -> None:
 
     RESULT: CP-SAT variable creation iterates only valid slots for every
     variable type, cutting total variable count by 40–70% on typical datasets.
+    With Phase 7 enhancements: additional early-warning diagnostics for
+    likely infeasibility scenarios.
     """
     dallowed = ctx.teacher_disallowed_slot_ids  # teacher_id → set[slot_id]
 
@@ -758,4 +767,134 @@ def build_pruned_slots(ctx: SolverContext) -> None:
                     if ts0 is not None:
                         starts.append(ts0.id)
             ctx.valid_slots_for_elective_batch[(block_id, batch_idx)] = starts
+
+
+def _validate_domain_reduction(ctx: SolverContext) -> None:
+    """Phase 7 Enhancement: Validate and report domain reduction effectiveness.
+    
+    Post-pruning checks:
+      1. Warn if any (section, subject) pair has been pruned to 0 slots
+         (indicates likely infeasibility — that subject can't be scheduled)
+      2. Validate room type availability for subjects needing specific room types
+      3. Validate subject allowed-rooms restrictions don't block all rooms
+      4. Log domain reduction metrics to help diagnose solver congestion
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    # Check 1: Empty slot lists (infeasibility indicators)
+    zero_slot_pairs = []
+    for (sec_id, subj_id), slot_list in ctx.valid_slots_by_section_subject.items():
+        if not slot_list:
+            subject = ctx.subject_by_id.get(subj_id)
+            section = ctx.section_by_id.get(sec_id)
+            if subject and section:
+                teacher_id = ctx.assigned_teacher_by_section_subject.get((sec_id, subj_id))
+                zero_slot_pairs.append({
+                    "section": str(section.name or section.id),
+                    "subject": str(subject.name or subject.id),
+                    "teacher": str(ctx.teacher_by_id.get(teacher_id, "UNKNOWN") if teacher_id else "UNKNOWN"),
+                    "track": str(getattr(section, "track", "CORE") or "CORE"),
+                })
+    
+    if zero_slot_pairs:
+        logger.warning(
+            "[solver] DOMAIN_REDUCTION: %d (section,subject) pairs pruned to 0 slots — may cause infeasibility. "
+            "First 5: %s",
+            len(zero_slot_pairs),
+            zero_slot_pairs[:5]
+        )
+    
+    # Check 2: Room type availability for subjects
+    lab_count = len(ctx.rooms_by_type.get("LAB", []))
+    theory_count = len(ctx.rooms_by_type.get("CLASSROOM", [])) + len(ctx.rooms_by_type.get("LT", []))
+    
+    lab_subject_count = sum(
+        1 for subj in ctx.subjects
+        if str(getattr(subj, "subject_type", "THEORY")) == "LAB"
+    )
+    
+    if lab_subject_count > 0 and lab_count == 0:
+        logger.warning(
+            "[solver] DOMAIN_REDUCTION: %d LAB subjects exist but no LAB rooms available — "
+            "LAB subjects cannot be scheduled.",
+            lab_subject_count
+        )
+    
+    # Check 3: Allowed-rooms restrictions don't block all compatible rooms
+    allowed_rooms_issues = []
+    for subj_id, allowed_room_ids in ctx.allowed_rooms_by_subject.items():
+        subject = ctx.subject_by_id.get(subj_id)
+        if not subject or not allowed_room_ids:
+            continue
+        
+        subj_type = str(getattr(subject, "subject_type", "THEORY"))
+        allowed_rooms = [ctx.room_by_id.get(rid) for rid in allowed_room_ids]
+        allowed_rooms = [r for r in allowed_rooms if r is not None]
+        
+        if not allowed_rooms:
+            allowed_rooms_issues.append({
+                "subject": str(subject.name or subject.id),
+                "subject_type": subj_type,
+                "reason": "all_allowed_rooms_not_found",
+            })
+        else:
+            allowed_types = set(str(r.room_type) for r in allowed_rooms)
+            required_types = {"LAB"} if subj_type == "LAB" else {"CLASSROOM", "LT"}
+            if not (allowed_types & required_types):
+                allowed_rooms_issues.append({
+                    "subject": str(subject.name or subject.id),
+                    "subject_type": subj_type,
+                    "allowed_types": list(allowed_types),
+                    "required_types": list(required_types),
+                    "reason": "type_mismatch",
+                })
+    
+    if allowed_rooms_issues:
+        logger.warning(
+            "[solver] DOMAIN_REDUCTION: %d subjects have invalid allowed-rooms restrictions. "
+            "First 3: %s",
+            len(allowed_rooms_issues),
+            allowed_rooms_issues[:3]
+        )
+    
+    # Check 4: Domain reduction metrics
+    total_slots_available = sum(len(v) for v in ctx.valid_slots_by_section_subject.values())
+    total_possible_slots = len(ctx.slots) * len(
+        [(sec_id, subj_id) 
+         for sec_id in ctx.section_by_id
+         for subj_id, _ in ctx.section_required.get(sec_id, [])
+         if ctx.subject_by_id.get(subj_id) is not None]
+    )
+    
+    if total_possible_slots > 0:
+        reduction_pct = 100 * (1 - total_slots_available / max(1, total_possible_slots))
+        logger.info(
+            "[solver] DOMAIN_REDUCTION: %.1f%% of slots pruned (%d → %d valid slots)",
+            reduction_pct,
+            total_possible_slots,
+            total_slots_available,
+        )
+    
+    # Store metrics in context for later retrieval
+    if not hasattr(ctx, 'domain_reduction_metrics'):
+        ctx.domain_reduction_metrics = {}
+    ctx.domain_reduction_metrics.update({
+        "zero_slot_pairs": len(zero_slot_pairs),
+        "allowed_rooms_issues": len(allowed_rooms_issues),
+        "total_slots_available": total_slots_available,
+        "lab_rooms": lab_count,
+        "theory_rooms": theory_count,
+        "lab_subjects": lab_subject_count,
+    })
+    
+    # Early termination check: If EVERY (section, subject) pair has 0 slots,
+    # log critical error (indicates entire model is infeasible pre-solve)
+    if ctx.valid_slots_by_section_subject and all(
+        not v for v in ctx.valid_slots_by_section_subject.values()
+    ):
+        logger.critical(
+            "[solver] DOMAIN_REDUCTION: CRITICAL — ALL (section,subject) pairs pruned to 0 slots. "
+            "Model is certainly infeasible. Proceeding with warning."
+        )
 
