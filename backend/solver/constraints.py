@@ -164,18 +164,11 @@ def _add_slot_load_constraints(ctx: SolverContext) -> None:
         
         # PHASE 11: REMOVED hard slot cap — allow flexible distribution
         # Old: model.Add(load <= int(total_available_rooms))
-        # New: Soft capacity with overflow penalty
-
-        # Soft capacity: Allow overflow but penalize
-        overflow = model.NewIntVar(0, max_slot_load, f"slot_capacity_overflow_{slot_id}")
-        model.Add(overflow >= load - int(total_available_rooms))
-        model.Add(overflow >= 0)
-        ctx.slot_capacity_overflow_terms.append(overflow)
-
-        # Load balancing: Penalize quadratic load distribution (spread classes across slots)
-        load_squared = model.NewIntVar(0, (max_slot_load * 2) ** 2, f"slot_load_squared_{slot_id}")
-        model.AddMultiplicationEquality(load_squared, [load, load])
-        ctx.slot_load_squared_terms.append(load_squared)
+        # New: Soft capacity with load-based penalty
+        
+        # Use load variable directly as soft penalty term
+        # Higher load = higher penalty to encourage distribution across slots
+        ctx.slot_capacity_overflow_terms.append(load)
 
         overload = model.NewIntVar(0, max_slot_load, f"slot_over_{slot_id}")
         model.Add(overload >= load - int(soft_threshold))
