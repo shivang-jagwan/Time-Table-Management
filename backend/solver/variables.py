@@ -161,9 +161,10 @@ def _create_lab_vars(
                 ctx.section_slot_terms[(section.id, ts.id)].append(sv)
                 ctx.lab_room_terms_by_slot[ts.id].append(sv)
                 ctx.teacher_slot_terms[(assigned_teacher_id, ts.id)].append(sv)
-                ctx.teacher_all_terms[assigned_teacher_id].append(sv)
-                ctx.teacher_day_terms[(assigned_teacher_id, day)].append(sv)
-                ctx.teacher_active_days[assigned_teacher_id].add(day)
+            # Teacher load should count LAB as one session (not one per covered slot).
+            ctx.teacher_all_terms[assigned_teacher_id].append(sv)
+            ctx.teacher_day_terms[(assigned_teacher_id, day)].append(sv)
+            ctx.teacher_active_days[assigned_teacher_id].add(day)
     else:
         # Fallback path: no pruning data available — use original logic.
         # This should only happen if build_pruned_slots() was not called
@@ -195,9 +196,10 @@ def _create_lab_vars(
                     ctx.section_slot_terms[(section.id, ts.id)].append(sv)
                     ctx.lab_room_terms_by_slot[ts.id].append(sv)
                     ctx.teacher_slot_terms[(assigned_teacher_id, ts.id)].append(sv)
-                    ctx.teacher_all_terms[assigned_teacher_id].append(sv)
-                    ctx.teacher_day_terms[(assigned_teacher_id, day)].append(sv)
-                    ctx.teacher_active_days[assigned_teacher_id].add(day)
+                # Teacher load should count LAB as one session (not one per covered slot).
+                ctx.teacher_all_terms[assigned_teacher_id].append(sv)
+                ctx.teacher_day_terms[(assigned_teacher_id, day)].append(sv)
+                ctx.teacher_active_days[assigned_teacher_id].add(day)
 
     starts = ctx.lab_starts_by_sec_subj.get((section.id, subject_id), [])
     locked = int(ctx.locked_lab_sessions_by_sec_subj.get((section.id, subject_id), 0) or 0)

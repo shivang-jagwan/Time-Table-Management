@@ -75,9 +75,7 @@ export function TimetableViewer({ onToast }: { onToast: (msg: string) => void })
   const [loading, setLoading] = React.useState(false)
   const [programCode, setProgramCode] = React.useState('')
   const [academicYearNumber, setAcademicYearNumber] = React.useState(1)
-  const [runScopeFilter, setRunScopeFilter] = React.useState<'ALL' | 'PROGRAM_GLOBAL' | 'YEAR_ONLY'>(
-    'PROGRAM_GLOBAL',
-  )
+  const [runScopeFilter, setRunScopeFilter] = React.useState<'ALL' | 'PROGRAM_GLOBAL' | 'YEAR_ONLY'>('ALL')
 
   const [runs, setRuns] = React.useState<RunSummary[]>([])
   const [runId, setRunId] = React.useState<string>('')

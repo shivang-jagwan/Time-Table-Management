@@ -69,6 +69,19 @@ def _required_weekly_slots(subj: Any, sessions_per_week: int | None = None) -> i
     return int(sessions) * int(_duration_slots(subj))
 
 
+def _required_weekly_teacher_load(subj: Any, sessions_per_week: int | None = None) -> int:
+    """Teacher load counted in teaching sessions, not slot duration.
+
+    LAB blocks may occupy 2+ consecutive slots, but for teacher max_per_week
+    validation we count one session per class occurrence.
+    """
+    if sessions_per_week is None:
+        sessions = int(getattr(subj, "sessions_per_week", 0) or 0)
+    else:
+        sessions = int(sessions_per_week or 0)
+    return int(sessions)
+
+
 def persist_conflicts(db: Session, *, run: TimetableRun, conflicts: Iterable[ValidationConflict]) -> None:
     tenant_id = getattr(run, "tenant_id", None)
     for c in conflicts:
@@ -994,7 +1007,7 @@ def validate_prereqs(
                 teacher_affected_sections[teacher_id].add(sec_id)
                 teacher_affected_subjects[teacher_id].add(subj_id)
                 spw = int(getattr(subj, "sessions_per_week", 0) or 0)
-                teacher_required_slots[teacher_id] += int(_required_weekly_slots(subj, spw))
+                teacher_required_slots[teacher_id] += int(_required_weekly_teacher_load(subj, spw))
 
             # 2) Count combined THEORY groups once per group.
             for gid in sorted(list(combined_gids_seen), key=lambda x: str(x)):
@@ -1027,7 +1040,7 @@ def validate_prereqs(
                 if teacher_id is None:
                     continue
 
-                teacher_required_slots[teacher_id] += int(_required_weekly_slots(subj, spw))
+                teacher_required_slots[teacher_id] += int(_required_weekly_teacher_load(subj, spw))
                 for sid in sec_ids:
                     teacher_affected_sections[teacher_id].add(sid)
                 teacher_affected_subjects[teacher_id].add(subj_id)
@@ -1048,7 +1061,7 @@ def validate_prereqs(
                             spw = int(getattr(subj, "sessions_per_week", 0) or 0)
                             if spw <= 0:
                                 continue
-                            slots = int(_required_weekly_slots(subj, spw))
+                            slots = int(_required_weekly_teacher_load(subj, spw))
                             teacher_required_slots[teacher_id] += int(slots)
                             teacher_affected_sections[teacher_id].add(sec_id)
                             teacher_affected_subjects[teacher_id].add(subj_id)

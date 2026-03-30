@@ -49,6 +49,7 @@ def add_objective(ctx: SolverContext) -> None:
 
     # Build three priority tiers and combine with dominance scales so that
     # improving a higher-priority tier always outweighs lower-tier changes.
+    tier_coverage: list = []
     tier_primary: list = []
     tier_secondary: list = []
     tier_tertiary: list = []
@@ -104,31 +105,32 @@ def add_objective(ctx: SolverContext) -> None:
             tier_primary.append(load_sq * W_SLOT_LOAD_BALANCE_QUAD)
     
     # ── 2e. Session requirement soft penalties (Phase 7: Convert to soft) ─
-    # Penalize under-allocation (fewer sessions than required) and over-allocation
+    # Keep session coverage in a higher-priority tier so timetables do not
+    # collapse into near-empty schedules to optimize balancing terms.
     if ctx.theory_sessions_under_terms:
         for uv in ctx.theory_sessions_under_terms:
-            tier_primary.append(uv * W_SESSION_UNDER)
+            tier_coverage.append(uv * W_SESSION_UNDER)
     if ctx.theory_sessions_over_terms:
         for ov in ctx.theory_sessions_over_terms:
-            tier_primary.append(ov * W_SESSION_OVER)
+            tier_coverage.append(ov * W_SESSION_OVER)
     if ctx.lab_sessions_under_terms:
         for uv in ctx.lab_sessions_under_terms:
-            tier_primary.append(uv * W_SESSION_UNDER)
+            tier_coverage.append(uv * W_SESSION_UNDER)
     if ctx.lab_sessions_over_terms:
         for ov in ctx.lab_sessions_over_terms:
-            tier_primary.append(ov * W_SESSION_OVER)
+            tier_coverage.append(ov * W_SESSION_OVER)
     if ctx.combined_sessions_under_terms:
         for uv in ctx.combined_sessions_under_terms:
-            tier_primary.append(uv * W_SESSION_UNDER)
+            tier_coverage.append(uv * W_SESSION_UNDER)
     if ctx.combined_sessions_over_terms:
         for ov in ctx.combined_sessions_over_terms:
-            tier_primary.append(ov * W_SESSION_OVER)
+            tier_coverage.append(ov * W_SESSION_OVER)
     if ctx.elective_sessions_under_terms:
         for uv in ctx.elective_sessions_under_terms:
-            tier_primary.append(uv * W_SESSION_UNDER)
+            tier_coverage.append(uv * W_SESSION_UNDER)
     if ctx.elective_sessions_over_terms:
         for ov in ctx.elective_sessions_over_terms:
-            tier_primary.append(ov * W_SESSION_OVER)
+            tier_coverage.append(ov * W_SESSION_OVER)
 
     # ── 3. Teacher internal gaps ─────────────────────────────────────────
     if ctx.teacher_gap_terms:
@@ -213,11 +215,18 @@ def add_objective(ctx: SolverContext) -> None:
         + 1
     )
 
+    # Avoid objective int64 overflow in CP-SAT.
+    # The previous dominance scaling (primary = tertiary_bound * secondary_bound)
+    # can explode on larger instances and trigger: "Possible integer overflow in objective".
+    # Keep lexicographic intent with conservative fixed scales.
     tertiary_scale = 1
-    secondary_scale = max(1, tertiary_bound)
-    primary_scale = max(1, tertiary_bound * secondary_bound)
+    secondary_scale = 100
+    primary_scale = 10_000
+    coverage_scale = 1_000_000
 
     objective_terms: list = []
+    if tier_coverage:
+        objective_terms.append(sum(tier_coverage) * coverage_scale)
     if tier_primary:
         objective_terms.append(sum(tier_primary) * primary_scale)
     if tier_secondary:

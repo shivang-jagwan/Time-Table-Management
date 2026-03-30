@@ -1906,6 +1906,19 @@ def _solve_program(
     setattr(ctx, "_termination_reason", str(termination_reason))
 
     # 9. Handle infeasible / error
+    # CP-SAT may return UNKNOWN on time limit even when an incumbent solution
+    # exists. In that case, promote to FEASIBLE so result writing can persist
+    # a valid timetable instead of returning a generic ERROR.
+    if status == cp_model.UNKNOWN:
+        has_incumbent_solution = False
+        try:
+            has_incumbent_solution = len(solver.ResponseProto().solution) > 0
+        except Exception:
+            has_incumbent_solution = False
+        if has_incumbent_solution:
+            logger.warning("[solver] status=UNKNOWN with incumbent solution; promoting to FEASIBLE")
+            status = cp_model.FEASIBLE
+
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         return _handle_infeasible(
             ctx, solver, status,
