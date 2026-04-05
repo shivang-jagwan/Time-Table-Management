@@ -1,5 +1,6 @@
 import React from 'react'
 import { useSearchParams } from 'react-router-dom'
+import { useLayoutContext } from '../components/Layout'
 import { listRunEntries, listTimeSlots, type TimeSlot, type TimetableEntry } from '../api/solver'
 import {
   OfficialTimetablePrint,
@@ -7,14 +8,18 @@ import {
   adaptTimetableEntry,
   type OfficialEntry,
 } from '../components/OfficialTimetablePrint'
+import { clampAcademicYearNumber, parseAcademicYearFromSectionCode } from '../utils/academicYear'
 
 type SectionBlock = { sectionCode: string; title: string; entries: OfficialEntry[] }
 
 export function OfficialPrintAllSections() {
+  const { academicYearNumber } = useLayoutContext()
   const [params] = useSearchParams()
   const runId = params.get('runId') ?? ''
   const semester = params.get('semester') ?? ''
   const effectiveDate = params.get('effectiveDate') ?? ''
+  const yearParam = Number(params.get('year'))
+  const selectedYear = clampAcademicYearNumber(Number.isFinite(yearParam) ? yearParam : Number(academicYearNumber))
 
   const [loading, setLoading] = React.useState(false)
   const [error, setError] = React.useState('')
@@ -31,9 +36,14 @@ export function OfficialPrintAllSections() {
         const [rawEntries, s] = await Promise.all([listRunEntries(runId), listTimeSlots()])
         if (cancelled) return
 
+        const entriesForYear = (rawEntries as TimetableEntry[]).filter((e) => {
+          const y = parseAcademicYearFromSectionCode(e.section_code)
+          return y == null || y === selectedYear
+        })
+
         // Group by section_code, preserve order of first appearance
         const map = new Map<string, { title: string; entries: OfficialEntry[] }>()
-        for (const e of rawEntries as TimetableEntry[]) {
+        for (const e of entriesForYear) {
           const key = e.section_code
           if (!map.has(key)) map.set(key, { title: e.section_name ?? key, entries: [] })
           map.get(key)!.entries.push(adaptTimetableEntry(e))
@@ -51,7 +61,7 @@ export function OfficialPrintAllSections() {
       }
     })()
     return () => { cancelled = true }
-  }, [runId])
+  }, [runId, selectedYear])
 
   // Auto-print once data is ready
   React.useEffect(() => {
@@ -70,7 +80,7 @@ export function OfficialPrintAllSections() {
           <div>
             <div className="text-sm font-semibold">Official Timetable — All Sections</div>
             <div className="mt-0.5 text-xs text-slate-500">
-              {loading ? 'Loading…' : blocks.length > 0 ? `${blocks.length} section(s) · A4 landscape` : 'No data'}
+              {loading ? 'Loading…' : blocks.length > 0 ? `${blocks.length} section(s) · Year ${selectedYear} · A4 landscape` : 'No data'}
             </div>
           </div>
           <div className="flex items-center gap-2">

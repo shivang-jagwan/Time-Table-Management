@@ -91,7 +91,7 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-SOLVER_HARD_MAX_SECONDS = 60.0
+SOLVER_HARD_MAX_SECONDS = 900.0
 SOLVER_MAX_RESTARTS = 3
 SOLVER_MAX_LNS_ITERATIONS = 5
 
@@ -2579,6 +2579,7 @@ def solve_timetable(
                 "program_code": payload.program_code,
                 "academic_year_number": payload.academic_year_number,
                 "max_time_seconds": max_time_seconds,
+                "room_balance_mode": str(getattr(payload, "room_balance_mode", "soft") or "soft"),
                 "requested_max_time_seconds": requested_max_time_seconds,
                 "hard_time_cap_seconds": SOLVER_HARD_MAX_SECONDS,
                 "relax_teacher_load_limits": payload.relax_teacher_load_limits,
@@ -2767,6 +2768,7 @@ def solve_timetable(
             academic_year_id=ay.id,
             seed=payload.seed,
             max_time_seconds=max_time_seconds,
+            room_balance_mode=str(getattr(payload, "room_balance_mode", "soft") or "soft"),
             enforce_teacher_load_limits=not payload.relax_teacher_load_limits,
             require_optimal=payload.require_optimal,
             allow_extended_solve=getattr(payload, "allow_extended_solve", False),
@@ -3104,6 +3106,7 @@ def _global_solve_body(
             program_id=program.id,
             seed=payload.seed,
             max_time_seconds=max_time_seconds,
+            room_balance_mode=str(getattr(payload, "room_balance_mode", "soft") or "soft"),
             enforce_teacher_load_limits=not payload.relax_teacher_load_limits,
             require_optimal=payload.require_optimal,
             allow_extended_solve=getattr(payload, "allow_extended_solve", False),
@@ -3152,8 +3155,37 @@ def _global_solve_body(
             fresh = db.get(TimetableRun, run_id)
             terminal = {"OPTIMAL", "SUBOPTIMAL", "FEASIBLE", "INFEASIBLE", "VALIDATION_FAILED", "ERROR"}
             if fresh is not None and str(fresh.status) not in terminal:
+                transient_db_error = is_transient_db_connectivity_error(exc)
+                if transient_db_error:
+                    user_facing_message = (
+                        "Database connectivity dropped during solve. "
+                        "This run failed due to DB connection loss, not solver timeout. "
+                        "Please retry."
+                    )
+                else:
+                    user_facing_message = f"{type(exc).__name__}: {str(exc)}"
+
                 fresh.status = "ERROR"
-                fresh.notes = f"{type(exc).__name__}: {str(exc)}"[:500]
+                fresh.notes = user_facing_message[:500]
+
+                params = dict(fresh.parameters or {})
+                solver_result = dict(params.get("_solver_result") or {})
+                solver_result["message"] = user_facing_message[:500]
+                solver_result["reason_summary"] = user_facing_message[:500]
+                params["_solver_result"] = solver_result
+                fresh.parameters = params
+
+                if transient_db_error:
+                    db.add(
+                        TimetableConflict(
+                            tenant_id=tenant_id,
+                            run_id=fresh.id,
+                            severity="ERROR",
+                            conflict_type="DATABASE_UNAVAILABLE",
+                            message=user_facing_message,
+                            metadata_json={"exception_type": type(exc).__name__},
+                        )
+                    )
                 db.commit()
         except Exception:
             pass
@@ -3192,6 +3224,7 @@ def solve_timetable_global(
             parameters={
                 "program_code": payload.program_code,
                 "max_time_seconds": max_time_seconds,
+                "room_balance_mode": str(getattr(payload, "room_balance_mode", "soft") or "soft"),
                 "requested_max_time_seconds": requested_max_time_seconds,
                 "hard_time_cap_seconds": SOLVER_HARD_MAX_SECONDS,
                 "relax_teacher_load_limits": payload.relax_teacher_load_limits,

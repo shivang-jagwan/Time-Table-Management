@@ -960,6 +960,108 @@ def run_infeasibility_analysis(data: dict[str, Any]) -> list[dict[str, Any]]:
             )
 
     # ------------------------
+    # G2) Room oversubscription from pruned domains (pre-solve pressure)
+    # ------------------------
+    pruned_theory_pairs_by_slot: dict[Any, int] = defaultdict(int)
+    pruned_lab_pairs_by_slot: dict[Any, int] = defaultdict(int)
+
+    for sec_id, reqs in section_required.items():
+        for subj_id, sessions_override in reqs or []:
+            subj = subject_by_id.get(subj_id)
+            if subj is None:
+                continue
+
+            sessions_per_week = int(
+                sessions_override if sessions_override is not None else getattr(subj, "sessions_per_week", 0) or 0
+            )
+            if sessions_per_week <= 0:
+                continue
+
+            is_lab = str(getattr(subj, "subject_type", "THEORY")) == "LAB"
+            locked_sessions = int(
+                locked_lab_blocks_by_sec_subj.get((sec_id, subj_id), 0)
+                if is_lab
+                else locked_theory_by_sec_subj.get((sec_id, subj_id), 0)
+            )
+            remaining_sessions = int(sessions_per_week) - int(locked_sessions)
+            if remaining_sessions <= 0:
+                continue
+
+            valid_slots = list(valid_slots_by_section_subject.get((sec_id, subj_id), []) or [])
+            if not valid_slots:
+                continue
+
+            if not is_lab:
+                for slot_id in valid_slots:
+                    pruned_theory_pairs_by_slot[slot_id] += 1
+                continue
+
+            block = int(getattr(subj, "lab_block_size_slots", 1) or 1)
+            if block < 1:
+                block = 1
+            for start_slot_id in valid_slots:
+                di = slot_info.get(start_slot_id)
+                if not di:
+                    pruned_lab_pairs_by_slot[start_slot_id] += 1
+                    continue
+                day, slot_idx = int(di[0]), int(di[1])
+                for j in range(block):
+                    ts = slot_by_day_index.get((day, slot_idx + j))
+                    if ts is None:
+                        continue
+                    pruned_lab_pairs_by_slot[ts.id] += 1
+
+    for slot_id, candidate_pairs in sorted(pruned_theory_pairs_by_slot.items(), key=lambda kv: str(kv[0])):
+        locked_needed = int(locked_theory_by_slot.get(slot_id, 0) or 0)
+        projected_needed = int(locked_needed) + int(candidate_pairs)
+        if projected_needed > int(theory_room_capacity):
+            di = slot_info.get(slot_id)
+            day, slot_idx = (int(di[0]), int(di[1])) if di else (None, None)
+            diagnostics.append(
+                _diag(
+                    dtype=DiagnosticType.ROOM_CAPACITY_SHORTAGE,
+                    slot_id=str(slot_id),
+                    day_of_week=day,
+                    slot_index=slot_idx,
+                    room_type="THEORY",
+                    available_rooms=int(theory_room_capacity),
+                    locked_usage=int(locked_needed),
+                    candidate_pairs=int(candidate_pairs),
+                    projected_demand=int(projected_needed),
+                    explanation=(
+                        f"Slot D{day} #{slot_idx} is oversubscribed for THEORY after pruning: "
+                        f"{int(candidate_pairs)} section-subject pairs can use this slot, with {int(locked_needed)} locked usage, "
+                        f"but only {int(theory_room_capacity)} THEORY rooms are available."
+                    ),
+                )
+            )
+
+    for slot_id, candidate_pairs in sorted(pruned_lab_pairs_by_slot.items(), key=lambda kv: str(kv[0])):
+        locked_needed = int(locked_lab_by_slot.get(slot_id, 0) or 0)
+        projected_needed = int(locked_needed) + int(candidate_pairs)
+        if projected_needed > int(lab_room_capacity):
+            di = slot_info.get(slot_id)
+            day, slot_idx = (int(di[0]), int(di[1])) if di else (None, None)
+            diagnostics.append(
+                _diag(
+                    dtype=DiagnosticType.ROOM_CAPACITY_SHORTAGE,
+                    slot_id=str(slot_id),
+                    day_of_week=day,
+                    slot_index=slot_idx,
+                    room_type="LAB",
+                    available_rooms=int(lab_room_capacity),
+                    locked_usage=int(locked_needed),
+                    candidate_pairs=int(candidate_pairs),
+                    projected_demand=int(projected_needed),
+                    explanation=(
+                        f"Slot D{day} #{slot_idx} is oversubscribed for LAB after pruning: "
+                        f"{int(candidate_pairs)} LAB-block placements cover this slot, with {int(locked_needed)} locked usage, "
+                        f"but only {int(lab_room_capacity)} LAB rooms are available."
+                    ),
+                )
+            )
+
+    # ------------------------
     # H) Special room misuse
     # ------------------------
     for fe in fixed_entries:

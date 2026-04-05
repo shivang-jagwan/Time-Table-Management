@@ -6,3 +6,18 @@ export function clampAcademicYearNumber(n: number): number {
   if (v > 3) return 3
   return Math.trunc(v)
 }
+
+export function parseAcademicYearFromSectionCode(code: string): number | null {
+  const text = String(code ?? '').trim()
+  if (!text) return null
+
+  // Supports common section formats used in this project:
+  //   2A6, 3A12, Y2A6, y3-sec-1, etc.
+  let m = /^\s*[Yy]\s*(\d+)/.exec(text)
+  if (!m) m = /^\s*(\d+)/.exec(text)
+  if (!m) return null
+
+  const year = Number(m[1])
+  if (!Number.isFinite(year)) return null
+  return clampAcademicYearNumber(year)
+}

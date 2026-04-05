@@ -61,7 +61,7 @@ export async function pollRunUntilDone(
   runId: string,
   onTick: (detail: RunDetail) => void,
   intervalMs = 4000,
-  timeoutMs = 360_000,
+  timeoutMs = 1_200_000,
 ): Promise<RunDetail> {
   const deadline = Date.now() + timeoutMs
   let transientErrors = 0
@@ -92,7 +92,9 @@ export async function pollRunUntilDone(
       }
     }
   }
-  throw new Error('Poll timeout: solver did not complete within the allowed time.')
+  throw new Error(
+    `Poll timeout after ${Math.round(timeoutMs / 1000)}s. Solver may still be running on server for run ${runId}.`,
+  )
 }
 
 export type SolveTimetableRequest = {
@@ -100,6 +102,7 @@ export type SolveTimetableRequest = {
   academic_year_number: number
   seed?: number | null
   max_time_seconds?: number
+  room_balance_mode?: 'soft' | 'strict'
   relax_teacher_load_limits?: boolean
   require_optimal?: boolean
 }
@@ -108,6 +111,7 @@ export type SolveGlobalTimetableRequest = {
   program_code: string
   seed?: number | null
   max_time_seconds?: number
+  room_balance_mode?: 'soft' | 'strict'
   relax_teacher_load_limits?: boolean
   require_optimal?: boolean
 }
@@ -141,10 +145,11 @@ export async function solveTimetable(payload: SolveTimetableRequest): Promise<So
 }
 
 export async function solveTimetableGlobal(payload: SolveGlobalTimetableRequest): Promise<SolveTimetableResponse> {
-  const rawMaxTime = Number(payload.max_time_seconds ?? 60)
+  const rawMaxTime = Number(payload.max_time_seconds ?? 900)
   const maxTimeSeconds = Number.isFinite(rawMaxTime)
-    ? Math.min(60, Math.max(0.1, rawMaxTime))
-    : 60
+    ? Math.min(900, Math.max(0.1, rawMaxTime))
+    : 900
+  const roomBalanceMode = payload.room_balance_mode === 'strict' ? 'strict' : 'soft'
 
   return apiFetch<SolveTimetableResponse>('/api/solver/solve-global', {
     method: 'POST',
@@ -152,6 +157,7 @@ export async function solveTimetableGlobal(payload: SolveGlobalTimetableRequest)
       program_code: payload.program_code,
       seed: payload.seed ?? null,
       max_time_seconds: maxTimeSeconds,
+      room_balance_mode: roomBalanceMode,
       relax_teacher_load_limits: Boolean(payload.relax_teacher_load_limits),
       require_optimal: Boolean(payload.require_optimal),
     }),

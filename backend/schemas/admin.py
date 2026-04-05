@@ -165,6 +165,40 @@ class SetTeacherSubjectSectionsRequest(BaseModel):
     section_ids: list[UUID] = Field(default_factory=list)
 
 
+class AutoAssignTeacherLoadRequest(BaseModel):
+    program_code: str = Field(min_length=1)
+    academic_year_number: int = Field(ge=1, le=4)
+    # Hard cap used while spreading demand across weekdays to avoid unrealistic
+    # concentration relative to parallel-room capacity.
+    max_parallel_rooms: int = Field(default=26, ge=1, le=500)
+    dry_run: bool = False
+
+
+class AutoAssignTeacherLoadSummary(BaseModel):
+    max_load: int = 0
+    min_load: int = 0
+    avg_load: float = 0.0
+
+
+class AutoAssignTeacherLoadTeacherOut(BaseModel):
+    teacher_id: UUID
+    teacher_code: str
+    teacher_name: str
+    assigned_subjects: list[str] = Field(default_factory=list)
+    weekly_load: int = 0
+    daily_distribution: dict[str, int] = Field(default_factory=dict)
+
+
+class AutoAssignTeacherLoadResponse(BaseModel):
+    status: str = "success"
+    dry_run: bool = False
+    summary: AutoAssignTeacherLoadSummary
+    teachers: list[AutoAssignTeacherLoadTeacherOut] = Field(default_factory=list)
+    assignments_created: int = 0
+    assignments_updated: int = 0
+    message: str | None = None
+
+
 class DeleteCombinedSubjectGroupResponse(BaseModel):
     ok: bool = True
     deleted: int = 1

@@ -35,6 +35,7 @@ from models.time_slot import TimeSlot
 from models.track_subject import TrackSubject
 from models.fixed_timetable_entry import FixedTimetableEntry
 from models.special_allotment import SpecialAllotment
+from models.timetable_entry import TimetableEntry
 
 from solver.context import SolverContext
 
@@ -218,6 +219,9 @@ def load_all(ctx: SolverContext) -> None:
 
     # --- Combined groups (v2 + legacy) ---------------------------------------
     _load_combined_groups(ctx)
+
+    # --- Existing run occupancy (for decomposed append mode) ------------------
+    _load_existing_run_room_events(ctx)
 
     # --- Build integer index maps (OPTIMIZATION) -----------------------------
     # Must come after all entities are loaded so the maps are complete.
@@ -448,6 +452,23 @@ def _load_combined_groups(ctx: SolverContext) -> None:
     ctx.group_teacher_id = group_teacher_id
 
 
+def _load_existing_run_room_events(ctx: SolverContext) -> None:
+    """Load persisted room occupancy rows for the current run once, up-front."""
+
+    db = ctx.db
+    tenant_id = ctx.tenant_id
+    q_existing = (
+        select(
+            TimetableEntry.room_id,
+            TimetableEntry.slot_id,
+            TimetableEntry.combined_class_id,
+        )
+        .where(TimetableEntry.run_id == ctx.run.id)
+    )
+    q_existing = where_tenant(q_existing, TimetableEntry, tenant_id)
+    ctx.existing_run_room_events = list(db.execute(q_existing).all())
+
+
 # ── Index maps & pruned slot computation (OPTIMIZATION) ──────────────────────
 
 
@@ -575,6 +596,34 @@ def build_pruned_slots(ctx: SolverContext) -> None:
     With Phase 7 enhancements: additional early-warning diagnostics for
     likely infeasibility scenarios.
     """
+    # --- FIX 2: Room occupancy pre-pruning ---
+    from collections import Counter
+
+    theory_rooms = len(ctx.rooms_by_type.get("CLASSROOM", [])) + len(ctx.rooms_by_type.get("LT", []))
+    lab_rooms = len(ctx.rooms_by_type.get("LAB", []))
+
+    # Pre-count existing locked occupancy per slot (from fixed_entries / special_allotments)
+    locked_theory_per_slot = Counter()
+    locked_lab_per_slot = Counter()
+    for entry in getattr(ctx, "fixed_entries", []):
+        subj = ctx.subject_by_id.get(getattr(entry, "subject_id", None))
+        if subj is None:
+            continue
+        if str(getattr(subj, "subject_type", "")) == "LAB":
+            locked_lab_per_slot[getattr(entry, "slot_id", None)] += 1
+        else:
+            locked_theory_per_slot[getattr(entry, "slot_id", None)] += 1
+
+    slot_ids = [s.id for s in getattr(ctx, "slots", [])]
+    ctx._slot_theory_headroom = {
+        slot_id: max(0, theory_rooms - locked_theory_per_slot.get(slot_id, 0))
+        for slot_id in slot_ids
+    }
+    ctx._slot_lab_headroom = {
+        slot_id: max(0, lab_rooms - locked_lab_per_slot.get(slot_id, 0))
+        for slot_id in slot_ids
+    }
+
     dallowed = ctx.teacher_disallowed_slot_ids  # teacher_id → set[slot_id]
 
     for section in ctx.sections:
@@ -587,6 +636,9 @@ def build_pruned_slots(ctx: SolverContext) -> None:
             subj = ctx.subject_by_id.get(subject_id)
             if subj is None:
                 continue
+
+            subj_type = str(getattr(subj, "subject_type", "THEORY") or "THEORY")
+            slot_headroom = ctx._slot_lab_headroom if subj_type == "LAB" else ctx._slot_theory_headroom
 
             teacher_id = ctx.assigned_teacher_by_section_subject.get((sec_id, subject_id))
             if teacher_id is None:
@@ -601,7 +653,7 @@ def build_pruned_slots(ctx: SolverContext) -> None:
             if block <= 1:
                 pruned_single = [
                     slot_id for slot_id in sorted(allowed)
-                    if slot_id not in teacher_blocked
+                    if slot_id not in teacher_blocked and slot_headroom.get(slot_id, 0) > 0
                 ]
                 ctx.valid_slots_by_section_subject[(sec_id, subject_id)] = pruned_single
                 continue
@@ -616,7 +668,12 @@ def build_pruned_slots(ctx: SolverContext) -> None:
                     ok = True
                     for j in range(block):
                         ts = ctx.slot_by_day_index.get((day, start_idx + j))
-                        if ts is None or ts.id in teacher_blocked or ts.id not in allowed:
+                        if (
+                            ts is None
+                            or ts.id in teacher_blocked
+                            or ts.id not in allowed
+                            or slot_headroom.get(ts.id, 0) <= 0
+                        ):
                             ok = False
                             break
                     if not ok:

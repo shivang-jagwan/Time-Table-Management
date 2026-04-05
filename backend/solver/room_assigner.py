@@ -361,7 +361,7 @@ def reserve_locked_rooms(ctx: SolverContext) -> None:
         rid = _rid(room_id)
         if rid in ctx.used_rooms_by_slot[sid]:
             ctx.conflicting_special_room_slots.add((str(sec_id), str(slot_id)))
-            ctx.db.add(
+            ctx.pending_conflicts.append(
                 TimetableConflict(
                     tenant_id=tenant_id,
                     run_id=run.id,
@@ -381,7 +381,7 @@ def reserve_locked_rooms(ctx: SolverContext) -> None:
         rid = _rid(room_id)
         if rid in ctx.used_rooms_by_slot[sid]:
             ctx.conflicting_fixed_room_slots.add((str(sec_id), str(slot_id)))
-            ctx.db.add(
+            ctx.pending_conflicts.append(
                 TimetableConflict(
                     tenant_id=tenant_id,
                     run_id=run.id,

@@ -31,6 +31,7 @@ import {
   type TimetableGridEntry,
 } from '../api/timetable'
 import { useModalScrollLock } from '../hooks/useModalScrollLock'
+import { parseAcademicYearFromSectionCode } from '../utils/academicYear'
 
 const WEEKDAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
 
@@ -173,13 +174,6 @@ function EntryTooltip({ lines }: { lines: string[] }) {
       ))}
     </div>
   )
-}
-
-function yearFromSectionCode(code: string): number | null {
-  const m = /^Y(\d+)\b/i.exec(String(code ?? '').trim())
-  if (!m) return null
-  const n = Number(m[1])
-  return Number.isFinite(n) ? n : null
 }
 
 export function Timetable() {
@@ -525,7 +519,7 @@ export function Timetable() {
   const sectionCodesForYear = React.useMemo(() => {
     const yn = Number(academicYearNumber)
     return sectionCodes.filter((c) => {
-      const y = yearFromSectionCode(c)
+      const y = parseAcademicYearFromSectionCode(c)
       return y == null || y === yn
     })
   }, [sectionCodes, academicYearNumber])
@@ -533,7 +527,7 @@ export function Timetable() {
   const sectionsForYear = React.useMemo(() => {
     const yn = Number(academicYearNumber)
     return sections.filter((s) => {
-      const y = yearFromSectionCode(s.code)
+      const y = parseAcademicYearFromSectionCode(s.code)
       return y == null || y === yn
     })
   }, [sections, academicYearNumber])
@@ -889,7 +883,7 @@ export function Timetable() {
               }
               disabled={!runId}
               onClick={() => {
-                const url = `/timetable/print-all/sections?runId=${encodeURIComponent(runId)}`
+                const url = `/timetable/print-all/sections?runId=${encodeURIComponent(runId)}&year=${encodeURIComponent(String(academicYearNumber))}`
                 window.open(url, '_blank', 'noopener,noreferrer')
               }}
               type="button"
@@ -904,7 +898,7 @@ export function Timetable() {
               }
               disabled={!runId}
               onClick={() => {
-                const url = `/timetable/print-all/rooms?runId=${encodeURIComponent(runId)}`
+                const url = `/timetable/print-all/rooms?runId=${encodeURIComponent(runId)}&year=${encodeURIComponent(String(academicYearNumber))}`
                 window.open(url, '_blank', 'noopener,noreferrer')
               }}
               type="button"
@@ -919,7 +913,7 @@ export function Timetable() {
               }
               disabled={!runId}
               onClick={() => {
-                const url = `/timetable/print-all/faculty?runId=${encodeURIComponent(runId)}`
+                const url = `/timetable/print-all/faculty?runId=${encodeURIComponent(runId)}&year=${encodeURIComponent(String(academicYearNumber))}`
                 window.open(url, '_blank', 'noopener,noreferrer')
               }}
               type="button"
@@ -937,7 +931,7 @@ export function Timetable() {
               }
               disabled={!runId}
               onClick={() => {
-                const url = `/print/sections?runId=${encodeURIComponent(runId)}`
+                const url = `/print/sections?runId=${encodeURIComponent(runId)}&year=${encodeURIComponent(String(academicYearNumber))}`
                 window.open(url, '_blank', 'noopener,noreferrer')
               }}
               type="button"
@@ -952,7 +946,7 @@ export function Timetable() {
               }
               disabled={!runId}
               onClick={() => {
-                const url = `/print/rooms?runId=${encodeURIComponent(runId)}`
+                const url = `/print/rooms?runId=${encodeURIComponent(runId)}&year=${encodeURIComponent(String(academicYearNumber))}`
                 window.open(url, '_blank', 'noopener,noreferrer')
               }}
               type="button"
@@ -967,7 +961,7 @@ export function Timetable() {
               }
               disabled={!runId}
               onClick={() => {
-                const url = `/print/faculty?runId=${encodeURIComponent(runId)}`
+                const url = `/print/faculty?runId=${encodeURIComponent(runId)}&year=${encodeURIComponent(String(academicYearNumber))}`
                 window.open(url, '_blank', 'noopener,noreferrer')
               }}
               type="button"
@@ -1168,7 +1162,7 @@ export function Timetable() {
                 <div className="text-sm font-semibold text-slate-900">This run has no timetable entries</div>
                 <div className="mt-1 text-sm text-slate-700">
                   Status: <span className="font-medium">{selectedRun?.status ?? '—'}</span>. Only{' '}
-                  <span className="font-medium">FEASIBLE</span> / <span className="font-medium">OPTIMAL</span> runs produce a section timetable grid.
+                  <span className="font-medium">FEASIBLE</span> / <span className="font-medium">SUBOPTIMAL</span> / <span className="font-medium">OPTIMAL</span> runs produce a section timetable grid.
                 </div>
                 <div className="mt-2 flex flex-wrap items-center gap-2 text-sm">
                   <Link

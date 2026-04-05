@@ -101,6 +101,7 @@ class SolverContext:
     academic_year_id: Any | None
     seed: int | None
     max_time_seconds: float
+    room_balance_mode: str
     enforce_teacher_load_limits: bool
     require_optimal: bool
     tenant_id: Any | None = None
@@ -252,6 +253,8 @@ class SolverContext:
     room_slot_terms: dict[tuple[Any, Any], list] = field(default_factory=lambda: defaultdict(list))
     # Constant locked occupancy per-(room,slot) from fixed/special entries.
     locked_room_usage_by_room_slot: dict[tuple[Any, Any], int] = field(default_factory=lambda: defaultdict(int))
+    # Already persisted run occupancy rows loaded upfront by data_loader.
+    existing_run_room_events: list[tuple[Any, Any, Any | None]] = field(default_factory=list)
     # Diagnostics: persisted locked rows vs deduped physical events.
     locked_existing_room_rows_count: int = 0
     locked_existing_room_events_count: int = 0
@@ -280,6 +283,9 @@ class SolverContext:
 
     # Subject day-spread penalty terms (soft: penalise >1 session of same subject on same day)
     subject_spread_penalty_terms: list[Any] = field(default_factory=list)
+
+    # Lab day continuity penalty terms (soft: discourage non-contiguous lab days)
+    lab_day_gap_penalty_terms: list[Any] = field(default_factory=list)
 
     # Objective attribution maps for adaptive LNS.
     section_gap_terms_by_section_day: dict[tuple[Any, int], list[Any]] = field(
@@ -320,6 +326,10 @@ class SolverContext:
     seen_uncombined_room_slot: set[tuple[str, str]] = field(default_factory=set)
     seen_non_elective_section_slot: set[tuple[str, str]] = field(default_factory=set)
     seen_teacher_slot_event: dict[tuple[str, str], str | None] = field(default_factory=dict)
+
+    # Buffered output payloads: solver writes to memory first, then bulk persists once.
+    pending_entries: list[TimetableEntry] = field(default_factory=list)
+    pending_conflicts: list[TimetableConflict] = field(default_factory=list)
 
     entries_written: int = 0
     conflicts: list[TimetableConflict] = field(default_factory=list)

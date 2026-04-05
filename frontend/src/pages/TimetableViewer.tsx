@@ -12,15 +12,10 @@ import {
   RequiredSubject,
 } from '../api/solver'
 import { PremiumSelect } from '../components/PremiumSelect'
+import { useLayoutContext } from '../components/Layout'
+import { parseAcademicYearFromSectionCode } from '../utils/academicYear'
 
 const WEEKDAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
-
-function yearFromSectionCode(code: string): number | null {
-  const m = /^Y(\d+)\b/i.exec(String(code ?? '').trim())
-  if (!m) return null
-  const n = Number(m[1])
-  return Number.isFinite(n) ? n : null
-}
 
 function shortId(id: string): string {
   return id.split('-')[0] ?? id
@@ -72,9 +67,14 @@ function groupForCell(entries: TimetableEntry[]) {
 }
 
 export function TimetableViewer({ onToast }: { onToast: (msg: string) => void }) {
+  const {
+    programCode,
+    academicYearNumber,
+    setProgramCode,
+    setAcademicYearNumber,
+  } = useLayoutContext()
+
   const [loading, setLoading] = React.useState(false)
-  const [programCode, setProgramCode] = React.useState('')
-  const [academicYearNumber, setAcademicYearNumber] = React.useState(1)
   const [runScopeFilter, setRunScopeFilter] = React.useState<'ALL' | 'PROGRAM_GLOBAL' | 'YEAR_ONLY'>('ALL')
 
   const [runs, setRuns] = React.useState<RunSummary[]>([])
@@ -101,7 +101,7 @@ export function TimetableViewer({ onToast }: { onToast: (msg: string) => void })
   const sectionCodesForYear = React.useMemo(() => {
     const yn = Number(academicYearNumber)
     return sectionCodes.filter((c) => {
-      const y = yearFromSectionCode(c)
+      const y = parseAcademicYearFromSectionCode(c)
       return y == null || y === yn
     })
   }, [sectionCodes, academicYearNumber])

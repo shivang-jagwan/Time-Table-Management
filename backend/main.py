@@ -225,18 +225,25 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        # Best-effort: don't block app boot if DB is temporarily down.
-        try:
-            _apply_startup_schema_recovery()
-        except Exception:
-            logger.exception("Startup schema recovery failed")
+        # In development, skip heavy startup DDL recovery to keep local boot fast.
+        if settings.environment.lower() == "production":
+            # Best-effort: don't block app boot if DB is temporarily down.
+            try:
+                _apply_startup_schema_recovery()
+            except Exception:
+                logger.exception("Startup schema recovery failed")
+        else:
+            logger.info("Skipping startup schema recovery in development")
 
-        try:
-            from core.bootstrap import bootstrap_auth
+        if settings.environment.lower() == "production":
+            try:
+                from core.bootstrap import bootstrap_auth
 
-            bootstrap_auth()
-        except Exception:
-            logger.exception("Auth bootstrap failed")
+                bootstrap_auth()
+            except Exception:
+                logger.exception("Auth bootstrap failed")
+        else:
+            logger.info("Skipping auth bootstrap in development")
 
         yield
 

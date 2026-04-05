@@ -41,3 +41,5 @@ class TimetableRun(Base):
     total_variables    = Column(Integer, nullable=True)
     total_constraints  = Column(Integer, nullable=True)
     objective_value    = Column(Float, nullable=True)
+    # Analytics data — populated by finalize_analytics() after solve completes
+    analytics_dict     = Column(JSONB, nullable=True)

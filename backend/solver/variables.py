@@ -35,10 +35,6 @@ import logging
 from collections import defaultdict
 from typing import Any
 
-from sqlalchemy import select
-
-from api.tenant import where_tenant
-from models.timetable_entry import TimetableEntry
 from solver.context import SolverContext
 from solver.pre_solve_locks import contiguous_starts, _ensure_elective_batches
 
@@ -736,19 +732,10 @@ def _create_room_assignment_vars(ctx: SolverContext) -> None:
     """
     model = ctx.model
 
-    # Seed locked fixed/special occupancy as constants.
-    # Also include already-persisted entries for decomposed global solves
-    # where subsequent batches append to the same run.
-    q_existing = select(
-        TimetableEntry.room_id,
-        TimetableEntry.slot_id,
-        TimetableEntry.combined_class_id,
-    ).where(
-        TimetableEntry.run_id == ctx.run.id
-    )
-    q_existing = where_tenant(q_existing, TimetableEntry, ctx.tenant_id)
+    # Seed already-persisted run occupancy loaded up-front by data_loader.
+    # This keeps model build DB-free.
     seen_existing_events: set[tuple[Any, Any, Any | None]] = set()
-    for room_id, slot_id, combined_class_id in ctx.db.execute(q_existing).all():
+    for room_id, slot_id, combined_class_id in list(ctx.existing_run_room_events or []):
         room = ctx.room_by_id.get(room_id)
         if room is not None and bool(getattr(room, "is_special", False)):
             continue

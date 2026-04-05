@@ -6,6 +6,7 @@ import { useLayoutContext } from '../components/Layout'
 import { listSubjects, Subject } from '../api/subjects'
 import { PremiumSelect } from '../components/PremiumSelect'
 import {
+  autoAssignTeacherLoad,
   listTeacherSubjectSections,
   setTeacherSubjectSections,
   TeacherSubjectSectionAssignmentRow,
@@ -63,6 +64,7 @@ export function Teachers() {
   const [assignRows, setAssignRows] = React.useState<TeacherSubjectSectionAssignmentRow[]>([])
   const [assignLoading, setAssignLoading] = React.useState(false)
   const [assignSaving, setAssignSaving] = React.useState(false)
+  const [autoAssignLoading, setAutoAssignLoading] = React.useState(false)
 
   const [editOpen, setEditOpen] = React.useState(false)
   const [editTeacher, setEditTeacher] = React.useState<Teacher | null>(null)
@@ -210,6 +212,56 @@ export function Teachers() {
     } finally {
       setAssignLoading(false)
     }
+  }
+
+  async function runAutoAssignTeacherLoad(dryRun: boolean) {
+    const pc = programCode.trim()
+    if (!pc) {
+      showToast('Select a program first', 3000)
+      return
+    }
+
+    setAutoAssignLoading(true)
+    try {
+      const res = await autoAssignTeacherLoad({
+        program_code: pc,
+        academic_year_number: Number(academicYearNumber),
+        max_parallel_rooms: 26,
+        dry_run: dryRun,
+      })
+
+      if (!dryRun) {
+        await refreshAssignmentData()
+        await refreshTeacherAssignments(assignTeacherId)
+        if (assignTeacherId && assignSubjectId) {
+          await refreshTeacherSubjectSelection(assignTeacherId, assignSubjectId)
+        }
+      }
+
+      const summaryText =
+        `${dryRun ? 'Preview Completed' : 'Load Assigned Successfully'}\n` +
+        `Max: ${res.summary.max_load}\n` +
+        `Min: ${res.summary.min_load}\n` +
+        `Avg: ${res.summary.avg_load}\n` +
+        `Create: ${res.assignments_created}\n` +
+        `Update: ${res.assignments_updated}`
+
+      window.alert(summaryText)
+      showToast(dryRun ? 'Auto assign preview ready' : 'Auto assign completed')
+      if (res.message) showToast(res.message, 4500)
+    } catch (e: any) {
+      showToast(`${dryRun ? 'Preview failed' : 'Auto assign failed'}: ${String(e?.message ?? e)}`, 4000)
+    } finally {
+      setAutoAssignLoading(false)
+    }
+  }
+
+  async function onAutoAssignTeacherLoad() {
+    await runAutoAssignTeacherLoad(false)
+  }
+
+  async function onPreviewAutoAssignTeacherLoad() {
+    await runAutoAssignTeacherLoad(true)
   }
 
   React.useEffect(() => {
@@ -368,11 +420,27 @@ export function Teachers() {
             <div className="flex items-center gap-2">
               <button
                 className="rounded-2xl border bg-white px-4 py-2 text-sm font-medium text-slate-800 disabled:opacity-50"
+                onClick={onPreviewAutoAssignTeacherLoad}
+                disabled={assignLoading || assignSaving || autoAssignLoading}
+                type="button"
+              >
+                {autoAssignLoading ? 'Working…' : 'Preview Auto Assign'}
+              </button>
+              <button
+                className="rounded-2xl bg-slate-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
+                onClick={onAutoAssignTeacherLoad}
+                disabled={assignLoading || assignSaving || autoAssignLoading}
+                type="button"
+              >
+                {autoAssignLoading ? 'Auto assigning…' : 'Auto Assign Teacher Load'}
+              </button>
+              <button
+                className="rounded-2xl border bg-white px-4 py-2 text-sm font-medium text-slate-800 disabled:opacity-50"
                 onClick={() => {
                   refreshAssignmentData()
                   refreshTeacherAssignments(assignTeacherId)
                 }}
-                disabled={assignLoading || assignSaving}
+                disabled={assignLoading || assignSaving || autoAssignLoading}
               >
                 {assignLoading ? 'Loading…' : 'Refresh'}
               </button>

@@ -150,6 +150,12 @@ def add_objective(ctx: SolverContext) -> None:
         for pv in ctx.teacher_preferred_slot_penalty_terms:
             tier_secondary.append(pv * W_TEACHER_PREFERRED_SLOT)
 
+    # ── 4c. Lab day continuity (soft preference for adjacent days) ───────
+    W_LAB_DAY_GAP = 150  # Penalize non-contiguous lab days (cognitive load)
+    if ctx.lab_day_gap_penalty_terms:
+        for pv in ctx.lab_day_gap_penalty_terms:
+            tier_secondary.append(pv * W_LAB_DAY_GAP)
+
     # ── 5. Late-slot penalty (10 × slot_index — prefer earlier slots) ─────
     # While iterating, collect any variable assigned to the last slot on
     # Friday so we can apply the Friday-last-slot penalty in section 6.

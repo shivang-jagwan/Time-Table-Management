@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import { Toast } from '../components/Toast'
 import {
   generateTimetableGlobal,
+  getRun,
   getSolverCalculations,
   listRunConflicts,
   listTimeSlots,
@@ -39,6 +40,50 @@ function prettyDiagType(t: unknown): string {
     .replace(/\b([a-z])/g, (m) => m.toUpperCase())
 }
 
+function normalizeRunStatus(status: string): SolveTimetableResponse['status'] {
+  // Backend run rows use VALIDATION_FAILED while solve response payload uses FAILED_VALIDATION.
+  if (status === 'VALIDATION_FAILED') return 'FAILED_VALIDATION'
+  return status as SolveTimetableResponse['status']
+}
+
+function buildSolveResponseFromRun(detail: RunDetail, runConflicts: SolverConflict[]): SolveTimetableResponse {
+  const sr: Record<string, any> = (detail.parameters as any)?._solver_result ?? {}
+  const infeasibleConflict = runConflicts.find((c) => c.conflict_type === 'INFEASIBLE')
+  const infeasibleMeta = (infeasibleConflict?.metadata ?? {}) as Record<string, any>
+  const inferredReasonSummary =
+    typeof infeasibleMeta.reason_summary === 'string' ? infeasibleMeta.reason_summary : null
+  const inferredDiagnostics = Array.isArray(infeasibleMeta.diagnostics)
+    ? infeasibleMeta.diagnostics
+    : []
+  const warningMessagesFromConflicts = runConflicts
+    .filter((c) => c.severity === 'WARN')
+    .map((c) => c.message)
+  const mergedWarnings = Array.from(
+    new Set([
+      ...(Array.isArray(sr.warnings) ? sr.warnings : []),
+      ...warningMessagesFromConflicts,
+    ]),
+  )
+
+  return {
+    run_id: detail.id,
+    status: normalizeRunStatus(detail.status),
+    entries_written: sr.entries_written ?? detail.entries_total ?? 0,
+    conflicts: runConflicts,
+    reason_summary: sr.reason_summary ?? inferredReasonSummary ?? detail.notes ?? null,
+    diagnostics: Array.isArray(sr.diagnostics) && sr.diagnostics.length > 0
+      ? sr.diagnostics
+      : inferredDiagnostics,
+    objective_score: sr.objective_score ?? null,
+    warnings: mergedWarnings,
+    solver_stats: sr.solver_stats ?? {},
+    best_bound: sr.best_bound ?? null,
+    optimality_gap: sr.optimality_gap ?? null,
+    solve_time_seconds: sr.solve_time_seconds ?? null,
+    message: sr.message ?? null,
+  }
+}
+
 export function GenerateTimetable() {
   const { programCode, academicYearNumber } = useLayoutContext()
   const [toast, setToast] = React.useState('')
@@ -46,7 +91,8 @@ export function GenerateTimetable() {
   const [slotCount, setSlotCount] = React.useState<number | null>(null)
 
   const [seed, setSeed] = React.useState<string>('')
-  const [maxTimeSeconds, setMaxTimeSeconds] = React.useState<number>(60)
+  const [maxTimeSeconds, setMaxTimeSeconds] = React.useState<number>(900)
+  const [roomBalanceMode, setRoomBalanceMode] = React.useState<'soft' | 'strict'>('soft')
   const [relaxTeacherLoadLimits, setRelaxTeacherLoadLimits] = React.useState(false)
   const [requireOptimal, setRequireOptimal] = React.useState(true)
 
@@ -135,21 +181,24 @@ export function GenerateTimetable() {
     setPollStatus(null)
     setLastValidationConflicts([])
     setLastRun(null)
+    let launchedRunId: string | null = null
     try {
       const s = seed.trim() === '' ? null : Number(seed)
       const normalizedMaxTimeSeconds = Number.isFinite(Number(maxTimeSeconds))
-        ? Math.min(60, Math.max(0.1, Number(maxTimeSeconds)))
-        : 60
+        ? Math.min(900, Math.max(0.1, Number(maxTimeSeconds)))
+        : 900
       const res = await solveTimetableGlobal({
         program_code: pc,
         seed: Number.isFinite(s as any) ? s : null,
         max_time_seconds: normalizedMaxTimeSeconds,
+        room_balance_mode: roomBalanceMode,
         relax_teacher_load_limits: Boolean(relaxTeacherLoadLimits),
         require_optimal: Boolean(requireOptimal),
       })
 
       if (res.status === 'RUNNING') {
         // Backend accepted the job — poll until done
+        launchedRunId = res.run_id
         setLastRun(res)
         setPollStatus('Solver running on server…')
         showToast('Solver started — polling for completion…', 4000)
@@ -159,58 +208,59 @@ export function GenerateTimetable() {
             const elapsed = d.notes ? ` (${d.notes.slice(0, 60)})` : ''
             setPollStatus(`Solving… status: ${d.status}${elapsed}`)
           },
+          4000,
+          Math.max(1_200_000, Math.round(normalizedMaxTimeSeconds * 1000) + 180_000),
         )
         const runConflicts = await listRunConflicts(detail.id).catch(() => [])
-
-        // Build a compatible response shape from the RunDetail + saved _solver_result
-        const sr: Record<string, any> = (detail.parameters as any)?._solver_result ?? {}
-        const infeasibleConflict = runConflicts.find((c) => c.conflict_type === 'INFEASIBLE')
-        const infeasibleMeta = (infeasibleConflict?.metadata ?? {}) as Record<string, any>
-        const inferredReasonSummary =
-          typeof infeasibleMeta.reason_summary === 'string' ? infeasibleMeta.reason_summary : null
-        const inferredDiagnostics = Array.isArray(infeasibleMeta.diagnostics)
-          ? infeasibleMeta.diagnostics
-          : []
-        const warningMessagesFromConflicts = runConflicts
-          .filter((c) => c.severity === 'WARN')
-          .map((c) => c.message)
-        const mergedWarnings = Array.from(
-          new Set([
-            ...(Array.isArray(sr.warnings) ? sr.warnings : []),
-            ...warningMessagesFromConflicts,
-          ]),
-        )
-
-        const finalRun: SolveTimetableResponse = {
-          run_id: detail.id,
-          status: detail.status as SolveTimetableResponse['status'],
-          entries_written: sr.entries_written ?? detail.entries_total ?? 0,
-          conflicts: runConflicts,
-          reason_summary: sr.reason_summary ?? inferredReasonSummary ?? detail.notes ?? null,
-          diagnostics: Array.isArray(sr.diagnostics) && sr.diagnostics.length > 0
-            ? sr.diagnostics
-            : inferredDiagnostics,
-          objective_score: sr.objective_score ?? null,
-          warnings: mergedWarnings,
-          solver_stats: sr.solver_stats ?? {},
-          best_bound: sr.best_bound ?? null,
-          optimality_gap: sr.optimality_gap ?? null,
-          solve_time_seconds: sr.solve_time_seconds ?? null,
-          message: sr.message ?? null,
-        }
+        const finalRun = buildSolveResponseFromRun(detail, runConflicts)
         setLastRun(finalRun)
         setPollStatus(null)
         showToast(`Solve complete: ${finalRun.status}`)
       } else {
         // Synchronous response (validation failure, error, etc.)
-        setLastRun(res)
+        setLastRun({ ...res, status: normalizeRunStatus(res.status) })
+        setPollStatus(null)
         showToast(`Solve status: ${res.status}`)
       }
     } catch (e: any) {
-      showToast(`Solve failed: ${String(e?.message ?? e)}`, 3500)
+      const errMsg = String(e?.message ?? e)
+      if (launchedRunId) {
+        try {
+          const latest = await getRun(launchedRunId)
+          const latestConflicts = await listRunConflicts(launchedRunId).catch(() => [])
+          if (latest.status !== 'RUNNING' && latest.status !== 'CREATED') {
+            const recoveredRun = buildSolveResponseFromRun(latest, latestConflicts)
+            setLastRun(recoveredRun)
+            setPollStatus(null)
+            showToast(`Solve complete: ${recoveredRun.status}`)
+            return
+          }
+
+          setLastRun({
+            run_id: latest.id,
+            status: 'RUNNING',
+            entries_written: latest.entries_total ?? 0,
+            conflicts: latestConflicts,
+            reason_summary: latest.notes ?? null,
+            message: `Polling interrupted: ${errMsg}`,
+          })
+          setPollStatus(`Polling interrupted. Run ${launchedRunId} is still ${latest.status} on server.`)
+          showToast(`Polling interrupted. Run ${launchedRunId} is still ${latest.status}.`, 6000)
+          return
+        } catch {
+          setLastRun({
+            run_id: launchedRunId,
+            status: 'ERROR',
+            entries_written: 0,
+            conflicts: [],
+            message: `Solve polling failed for run ${launchedRunId}: ${errMsg}`,
+          })
+        }
+      }
+      setPollStatus(null)
+      showToast(`Solve failed: ${errMsg}`, 5000)
     } finally {
       setLoading(false)
-      setPollStatus(null)
     }
   }
 
@@ -407,12 +457,27 @@ export function GenerateTimetable() {
                   id="solve_max_time"
                   type="number"
                   min={0.1}
-                  max={60}
+                  max={900}
                   step={0.1}
                   className="input-premium mt-1 w-full text-sm"
                   value={maxTimeSeconds}
                   onChange={(e) => setMaxTimeSeconds(Number(e.target.value))}
                 />
+              </div>
+              <div>
+                <label htmlFor="room_balance_mode" className="text-xs font-medium text-slate-600">Room balance mode</label>
+                <select
+                  id="room_balance_mode"
+                  className="input-premium mt-1 w-full text-sm"
+                  value={roomBalanceMode}
+                  onChange={(e) => setRoomBalanceMode(e.target.value === 'strict' ? 'strict' : 'soft')}
+                >
+                  <option value="soft">Soft (recommended)</option>
+                  <option value="strict">Strict room cap</option>
+                </select>
+                <div className="mt-1 text-[11px] text-slate-500">
+                  Soft shifts classes across slots with overflow penalties; strict blocks any slot beyond room count.
+                </div>
               </div>
               <div className="flex items-end">
                 <label className="checkbox-row w-full rounded-lg border border-white/40 bg-white/70">
@@ -470,6 +535,8 @@ export function GenerateTimetable() {
                       ? '🔴 INFEASIBLE'
                       : lastRun.status === 'ERROR'
                         ? '🟠 ERROR'
+                        : lastRun.status === 'FAILED_VALIDATION'
+                          ? '🟠 VALIDATION FAILED'
                         : lastRun.status === 'OPTIMAL'
                           ? '🟢 OPTIMAL'
                           : lastRun.status === 'SUBOPTIMAL'
@@ -492,6 +559,12 @@ export function GenerateTimetable() {
                 {lastRun.solver_stats?.ortools_status != null ? (
                   <div className="mt-1 text-xs text-slate-500">
                     OR-Tools status: {fmtOrtoolsStatus(lastRun.solver_stats.ortools_status)}
+                  </div>
+                ) : null}
+
+                {lastRun.message ? (
+                  <div className="mt-3 rounded-2xl border border-slate-200 bg-white p-3 text-sm text-slate-700">
+                    {lastRun.message}
                   </div>
                 ) : null}
 
@@ -551,9 +624,54 @@ export function GenerateTimetable() {
                 {lastRun.status === 'ERROR' ? (
                   <div className="mt-3 rounded-2xl border border-amber-200 bg-amber-50 p-3 text-sm text-slate-800">
                     Solver returned <span className="font-semibold">ERROR</span> (no timetable entries).
-                    Most commonly this is a <span className="font-semibold">timeout</span>.
-                    Try increasing <span className="font-semibold">Max solve time</span> (e.g. 30–60s) or enable
-                    <span className="font-semibold"> Relax teacher load limits</span>, then solve again.
+                    {(() => {
+                      const detail = String(lastRun.message ?? lastRun.reason_summary ?? '').trim()
+                      const lower = detail.toLowerCase()
+                      const looksLikeDbDisconnect =
+                        lower.includes('database connectivity dropped') ||
+                        lower.includes('database unavailable') ||
+                        lower.includes('operationalerror') ||
+                        lower.includes('server closed the connection unexpectedly') ||
+                        lower.includes('connection')
+
+                      if (detail) {
+                        return (
+                          <>
+                            <div className="mt-2 rounded-xl border bg-white p-2 text-xs text-slate-700">
+                              {detail}
+                            </div>
+                            {looksLikeDbDisconnect ? (
+                              <div className="mt-2">
+                                This failure is a <span className="font-semibold">database connectivity issue</span>, not a solver timeout.
+                                Retry after backend/DB connectivity stabilizes.
+                              </div>
+                            ) : (
+                              <div className="mt-2">
+                                If this is a timeout, try increasing <span className="font-semibold">Max solve time</span> or enable
+                                <span className="font-semibold"> Relax teacher load limits</span>, then solve again.
+                              </div>
+                            )}
+                          </>
+                        )
+                      }
+
+                      return (
+                        <div className="mt-2">
+                          Most commonly this is a <span className="font-semibold">timeout</span>.
+                          Try increasing <span className="font-semibold">Max solve time</span> or enable
+                          <span className="font-semibold"> Relax teacher load limits</span>, then solve again.
+                        </div>
+                      )
+                    })()}
+                  </div>
+                ) : null}
+
+                {lastRun.status === 'FAILED_VALIDATION' ? (
+                  <div className="mt-3 rounded-2xl border border-amber-200 bg-amber-50 p-3 text-sm text-slate-800">
+                    Solver returned <span className="font-semibold">VALIDATION FAILED</span>.
+                    <div className="mt-2">
+                      Open <span className="font-semibold">Conflicts</span> to view the blocking issues and fix input data.
+                    </div>
                   </div>
                 ) : null}
 

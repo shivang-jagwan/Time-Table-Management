@@ -32,21 +32,25 @@ log = logging.getLogger(__name__)
 
 def add_constraints(ctx: SolverContext) -> None:
     """Add all constraints to ``ctx.model``."""
+
     _add_room_capacity_constraints(ctx)
     _add_fixed_entry_hard_constraints(ctx)
     _add_section_no_overlap(ctx)
+    _add_combined_group_selection(ctx)
     _add_section_compactness(ctx)
     _add_subject_day_spread(ctx)
     _add_no_consecutive_same_subject(ctx)
     _add_lunch_break_constraint(ctx)
     _add_teacher_no_overlap(ctx)
+    _add_room_slot_uniqueness(ctx)
+
     _add_teacher_weekly_off(ctx)
     _add_teacher_workload_soft_penalties(ctx)
     _add_teacher_compactness(ctx)
     _add_daily_load_balance(ctx)
-    _add_room_slot_uniqueness(ctx)
     _add_slot_load_constraints(ctx)
     _add_section_max_daily_slots(ctx)
+    _add_lab_day_continuity_preference(ctx)
 
 
 # ── Room capacity ───────────────────────────────────────────────────────────
@@ -122,19 +126,27 @@ def _add_room_capacity_constraints(ctx: SolverContext) -> None:
 
 def _add_room_slot_uniqueness(ctx: SolverContext) -> None:
     """Hard constraint: a room can host at most one class per slot."""
-    model = ctx.model
     for (room_id, slot_id), terms in ctx.room_slot_terms.items():
+        if not terms:
+            continue
         locked = int(ctx.locked_room_usage_by_room_slot.get((room_id, slot_id), 0) or 0)
-        if terms:
-            model.Add(sum(terms) + locked <= 1)
-        elif locked > 1:
-            log.warning("Room %s slot %s has locked count %d > 1, skipping instead of forcing infeasible", room_id, slot_id, locked)
-            return
+        total_terms = list(terms)
+        if locked > 0:
+            ctx.model.Add(cp_model.LinearExpr.Sum(total_terms) <= (1 - locked))
+        else:
+            ctx.model.Add(cp_model.LinearExpr.Sum(total_terms) <= 1)
 
 
 def _add_slot_load_constraints(ctx: SolverContext) -> None:
-    """Hard slot cap + soft balancing and anti-congestion penalties."""
+    """Slot load constraints with selectable room-balance policy.
+
+    Modes:
+      - ``soft``   : allow overflow and penalize it (default)
+      - ``strict`` : enforce hard room-capacity per slot
+    """
     model = ctx.model
+    room_balance_mode = str(getattr(ctx, "room_balance_mode", "soft") or "soft").strip().lower()
+    strict_room_cap = room_balance_mode == "strict"
 
     total_available_rooms = int(
         sum(
@@ -162,13 +174,15 @@ def _add_slot_load_constraints(ctx: SolverContext) -> None:
 
         model.Add(load == sum(load_terms))
         
-        # PHASE 11: REMOVED hard slot cap — allow flexible distribution
-        # Old: model.Add(load <= int(total_available_rooms))
-        # New: Soft capacity with load-based penalty
-        
-        # Use load variable directly as soft penalty term
-        # Higher load = higher penalty to encourage distribution across slots
-        ctx.slot_capacity_overflow_terms.append(load)
+        if strict_room_cap:
+            model.Add(load <= int(total_available_rooms))
+        else:
+            # Soft capacity with true overflow penalty.
+            # Penalize only the amount above total available rooms, not the full load.
+            slot_capacity_overflow = model.NewIntVar(0, max_slot_load, f"slot_cap_over_{slot_id}")
+            model.Add(slot_capacity_overflow >= load - int(total_available_rooms))
+            model.Add(slot_capacity_overflow >= 0)
+            ctx.slot_capacity_overflow_terms.append(slot_capacity_overflow)
 
         overload = model.NewIntVar(0, max_slot_load, f"slot_over_{slot_id}")
         model.Add(overload >= load - int(soft_threshold))
@@ -189,6 +203,16 @@ def _add_slot_load_constraints(ctx: SolverContext) -> None:
     n = len(slot_load_vars)
     model.Add(total_load >= avg_load * n)
     model.Add(total_load <= avg_load * n + (n - 1))
+
+    if not strict_room_cap:
+        # Softly minimize the peak slot overflow to encourage spreading classes
+        # across the timetable instead of concentrating them in a few hot spots.
+        peak_slot_load = model.NewIntVar(0, max_slot_load * 2, "peak_slot_load")
+        model.AddMaxEquality(peak_slot_load, slot_load_vars)
+        peak_slot_overflow = model.NewIntVar(0, max_slot_load, "peak_slot_overflow")
+        model.Add(peak_slot_overflow >= peak_slot_load - int(total_available_rooms))
+        model.Add(peak_slot_overflow >= 0)
+        ctx.slot_capacity_overflow_terms.append(peak_slot_overflow)
 
     for ts in ctx.slots:
         slot_id = ts.id
@@ -212,6 +236,89 @@ def _log_skip_fixed_entry(ctx: SolverContext, reason: str, **details: Any) -> No
     if not hasattr(ctx, 'skipped_fixed_entries'):
         ctx.skipped_fixed_entries = []
     ctx.skipped_fixed_entries.append((reason, details))
+
+
+# ── Combined-group same-time enforcement ────────────────────────────────────
+
+
+def _add_combined_group_selection(ctx: SolverContext) -> None:
+    """HARD: Exactly one combined-group variable per group must be selected.
+    
+    This ensures all sections in a combined group use the SAME time slot.
+    For each group_id, exactly one combined_x[(group_id, slot_id)] is = 1.
+    """
+    model = ctx.model
+    
+    for group_id, combined_vars in ctx.combined_vars_by_gid.items():
+        if not combined_vars:
+            continue
+        
+        # Exactly 1 combined variable active per group
+        # This forces all sections to use the same slot
+        model.Add(sum(combined_vars) == 1)
+        
+        gid_str = str(group_id)[:20]  # Logging label
+        log.debug(f"Added combined-group same-time constraint for group {gid_str}: exactly 1 of {len(combined_vars)} vars")
+
+
+# ── Lab day continuity (soft preference) ────────────────────────────────────
+
+
+def _add_lab_day_continuity_preference(ctx: SolverContext) -> None:
+    """SOFT: Discourage splitting a lab across non-contiguous days.
+    
+    For each (section, subject) pair with multiple lab sessions per week,
+    prefer them to occur on nearby days (e.g., Mon-Tue) rather than 
+    Mon + Wed due to cognitive load concerns.
+    
+    Approach: For each lab with 2+ starts on different days, create a penalty
+    variable that increases when the days are far apart.
+    """
+    model = ctx.model
+    
+    # lab_starts_by_sec_subj: dict[(sec_id, subj_id)] -> list of lab_start BoolVars
+    for (sec_id, subj_id), lab_start_vars in ctx.lab_starts_by_sec_subj.items():
+        if len(lab_start_vars) < 2:
+            continue  # Single-session labs or no labs
+        
+        # Group these lab starts by day
+        lab_starts_by_day: dict[int, list] = defaultdict(list)
+        for lab_start_var in lab_start_vars:
+            # We need to look up which day this start is on
+            # Search through lab_start dictionary for the matching key
+            for (l_sec, l_subj, day, _slot_idx), sv in ctx.lab_start.items():
+                if l_sec == sec_id and l_subj == subj_id and sv is lab_start_var:
+                    lab_starts_by_day[day].append(lab_start_var)
+                    break
+        
+        if len(lab_starts_by_day) < 2:
+            continue  # All labs on one day or no split yet
+        
+        # days_with_labs contains days that have at least one lab start
+        days_with_labs = sorted(lab_starts_by_day.keys())
+        
+        if len(days_with_labs) < 2:
+            continue
+        
+        # Create penalty for day spread (e.g., if labs on day 0 and day 5, penalize)
+        for d1 in days_with_labs:
+            for d2 in days_with_labs:
+                if d1 >= d2:
+                    continue
+                gap = d2 - d1
+                if gap > 1:  # Non-contiguous DAYS (Mon-Tue=gap 1 is OK, Mon-Wed=gap 2 penalize)
+                    penalty_var = model.NewBoolVar(f"lab_gap_penalty_{sec_id}_{subj_id}_{d1}_{d2}")
+                    # penalty_var = 1 iff both days have active labs
+                    vars_d1 = lab_starts_by_day.get(d1, [])
+                    vars_d2 = lab_starts_by_day.get(d2, [])
+                    if vars_d1 and vars_d2:
+                        any_d1 = model.NewBoolVar(f"lab_any_day{d1}_")
+                        any_d2 = model.NewBoolVar(f"lab_any_day{d2}_")
+                        model.AddMaxEquality(any_d1, vars_d1)
+                        model.AddMaxEquality(any_d2, vars_d2)
+                        # penalty_var = 1 iff both any_d1 and any_d2
+                        model.Add(penalty_var >= any_d1 + any_d2 - 1)
+                        ctx.lab_day_gap_penalty_terms.append(penalty_var)
 
 
 def _add_fixed_entry_hard_constraints(ctx: SolverContext) -> None:

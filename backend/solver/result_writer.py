@@ -17,7 +17,7 @@ from collections import defaultdict
 from typing import Any
 
 from ortools.sat.python import cp_model
-from sqlalchemy import delete, func, select
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from api.tenant import where_tenant
@@ -25,6 +25,7 @@ from core.config import settings
 from models.timetable_conflict import TimetableConflict
 from models.timetable_entry import TimetableEntry
 from solver.context import SolverContext, SolverInvariantError, SolveResult
+from solver.persistence import save_run_outputs_with_retry
 from solver.room_assigner import (
     assert_entry_invariants,
     elective_group_id,
@@ -81,12 +82,12 @@ def write_results(
     run = ctx.run
     tenant_id = ctx.tenant_id
 
-    # Delete previous entries for this run only for the first partition.
-    if clear_existing_entries:
-        stmt = delete(TimetableEntry).where(TimetableEntry.run_id == run.id)
-        stmt = where_tenant(stmt, TimetableEntry, tenant_id)
-        db.execute(stmt)
-    else:
+    # Reset output buffers for this write pass.
+    ctx.pending_entries = []
+    ctx.pending_conflicts = []
+
+    # For append-mode partitions, bootstrap occupancy from already persisted rows.
+    if not clear_existing_entries:
         _bootstrap_existing_run_occupancy(ctx)
 
     # Objective score
@@ -138,7 +139,7 @@ def write_results(
         ctx.warnings.append(
             "Room assignment required fallback in occupied slots; timetable contains room conflicts."
         )
-        db.add(
+        ctx.pending_conflicts.append(
             TimetableConflict(
                 tenant_id=tenant_id,
                 run_id=run.id,
@@ -166,7 +167,7 @@ def write_results(
         ctx.warnings.append(
             "A feasible timetable was found, but optimality was not proven (SUBOPTIMAL)."
         )
-        db.add(
+        ctx.pending_conflicts.append(
             TimetableConflict(
                 tenant_id=tenant_id,
                 run_id=run.id,
@@ -218,13 +219,18 @@ def write_results(
     
     run.objective_value = float(ctx.objective_score) if ctx.objective_score is not None else None
     try:
-        db.commit()
+        save_run_outputs_with_retry(
+            db,
+            run=run,
+            tenant_id=tenant_id,
+            entries=ctx.pending_entries,
+            conflicts=ctx.pending_conflicts,
+            clear_existing_entries=clear_existing_entries,
+        )
     except IntegrityError:
-        try:
-            db.rollback()
-        except Exception:
-            pass
         raise
+
+    ctx.conflicts = list(ctx.pending_conflicts)
     return SolveResult(
         status=str(final_status),
         entries_written=ctx.entries_written,
@@ -338,13 +344,13 @@ def _count_room_assignment_conflicts(ctx: SolverContext) -> int:
         "SPECIAL_ROOM_CONFLICT",
         "FIXED_ROOM_CONFLICT",
     )
-    q = (
-        select(func.count(TimetableConflict.id))
-        .where(TimetableConflict.run_id == ctx.run.id)
-        .where(TimetableConflict.conflict_type.in_(list(conflict_types)))
+    return int(
+        sum(
+            1
+            for c in (ctx.pending_conflicts or [])
+            if str(getattr(c, "conflict_type", "")) in conflict_types
+        )
     )
-    q = where_tenant(q, TimetableConflict, ctx.tenant_id)
-    return int(ctx.db.execute(q).scalar() or 0)
 
 
 def _compute_solver_stats(ctx: SolverContext, solver: cp_model.CpSolver, status: int) -> None:
@@ -619,7 +625,7 @@ def _make_entry(ctx: SolverContext, **kwargs: Any) -> TimetableEntry:
     """
     entry = TimetableEntry(**kwargs)
     assert_entry_invariants(ctx, entry)
-    ctx.db.add(entry)
+    ctx.pending_entries.append(entry)
     ctx.entries_written += 1
     # O(E) slot index — populated once per entry, free to query later.
     ctx.entries_by_slot[entry.slot_id].append(entry)
@@ -789,7 +795,7 @@ def _write_theory_entries(ctx: SolverContext, solver: cp_model.CpSolver) -> None
 
         for covered_sid in block_slot_ids:
             if not ok_room:
-                ctx.db.add(
+                ctx.pending_conflicts.append(
                     TimetableConflict(
                         tenant_id=tenant_id,
                         run_id=run.id,
@@ -901,7 +907,7 @@ def _emit_block_batch_occurrence(ctx: SolverContext, solver: cp_model.CpSolver, 
             combined_conflict_id = room_conflict_group_id(
                 run_id=run.id, room_id=room_id, slot_id=slot_id
             )
-            ctx.db.add(
+            ctx.pending_conflicts.append(
                 TimetableConflict(
                     tenant_id=tenant_id,
                     run_id=run.id,
@@ -1000,7 +1006,7 @@ def _write_combined_theory_entries(ctx: SolverContext, solver: cp_model.CpSolver
         if room_id is None:
             continue
         if not ok_room:
-            ctx.db.add(
+            ctx.pending_conflicts.append(
                 TimetableConflict(
                     tenant_id=tenant_id,
                     run_id=run.id,
@@ -1083,7 +1089,7 @@ def _write_lab_entries(ctx: SolverContext, solver: cp_model.CpSolver) -> None:
             if ts is None:
                 continue
             if not ok_room:
-                ctx.db.add(
+                ctx.pending_conflicts.append(
                     TimetableConflict(
                         tenant_id=tenant_id,
                         run_id=run.id,

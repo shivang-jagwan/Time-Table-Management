@@ -16,7 +16,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--username", default=os.environ.get("USERNAME", "shivang123"))
     parser.add_argument("--password", default=os.environ.get("PASSWORD", "Shivang@GEHU123"))
     parser.add_argument("--program-code", default=os.environ.get("PROGRAM_CODE", "CSE"))
-    parser.add_argument("--max-time-seconds", type=float, default=60.0)
+    parser.add_argument("--max-time-seconds", type=float, default=900.0)
     parser.add_argument("--require-optimal", action="store_true")
     parser.add_argument("--relax-teacher-load-limits", action="store_true")
     return parser.parse_args()

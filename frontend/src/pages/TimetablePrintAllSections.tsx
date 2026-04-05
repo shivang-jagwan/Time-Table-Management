@@ -3,6 +3,7 @@ import { Link, useSearchParams } from 'react-router-dom'
 import { useLayoutContext } from '../components/Layout'
 import { listRunEntries, listTimeSlots, type TimeSlot } from '../api/solver'
 import { getSectionTimetable, type TimetableGridEntry } from '../api/timetable'
+import { clampAcademicYearNumber, parseAcademicYearFromSectionCode } from '../utils/academicYear'
 
 const WEEKDAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
 
@@ -220,9 +221,11 @@ function PrintGrid({
 }
 
 export function TimetablePrintAllSections() {
-  const { programCode } = useLayoutContext()
+  const { programCode, academicYearNumber } = useLayoutContext()
   const [params] = useSearchParams()
   const runId = params.get('runId') ?? ''
+  const yearParam = Number(params.get('year'))
+  const selectedYear = clampAcademicYearNumber(Number.isFinite(yearParam) ? yearParam : Number(academicYearNumber))
 
   const [loading, setLoading] = React.useState(false)
   const [progress, setProgress] = React.useState<{ done: number; total: number }>({ done: 0, total: 0 })
@@ -249,8 +252,13 @@ export function TimetablePrintAllSections() {
         if (cancelled) return
         setSlots(s)
 
+        const runEntriesForYear = runEntries.filter((e) => {
+          const y = parseAcademicYearFromSectionCode(e.section_code)
+          return y == null || y === selectedYear
+        })
+
         const map = new Map<string, string>()
-        for (const e of runEntries) {
+        for (const e of runEntriesForYear) {
           if (e.section_id && e.section_code) map.set(e.section_id, e.section_code)
         }
         const list = Array.from(map.entries())
@@ -292,7 +300,7 @@ export function TimetablePrintAllSections() {
     return () => {
       cancelled = true
     }
-  }, [runId])
+  }, [runId, selectedYear])
 
   React.useEffect(() => {
     if (autoPrinted) return
@@ -337,7 +345,7 @@ export function TimetablePrintAllSections() {
 
       <div className="mx-auto max-w-[1400px] px-6 py-6">
         <div className="mb-4">
-          <div className="text-lg font-semibold">{programCode} · All Sections</div>
+          <div className="text-lg font-semibold">{programCode} · Year {selectedYear} · All Sections</div>
           <div className="mt-1 text-xs text-slate-500">Run: {runId || '—'}</div>
           {loading ? (
             <div className="mt-2 text-xs text-slate-600">

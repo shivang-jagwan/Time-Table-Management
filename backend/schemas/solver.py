@@ -24,7 +24,8 @@ class GenerateGlobalTimetableRequest(BaseModel):
 
 
 class SolveTimetableRequest(GenerateTimetableRequest):
-    max_time_seconds: float = Field(default=30.0, gt=0, le=60.0)
+    max_time_seconds: float = Field(default=900.0, gt=0, le=900.0)
+    room_balance_mode: Literal["soft", "strict"] = "soft"
     relax_teacher_load_limits: bool = False
     require_optimal: bool = True
     # New: debug capacity tables and smart relaxation mode
@@ -42,7 +43,8 @@ class SolveTimetableRequest(GenerateTimetableRequest):
 
 
 class SolveGlobalTimetableRequest(GenerateGlobalTimetableRequest):
-    max_time_seconds: float = Field(default=30.0, gt=0, le=60.0)
+    max_time_seconds: float = Field(default=900.0, gt=0, le=900.0)
+    room_balance_mode: Literal["soft", "strict"] = "soft"
     relax_teacher_load_limits: bool = False
     require_optimal: bool = True
     debug_capacity_mode: bool = False

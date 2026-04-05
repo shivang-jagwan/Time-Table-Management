@@ -46,16 +46,20 @@ from solver.hybrid_initializer import generate_hybrid_hints
 from solver.initialization_engine import build_initialization_modes, generate_initial_hints
 from solver.lns_strategies import build_lns_hints, choose_lns_strategy
 from solver.objective import add_objective
+from solver.persistence import save_run_outputs_with_retry
 from solver.pre_solve_locks import apply_pre_solve_locks, check_teacher_window_feasibility, validate_pre_solve_locks
 from solver.result_writer import write_results
 from solver.variables import create_variables
+from solver.solver_analytics import initialize_analytics, finalize_analytics
+from solver.solver_calculation import initialize_calculations
+from solver.solver_logging import log_solve_start, log_solve_end
 
 logger = logging.getLogger(__name__)
 
 
 # Hard solver governance limits.
-HARD_SINGLE_SOLVE_LIMIT_SECONDS = 30.0
-HARD_TOTAL_SOLVE_LIMIT_SECONDS = 60.0
+HARD_SINGLE_SOLVE_LIMIT_SECONDS = 900.0
+HARD_TOTAL_SOLVE_LIMIT_SECONDS = 900.0
 MAX_RESTARTS = 3
 MAX_ITERATIONS = 5
 DEFAULT_NUM_SEARCH_WORKERS = 8
@@ -128,6 +132,7 @@ def solve_program_year(
     academic_year_id,
     seed: int | None,
     max_time_seconds: float,
+    room_balance_mode: str = "soft",
     enforce_teacher_load_limits: bool = True,
     require_optimal: bool = False,
     allow_extended_solve: bool = False,
@@ -151,6 +156,7 @@ def solve_program_year(
             academic_year_id=academic_year_id,
             seed=seed,
             max_time_seconds=total_budget,
+            room_balance_mode=room_balance_mode,
             enforce_teacher_load_limits=enforce_teacher_load_limits,
             require_optimal=require_optimal,
             allow_extended_solve=allow_extended_solve,
@@ -167,6 +173,7 @@ def solve_program_year(
         academic_year_id=academic_year_id,
         base_seed=seed,
         max_time_seconds=total_budget,
+        room_balance_mode=room_balance_mode,
         enforce_teacher_load_limits=enforce_teacher_load_limits,
         require_optimal=require_optimal,
         allow_extended_solve=allow_extended_solve,
@@ -187,6 +194,7 @@ def solve_program_global(
     program_id,
     seed: int | None,
     max_time_seconds: float,
+    room_balance_mode: str = "soft",
     enforce_teacher_load_limits: bool = True,
     require_optimal: bool = False,
     allow_extended_solve: bool = False,
@@ -197,31 +205,30 @@ def solve_program_global(
     lns_iterations: int = 0,
     lns_keep_fraction: float = 0.7,
 ) -> SolveResult:
-    """Program-wide solve across all academic years via decomposed batches.
-
-    Phase-1 scalable architecture: partition by academic year, solve incrementally,
-    and carry teacher slot usage globally across partitions.
-    """
+    """Program-wide solve across all academic years in one monolithic model."""
     total_budget = _cap_total_budget_seconds(max_time_seconds)
     deadline_monotonic = time.monotonic() + total_budget
-    bounded_restarts = min(MAX_RESTARTS, max(1, int(multi_seed_restarts or 1)))
-    bounded_lns_iterations = min(MAX_ITERATIONS, max(0, int(lns_iterations or 0)))
-
-    return _solve_program_global_decomposed(
+    return _solve_program(
         db,
         run=run,
         program_id=program_id,
+        academic_year_id=None,
+        section_id_subset=None,
         seed=seed,
         max_time_seconds=total_budget,
+        room_balance_mode=room_balance_mode,
         enforce_teacher_load_limits=enforce_teacher_load_limits,
         require_optimal=require_optimal,
         allow_extended_solve=allow_extended_solve,
+        clear_existing_entries=True,
+        external_teacher_blocked_slot_ids=None,
         hybrid_init_enabled=hybrid_init_enabled,
         hybrid_population_size=hybrid_population_size,
         hybrid_generations=hybrid_generations,
-        multi_seed_restarts=bounded_restarts,
-        lns_iterations=bounded_lns_iterations,
-        lns_keep_fraction=lns_keep_fraction,
+        hints=None,
+        initialization_mode="heuristic",
+        persist_results=True,
+        suppress_terminal_status_update=False,
         solve_deadline_monotonic=deadline_monotonic,
     )
 
@@ -238,6 +245,23 @@ def _collect_teacher_schedule_map_for_run(
     for teacher_id, slot_id in db.execute(q).all():
         schedule[teacher_id].add(slot_id)
     return schedule
+
+
+def _collect_room_slot_map_for_run(
+    db: Session,
+    *,
+    run_id,
+    tenant_id,
+) -> dict[Any, set[Any]]:
+    room_map: dict[Any, set[Any]] = defaultdict(set)
+    q = select(TimetableEntry.slot_id, TimetableEntry.room_id).where(
+        TimetableEntry.run_id == run_id,
+        TimetableEntry.room_id.is_not(None),
+    )
+    q = where_tenant(q, TimetableEntry, tenant_id)
+    for slot_id, room_id in db.execute(q).all():
+        room_map[slot_id].add(room_id)
+    return room_map
 
 
 def _collect_conflict_ids_for_run(
@@ -366,6 +390,7 @@ def _solve_program_global_decomposed(
         )
 
     teacher_schedule_map: dict[Any, set[Any]] = defaultdict(set)
+    room_slot_map: dict[Any, set[Any]] = defaultdict(set)
     combined_conflicts: list[TimetableConflict] = []
     total_entries_written = 0
     total_warnings: list[str] = []
@@ -447,6 +472,7 @@ def _solve_program_global_decomposed(
             allow_extended_solve=allow_extended_solve,
             clear_existing_entries=(idx == 0),
             external_teacher_blocked_slot_ids=teacher_schedule_map,
+            external_room_occupied_slot_ids=room_slot_map,
             hybrid_init_enabled=hybrid_init_enabled,
             hybrid_population_size=hybrid_population_size,
             hybrid_generations=hybrid_generations,
@@ -462,8 +488,16 @@ def _solve_program_global_decomposed(
         total_warnings.extend(result.warnings)
         total_entries_written += int(result.entries_written)
 
+
         # Refresh global teacher usage from what has been persisted so far.
         teacher_schedule_map = _collect_teacher_schedule_map_for_run(
+            db,
+            run_id=run.id,
+            tenant_id=tenant_id,
+        )
+
+        # Refresh global room occupancy from what has been persisted so far.
+        room_slot_map = _collect_room_slot_map_for_run(
             db,
             run_id=run.id,
             tenant_id=tenant_id,
@@ -515,6 +549,11 @@ def _solve_program_global_decomposed(
                     break
 
                 teacher_schedule_map = _collect_teacher_schedule_map_for_run(
+                    db,
+                    run_id=run.id,
+                    tenant_id=tenant_id,
+                )
+                room_slot_map = _collect_room_slot_map_for_run(
                     db,
                     run_id=run.id,
                     tenant_id=tenant_id,
@@ -581,6 +620,7 @@ def _solve_program_global_decomposed(
                         allow_extended_solve=allow_extended_solve,
                         clear_existing_entries=False,
                         external_teacher_blocked_slot_ids=teacher_schedule_map,
+                        external_room_occupied_slot_ids=room_slot_map,
                         hybrid_init_enabled=hybrid_init_enabled,
                         hybrid_population_size=hybrid_population_size,
                         hybrid_generations=hybrid_generations,
@@ -597,6 +637,11 @@ def _solve_program_global_decomposed(
                     total_entries_written += int(replay_result.entries_written)
 
                     teacher_schedule_map = _collect_teacher_schedule_map_for_run(
+                        db,
+                        run_id=run.id,
+                        tenant_id=tenant_id,
+                    )
+                    room_slot_map = _collect_room_slot_map_for_run(
                         db,
                         run_id=run.id,
                         tenant_id=tenant_id,
@@ -1099,6 +1144,7 @@ def _solve_program_with_restarts(
     academic_year_id,
     base_seed: int | None,
     max_time_seconds: float,
+    room_balance_mode: str = "soft",
     enforce_teacher_load_limits: bool,
     require_optimal: bool,
     allow_extended_solve: bool,
@@ -1190,6 +1236,7 @@ def _solve_program_with_restarts(
             academic_year_id=academic_year_id,
             seed=candidate_seed,
             max_time_seconds=candidate_budget,
+            room_balance_mode=room_balance_mode,
             enforce_teacher_load_limits=enforce_teacher_load_limits,
             require_optimal=require_optimal,
             allow_extended_solve=False,
@@ -1241,6 +1288,7 @@ def _solve_program_with_restarts(
             academic_year_id=academic_year_id,
             seed=base_seed,
             max_time_seconds=fallback_budget,
+            room_balance_mode=room_balance_mode,
             enforce_teacher_load_limits=enforce_teacher_load_limits,
             require_optimal=require_optimal,
             allow_extended_solve=allow_extended_solve,
@@ -1296,6 +1344,7 @@ def _solve_program_with_restarts(
             academic_year_id=academic_year_id,
             seed=best_seed + lns_idx + 1,
             max_time_seconds=lns_budget,
+            room_balance_mode=room_balance_mode,
             enforce_teacher_load_limits=enforce_teacher_load_limits,
             require_optimal=require_optimal,
             allow_extended_solve=False,
@@ -1414,6 +1463,7 @@ def _solve_program_with_restarts(
         academic_year_id=academic_year_id,
         seed=best_seed,
         max_time_seconds=final_budget,
+        room_balance_mode=room_balance_mode,
         enforce_teacher_load_limits=enforce_teacher_load_limits,
         require_optimal=require_optimal,
         allow_extended_solve=allow_extended_solve,
@@ -1509,9 +1559,14 @@ def _timeout_result(
         try:
             run.status = "ERROR"
             run.notes = str(message)[:500]
-            db.add(conflict)
-            db.add(run)
-            db.commit()
+            save_run_outputs_with_retry(
+                db,
+                run=run,
+                tenant_id=tenant_id,
+                entries=[],
+                conflicts=[conflict],
+                clear_existing_entries=False,
+            )
             return SolveResult(
                 status="ERROR",
                 entries_written=0,
@@ -1519,10 +1574,7 @@ def _timeout_result(
                 message=message,
             )
         except Exception:
-            try:
-                db.rollback()
-            except Exception:
-                pass
+            pass
 
     return SolveResult(
         status="ERROR",
@@ -1541,11 +1593,13 @@ def _solve_program(
     section_id_subset: set[Any] | None = None,
     seed: int | None,
     max_time_seconds: float,
+    room_balance_mode: str = "soft",
     enforce_teacher_load_limits: bool,
     require_optimal: bool,
     allow_extended_solve: bool = False,
     clear_existing_entries: bool = True,
     external_teacher_blocked_slot_ids: dict[Any, set[Any]] | None = None,
+    external_room_occupied_slot_ids: dict[Any, set[Any]] | None = None,
     hybrid_init_enabled: bool = False,
     hybrid_population_size: int = 24,
     hybrid_generations: int = 20,
@@ -1561,6 +1615,9 @@ def _solve_program(
         max_time_seconds,
         deadline_monotonic=solve_deadline_monotonic,
     )
+    normalized_room_balance_mode = str(room_balance_mode or "soft").strip().lower()
+    if normalized_room_balance_mode not in {"soft", "strict"}:
+        normalized_room_balance_mode = "soft"
     if effective_budget < MIN_BUDGET_SLICE_SECONDS:
         return _timeout_result(
             db=db,
@@ -1584,6 +1641,7 @@ def _solve_program(
         section_id_subset=section_id_subset,
         seed=seed,
         max_time_seconds=effective_budget,
+        room_balance_mode=normalized_room_balance_mode,
         enforce_teacher_load_limits=enforce_teacher_load_limits,
         require_optimal=require_optimal,
         tenant_id=tenant_id,
@@ -1617,6 +1675,18 @@ def _solve_program(
     #     Must run AFTER apply_pre_solve_locks so teacher_disallowed_slot_ids
     #     is fully populated.  Variables step reads these lists directly.
     build_pruned_slots(ctx)
+
+    # 3b-I. OBSERVABILITY: Initialize analytics and pre-solve calculations
+    initialize_analytics(ctx)
+    initialize_calculations(ctx)
+    log_solve_start(
+        program_id=str(program_id),
+        sections_count=len(ctx.sections),
+        subjects_count=len(ctx.subjects),
+        teachers_count=len(ctx.teachers),
+        slots_count=len(ctx.slots),
+        rooms_count=len(ctx.rooms_all),
+    )
 
     # 3b-II. PHASE 7: Validate domain reduction effectiveness and warn on
     #         likely infeasibility indicators (empty slot sets, no compatible rooms).
@@ -1654,6 +1724,19 @@ def _solve_program(
             metadata={"phase": "create_variables"},
         )
     create_variables(ctx)
+
+    # Seed room occupancy carried from prior decomposed batches into the
+    # locked room usage map used by room-slot uniqueness constraints.
+    if external_room_occupied_slot_ids:
+        for slot_id, room_ids in external_room_occupied_slot_ids.items():
+            for room_id in room_ids or set():
+                room = ctx.room_by_id.get(room_id)
+                if room is not None and bool(getattr(room, "is_special", False)):
+                    continue
+                key = (room_id, slot_id)
+                existing = int(ctx.locked_room_usage_by_room_slot.get(key, 0) or 0)
+                if existing < 1:
+                    ctx.locked_room_usage_by_room_slot[key] = 1
 
     # 5. Add constraints
     if _is_deadline_exceeded(solve_deadline_monotonic):
@@ -1960,6 +2043,12 @@ def _solve_program(
         hints_out = _extract_solution_hints(ctx, solver)
         lns_feedback = _build_lns_feedback(ctx, hints_out, solver, deadline_monotonic=solve_deadline_monotonic)
 
+        # 9a. OBSERVABILITY: Finalize analytics for timeout/infeasible cases
+        analytics = finalize_analytics(ctx, None)
+        if analytics:
+            run.analytics_dict = analytics.as_dict()
+            db.commit()  # Commit the analytics update
+
         return SolveResult(
             status="OPTIMAL" if status == cp_model.OPTIMAL else "FEASIBLE",
             entries_written=0,
@@ -1976,13 +2065,28 @@ def _solve_program(
         )
 
     # 10. Write results
-    return write_results(
+    result = write_results(
         ctx,
         solver,
         status,
         clear_existing_entries=clear_existing_entries,
         suppress_terminal_status_update=suppress_terminal_status_update,
     )
+    
+    # 10b. OBSERVABILITY: Finalize analytics for successful solves and store
+    analytics = finalize_analytics(ctx, result)
+    if analytics:
+        run.analytics_dict = analytics.as_dict()
+        db.commit()  # Commit the analytics update
+    
+    log_solve_end(
+        status=result.status,
+        entries_written=result.entries_written,
+        solve_time_seconds=result.solve_time_seconds or 0.0,
+        objective_value=result.objective_score,
+    )
+    
+    return result
 
 
 def _add_search_hints(ctx: SolverContext) -> None:
@@ -2012,7 +2116,7 @@ def _add_search_hints(ctx: SolverContext) -> None:
     if hint_vars:
         ctx.model.AddDecisionStrategy(
             hint_vars,
-            cp_model.CHOOSE_FIRST,          # pick first unassigned var
+            cp_model.CHOOSE_MIN_DOMAIN_SIZE,  # pick most constrained unassigned var first
             cp_model.SELECT_MAX_VALUE,       # try value 1 first (commit)
         )
 
@@ -2129,8 +2233,14 @@ def _handle_infeasible(
         },
     )
     if persist_results:
-        ctx.db.add(conflict)
-        ctx.db.commit()
+        save_run_outputs_with_retry(
+            ctx.db,
+            run=run,
+            tenant_id=tenant_id,
+            entries=[],
+            conflicts=[conflict],
+            clear_existing_entries=False,
+        )
         return SolveResult(
             status=str(run.status),
             entries_written=0,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 import logging
+from collections import defaultdict
 
 from datetime import datetime, timedelta
 
@@ -29,6 +30,7 @@ from models.section_time_window import SectionTimeWindow
 from models.special_allotment import SpecialAllotment
 from models.subject import Subject
 from models.subject_allowed_room import SubjectAllowedRoom
+from models.room import Room
 from models.teacher import Teacher
 from models.teacher_subject_section import TeacherSubjectSection
 from models.time_slot import TimeSlot
@@ -59,6 +61,10 @@ from schemas.admin import (
     SetDefaultSectionWindowsRequest,
     SetTeacherSubjectSectionsRequest,
     TeacherSubjectSectionAssignmentRow,
+    AutoAssignTeacherLoadRequest,
+    AutoAssignTeacherLoadResponse,
+    AutoAssignTeacherLoadSummary,
+    AutoAssignTeacherLoadTeacherOut,
     UpdateElectiveBlockRequest,
     UpsertElectiveBlockSubjectRequest,
 )
@@ -928,6 +934,442 @@ def set_teacher_subject_sections(
         raise HTTPException(status_code=409, detail="SECTION_SUBJECT_ALREADY_ASSIGNED")
 
     return AdminActionResult(ok=True, created=created, updated=updated, message="Updated strict assignments.")
+
+
+@router.post("/auto-assign-teacher-load", response_model=AutoAssignTeacherLoadResponse)
+def auto_assign_teacher_load(
+    payload: AutoAssignTeacherLoadRequest,
+    _admin=Depends(require_admin),
+    db: Session = Depends(get_db),
+    tenant_id: uuid.UUID | None = Depends(get_tenant_id),
+):
+    """Auto-assign strict (section, subject) teacher mapping with balanced load.
+
+    Strategy:
+    1) Build section demand from section_subjects (fallback: mandatory track_subjects).
+    2) Resolve required sessions from sessions_override -> curriculum_subjects -> subjects.
+    3) Assign each demand item greedily to the least-loaded eligible teacher.
+    4) Spread load across weekdays and apply a global room-aware day capacity soft signal.
+    5) Persist assignments in teacher_subject_sections with strict one-active-per-pair behavior.
+    """
+
+    program = _get_program(db, payload.program_code.strip(), tenant_id=tenant_id)
+    year = _get_academic_year(db, int(payload.academic_year_number), tenant_id=tenant_id)
+
+    sections = (
+        db.execute(
+            where_tenant(
+                select(Section)
+                .where(Section.program_id == program.id)
+                .where(Section.academic_year_id == year.id)
+                .where(Section.is_active.is_(True)),
+                Section,
+                tenant_id,
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not sections:
+        raise HTTPException(status_code=404, detail="NO_ACTIVE_SECTIONS")
+
+    subjects = (
+        db.execute(
+            where_tenant(
+                select(Subject)
+                .where(Subject.program_id == program.id)
+                .where(Subject.academic_year_id == year.id)
+                .where(Subject.is_active.is_(True)),
+                Subject,
+                tenant_id,
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not subjects:
+        raise HTTPException(status_code=404, detail="NO_ACTIVE_SUBJECTS")
+
+    teachers_all = (
+        db.execute(
+            where_tenant(select(Teacher).where(Teacher.is_active.is_(True)), Teacher, tenant_id)
+        )
+        .scalars()
+        .all()
+    )
+
+    weekday_numbers = [0, 1, 2, 3, 4]
+    weekday_names = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri"}
+
+    teacher_by_id = {t.id: t for t in teachers_all}
+    subject_by_id = {s.id: s for s in subjects}
+    section_by_id = {s.id: s for s in sections}
+    subject_ids = set(subject_by_id.keys())
+    section_ids = set(section_by_id.keys())
+
+    teacher_available_days: dict[uuid.UUID, list[int]] = {}
+    teacher_cap_weekly: dict[uuid.UUID, int] = {}
+    teacher_cap_daily: dict[uuid.UUID, int] = {}
+    for t in teachers_all:
+        days = [d for d in weekday_numbers if int(getattr(t, "weekly_off_day", -1) or -1) != d]
+        cap_week = int(getattr(t, "max_per_week", 0) or 0)
+        cap_day = int(getattr(t, "max_per_day", 0) or 0)
+        if not days or cap_week <= 0 or cap_day <= 0:
+            continue
+        teacher_available_days[t.id] = days
+        teacher_cap_weekly[t.id] = cap_week
+        teacher_cap_daily[t.id] = cap_day
+
+    if not teacher_available_days:
+        raise HTTPException(status_code=422, detail="NO_AVAILABLE_TEACHERS")
+
+    section_subject_rows = db.execute(
+        where_tenant(
+            select(SectionSubject.section_id, SectionSubject.subject_id).where(
+                SectionSubject.section_id.in_(list(section_ids))
+            ),
+            SectionSubject,
+            tenant_id,
+        )
+    ).all()
+    section_subjects_by_section: dict[uuid.UUID, list[uuid.UUID]] = defaultdict(list)
+    for sid, subj_id in section_subject_rows:
+        if sid in section_ids and subj_id in subject_ids:
+            section_subjects_by_section[sid].append(subj_id)
+
+    track_rows = (
+        db.execute(
+            where_tenant(
+                select(TrackSubject)
+                .where(TrackSubject.program_id == program.id)
+                .where(TrackSubject.academic_year_id == year.id),
+                TrackSubject,
+                tenant_id,
+            )
+        )
+        .scalars()
+        .all()
+    )
+    mandatory_track_rows: dict[str, list[TrackSubject]] = defaultdict(list)
+    for row in track_rows:
+        if not bool(getattr(row, "is_elective", False)):
+            mandatory_track_rows[str(getattr(row, "track", "CORE") or "CORE")].append(row)
+
+    curriculum_rows = (
+        db.execute(
+            where_tenant(
+                select(CurriculumSubject)
+                .where(CurriculumSubject.program_id == program.id)
+                .where(CurriculumSubject.academic_year_id == year.id),
+                CurriculumSubject,
+                tenant_id,
+            )
+        )
+        .scalars()
+        .all()
+    )
+    curriculum_by_track_subject: dict[tuple[str, uuid.UUID], CurriculumSubject] = {}
+    curriculum_by_subject_id: dict[uuid.UUID, CurriculumSubject] = {}
+    for cs in curriculum_rows:
+        track = str(getattr(cs, "track", "CORE") or "CORE")
+        curriculum_by_track_subject[(track, cs.subject_id)] = cs
+        if track == "CORE" or cs.subject_id not in curriculum_by_subject_id:
+            curriculum_by_subject_id[cs.subject_id] = cs
+
+    def _resolve_sessions(subject_id: uuid.UUID, *, track: str, override: int | None) -> int:
+        if override is not None:
+            return max(0, int(override))
+        cs = curriculum_by_track_subject.get((track, subject_id))
+        if cs is None and track != "CORE":
+            cs = curriculum_by_track_subject.get(("CORE", subject_id))
+        if cs is None:
+            cs = curriculum_by_subject_id.get(subject_id)
+        if cs is not None:
+            return max(0, int(getattr(cs, "sessions_per_week", 0) or 0))
+        subj = subject_by_id.get(subject_id)
+        return max(0, int(getattr(subj, "sessions_per_week", 0) or 0)) if subj is not None else 0
+
+    # Section-block subjects should be excluded from strict non-block assignment demand.
+    section_block_rows = db.execute(
+        where_tenant(
+            select(SectionElectiveBlock.section_id, SectionElectiveBlock.block_id)
+            .where(SectionElectiveBlock.section_id.in_(list(section_ids))),
+            SectionElectiveBlock,
+            tenant_id,
+        )
+    ).all()
+    block_ids = sorted({bid for _sid, bid in section_block_rows})
+    block_subject_ids_by_block: dict[uuid.UUID, set[uuid.UUID]] = defaultdict(set)
+    if block_ids:
+        block_subj_rows = db.execute(
+            where_tenant(
+                select(ElectiveBlockSubject.block_id, ElectiveBlockSubject.subject_id)
+                .where(ElectiveBlockSubject.block_id.in_(block_ids)),
+                ElectiveBlockSubject,
+                tenant_id,
+            )
+        ).all()
+        for bid, subj_id in block_subj_rows:
+            block_subject_ids_by_block[bid].add(subj_id)
+    blocked_subjects_by_section: dict[uuid.UUID, set[uuid.UUID]] = defaultdict(set)
+    for sid, bid in section_block_rows:
+        blocked_subjects_by_section[sid].update(block_subject_ids_by_block.get(bid, set()))
+
+    # Build demand by (section, subject) -> weekly sessions.
+    demand_sessions: dict[tuple[uuid.UUID, uuid.UUID], int] = {}
+    for sec in sections:
+        sec_track = str(getattr(sec, "track", "CORE") or "CORE")
+        mapped = section_subjects_by_section.get(sec.id, [])
+        if mapped:
+            for subj_id in mapped:
+                if subj_id in blocked_subjects_by_section.get(sec.id, set()):
+                    continue
+                sessions = _resolve_sessions(subj_id, track=sec_track, override=None)
+                if sessions > 0:
+                    demand_sessions[(sec.id, subj_id)] = sessions
+            continue
+
+        for ts in mandatory_track_rows.get(sec_track, []):
+            subj_id = ts.subject_id
+            if subj_id in blocked_subjects_by_section.get(sec.id, set()):
+                continue
+            sessions = _resolve_sessions(
+                subj_id,
+                track=sec_track,
+                override=getattr(ts, "sessions_override", None),
+            )
+            if sessions > 0:
+                demand_sessions[(sec.id, subj_id)] = sessions
+
+    if not demand_sessions:
+        return AutoAssignTeacherLoadResponse(
+            status="success",
+            summary=AutoAssignTeacherLoadSummary(max_load=0, min_load=0, avg_load=0.0),
+            teachers=[],
+            assignments_created=0,
+            assignments_updated=0,
+            message="No demand found for current program/year.",
+        )
+
+    # Subject eligibility derived from active strict assignments (current data),
+    # with fallback to all available teachers when no prior mapping exists.
+    tss_rows = db.execute(
+        where_tenant(
+            select(TeacherSubjectSection.subject_id, TeacherSubjectSection.teacher_id)
+            .where(TeacherSubjectSection.is_active.is_(True))
+            .where(TeacherSubjectSection.subject_id.in_(list(subject_ids))),
+            TeacherSubjectSection,
+            tenant_id,
+        )
+    ).all()
+    eligible_teachers_by_subject: dict[uuid.UUID, set[uuid.UUID]] = defaultdict(set)
+    for subj_id, tid in tss_rows:
+        if tid in teacher_available_days:
+            eligible_teachers_by_subject[subj_id].add(tid)
+
+    all_available_teacher_ids = sorted(teacher_available_days.keys(), key=lambda t: str(t))
+
+    # Room-aware daily soft capacity signal.
+    rooms = (
+        db.execute(
+            where_tenant(
+                select(Room)
+                .where(Room.is_active.is_(True))
+                .where(Room.is_special.is_(False)),
+                Room,
+                tenant_id,
+            )
+        )
+        .scalars()
+        .all()
+    )
+    room_parallel_cap = min(int(payload.max_parallel_rooms), max(1, len(rooms)))
+
+    weekday_slot_rows = db.execute(
+        where_tenant(
+            select(TimeSlot.day_of_week, TimeSlot.slot_index)
+            .where(TimeSlot.day_of_week.in_(weekday_numbers))
+            .where(TimeSlot.is_lunch_break.is_(False)),
+            TimeSlot,
+            tenant_id,
+        )
+    ).all()
+    slots_per_day_map: dict[int, set[int]] = defaultdict(set)
+    for d, idx in weekday_slot_rows:
+        slots_per_day_map[int(d)].add(int(idx))
+    slots_per_day = max([len(v) for v in slots_per_day_map.values()] or [8])
+    global_daily_capacity = max(1, room_parallel_cap * slots_per_day)
+
+    teacher_weekly_load: dict[uuid.UUID, int] = {tid: 0 for tid in teacher_available_days.keys()}
+    teacher_daily_load: dict[uuid.UUID, dict[int, int]] = {
+        tid: {d: 0 for d in weekday_numbers} for tid in teacher_available_days.keys()
+    }
+    teacher_subject_codes: dict[uuid.UUID, set[str]] = defaultdict(set)
+    global_daily_load: dict[int, int] = {d: 0 for d in weekday_numbers}
+
+    chosen_teacher_by_pair: dict[tuple[uuid.UUID, uuid.UUID], uuid.UUID] = {}
+    unresolved_pairs: list[tuple[uuid.UUID, uuid.UUID]] = []
+
+    sorted_demands = sorted(
+        demand_sessions.items(),
+        key=lambda kv: (
+            -int(kv[1]),
+            (section_by_id.get(kv[0][0]).code if section_by_id.get(kv[0][0]) else ""),
+            (subject_by_id.get(kv[0][1]).code if subject_by_id.get(kv[0][1]) else ""),
+        ),
+    )
+
+    for (section_id, subject_id), sessions in sorted_demands:
+        eligible = sorted(
+            list(eligible_teachers_by_subject.get(subject_id) or set()),
+            key=lambda tid: str(tid),
+        )
+        if not eligible:
+            eligible = all_available_teacher_ids
+
+        best_choice: tuple | None = None
+        for tid in eligible:
+            days = teacher_available_days.get(tid, [])
+            if not days:
+                continue
+
+            best_day = min(
+                days,
+                key=lambda d: (
+                    teacher_daily_load[tid][d],
+                    global_daily_load[d],
+                    d,
+                ),
+            )
+
+            projected_week = teacher_weekly_load[tid] + sessions
+            projected_day = teacher_daily_load[tid][best_day] + sessions
+            weekly_over = max(0, projected_week - teacher_cap_weekly[tid])
+            daily_over = max(0, projected_day - teacher_cap_daily[tid])
+            global_over = max(0, (global_daily_load[best_day] + sessions) - global_daily_capacity)
+
+            score = (
+                1 if (weekly_over > 0 or daily_over > 0) else 0,
+                weekly_over + daily_over,
+                global_over,
+                projected_week,
+                projected_day,
+                teacher_weekly_load[tid],
+                str(tid),
+            )
+            if best_choice is None or score < best_choice[0]:
+                best_choice = (score, tid, best_day)
+
+        if best_choice is None:
+            unresolved_pairs.append((section_id, subject_id))
+            continue
+
+        _score, teacher_id, chosen_day = best_choice
+        chosen_teacher_by_pair[(section_id, subject_id)] = teacher_id
+        teacher_weekly_load[teacher_id] += sessions
+        teacher_daily_load[teacher_id][chosen_day] += sessions
+        global_daily_load[chosen_day] += sessions
+
+        subj = subject_by_id.get(subject_id)
+        if subj is not None:
+            teacher_subject_codes[teacher_id].add(str(getattr(subj, "code", "")))
+
+    created = 0
+    updated = 0
+    dry_run = bool(getattr(payload, "dry_run", False))
+
+    for (section_id, subject_id), teacher_id in chosen_teacher_by_pair.items():
+        existing_rows = (
+            db.execute(
+                where_tenant(
+                    select(TeacherSubjectSection)
+                    .where(TeacherSubjectSection.section_id == section_id)
+                    .where(TeacherSubjectSection.subject_id == subject_id),
+                    TeacherSubjectSection,
+                    tenant_id,
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        target_row = None
+        for row in existing_rows:
+            if row.teacher_id == teacher_id:
+                target_row = row
+                break
+
+        if target_row is None:
+            created += 1
+            if not dry_run:
+                db.add(
+                    TeacherSubjectSection(
+                        tenant_id=tenant_id,
+                        teacher_id=teacher_id,
+                        subject_id=subject_id,
+                        section_id=section_id,
+                        is_active=True,
+                    )
+                )
+        elif not target_row.is_active:
+            updated += 1
+            if not dry_run:
+                target_row.is_active = True
+
+        for row in existing_rows:
+            if row.teacher_id != teacher_id and row.is_active:
+                updated += 1
+                if not dry_run:
+                    row.is_active = False
+
+    if not dry_run:
+        db.commit()
+
+    active_teacher_ids = [tid for tid, v in teacher_weekly_load.items() if int(v) > 0]
+    load_values = [teacher_weekly_load[tid] for tid in active_teacher_ids]
+    if not load_values:
+        load_values = [0]
+    avg_load = float(sum(load_values)) / float(len(load_values))
+
+    teacher_out: list[AutoAssignTeacherLoadTeacherOut] = []
+    for tid in sorted(active_teacher_ids, key=lambda x: (-teacher_weekly_load[x], str(x))):
+        teacher = teacher_by_id.get(tid)
+        if teacher is None:
+            continue
+        teacher_out.append(
+            AutoAssignTeacherLoadTeacherOut(
+                teacher_id=tid,
+                teacher_code=str(getattr(teacher, "code", "") or ""),
+                teacher_name=str(getattr(teacher, "full_name", "") or ""),
+                assigned_subjects=sorted([c for c in teacher_subject_codes.get(tid, set()) if c]),
+                weekly_load=int(teacher_weekly_load.get(tid, 0)),
+                daily_distribution={
+                    weekday_names[d]: int(teacher_daily_load.get(tid, {}).get(d, 0))
+                    for d in weekday_numbers
+                },
+            )
+        )
+
+    message = None
+    if unresolved_pairs:
+        message = f"{len(unresolved_pairs)} section-subject pairs could not be assigned due to teacher availability constraints."
+    if dry_run:
+        preview_msg = "Preview only: no assignments were persisted."
+        message = f"{preview_msg} {message}" if message else preview_msg
+
+    return AutoAssignTeacherLoadResponse(
+        status="success",
+        dry_run=dry_run,
+        summary=AutoAssignTeacherLoadSummary(
+            max_load=max(load_values),
+            min_load=min(load_values),
+            avg_load=round(avg_load, 2),
+        ),
+        teachers=teacher_out,
+        assignments_created=created,
+        assignments_updated=updated,
+        message=message,
+    )
 
 
 def _ensure_teacher_subject_sections(

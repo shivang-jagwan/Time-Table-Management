@@ -150,6 +150,47 @@ export async function setTeacherSubjectSections(payload: {
   })
 }
 
+export type AutoAssignTeacherLoadSummary = {
+  max_load: number
+  min_load: number
+  avg_load: number
+}
+
+export type AutoAssignTeacherLoadTeacher = {
+  teacher_id: string
+  teacher_code: string
+  teacher_name: string
+  assigned_subjects: string[]
+  weekly_load: number
+  daily_distribution: Record<string, number>
+}
+
+export type AutoAssignTeacherLoadResponse = {
+  status: 'success' | string
+  dry_run?: boolean
+  summary: AutoAssignTeacherLoadSummary
+  teachers: AutoAssignTeacherLoadTeacher[]
+  assignments_created: number
+  assignments_updated: number
+  message?: string | null
+}
+
+export async function autoAssignTeacherLoad(payload: {
+  program_code: string
+  academic_year_number: number
+  max_parallel_rooms?: number
+  dry_run?: boolean
+}): Promise<AutoAssignTeacherLoadResponse> {
+  return apiFetch<AutoAssignTeacherLoadResponse>('/api/admin/auto-assign-teacher-load', {
+    method: 'POST',
+    body: JSON.stringify({
+      ...payload,
+      max_parallel_rooms: payload.max_parallel_rooms ?? 26,
+      dry_run: Boolean(payload.dry_run),
+    }),
+  })
+}
+
 export type CombinedSubjectGroupSectionOut = {
   section_id: string
   section_code: string

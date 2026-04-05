@@ -9,7 +9,7 @@ This module provides a last-resort timetable generation strategy that:
 6. Ignores all soft constraints and preferences
 
 Used when CP-SAT returns INFEASIBLE or UNKNOWN after all attempts.
-Output is marked as FEASIBLE_GREEDY_FALLBACK for user awareness.
+Output is marked as FEASIBLE with a GREEDY_FALLBACK_INVOKED warning for user awareness.
 
 PHASE 10: Added deadline awareness - greedy solver respects time limits and terminates
 gracefully if running out of time, producing partial timetables if needed.
@@ -22,11 +22,10 @@ import time
 from collections import defaultdict
 from typing import Any
 
-from sqlalchemy import delete
-from api.tenant import where_tenant
 from models.timetable_entry import TimetableEntry
 from models.timetable_conflict import TimetableConflict
 from solver.context import SolverContext, SolveResult
+from solver.persistence import save_run_outputs_with_retry
 from solver.room_assigner import pick_room, pick_room_for_block, assert_entry_invariants
 
 logger = logging.getLogger(__name__)
@@ -58,16 +57,8 @@ def greedy_fallback_solver(ctx: SolverContext) -> SolveResult:
     db = ctx.db
     run = ctx.run
     tenant_id = ctx.tenant_id
-    
-    # Clear previous entries (except pre-locked special/fixed entries)
-    stmt = delete(TimetableEntry).where(TimetableEntry.run_id == run.id)
-    stmt = where_tenant(stmt, TimetableEntry, tenant_id)
-    db.execute(stmt)
-    
-    # Re-load pre-locked entries (special allotments + fixed entries)
-    prelock_entries_0 = {(e[0], e[1], e[4]) for e in ctx.special_entries_to_write}  # (sec, subj, slot)
-    prelock_entries_1 = {(e[0], e[1], e[4]) for e in ctx.fixed_entries_to_write}     # (sec, subj, slot)
-    prelock_entries = prelock_entries_0 | prelock_entries_1
+    pending_entries: list[TimetableEntry] = []
+    pending_conflicts: list[TimetableConflict] = []
     
     # Track occupancy for hard constraint checking
     teacher_slot_usage: dict[tuple[Any, Any], int] = defaultdict(int)
@@ -166,8 +157,21 @@ def greedy_fallback_solver(ctx: SolverContext) -> SolveResult:
                         continue
                     
                     # Try to assign room for the entire block
+
                     room_id, _ = pick_room_for_block(ctx, block_slot_ids, subject_id=subj_id)
                     if room_id is None:
+                        logger.warning(
+                            "Greedy: no LAB room available for section=%s subject=%s at slots=%s. Skipping session %d/%d.",
+                            section_id, subj_id, block_slot_ids, sessions_assigned + 1, sessions_needed,
+                        )
+                        pending_conflicts.append(TimetableConflict(
+                            tenant_id=tenant_id,
+                            run_id=run.id,
+                            severity="WARN",
+                            conflict_type="ROOM_UNAVAILABLE",
+                            message=f"No LAB room available at slots {block_slot_ids}",
+                            metadata_json={"section_id": str(section_id), "subject_id": str(subj_id)},
+                        ))
                         continue
                     
                     # SUCCESS: Create entries for all slots in the block
@@ -184,7 +188,7 @@ def greedy_fallback_solver(ctx: SolverContext) -> SolveResult:
                                 slot_id=bid,
                             )
                             assert_entry_invariants(ctx, entry)
-                            db.add(entry)
+                            pending_entries.append(entry)
                             entries_written += 1
                             section_slot_usage[(section_id, bid)] += 1
                             teacher_slot_usage[(teacher_id, bid)] += 1
@@ -218,8 +222,21 @@ def greedy_fallback_solver(ctx: SolverContext) -> SolveResult:
                         continue
                     
                     # Try to assign a room
+
                     room_id, _ = pick_room(ctx, slot_id, str(subject.subject_type), section_id, subj_id)
                     if room_id is None:
+                        logger.warning(
+                            "Greedy: no %s room available for section=%s subject=%s at slot=%s. Skipping session %d/%d.",
+                            str(subject.subject_type), section_id, subj_id, slot_id, sessions_assigned + 1, sessions_needed,
+                        )
+                        pending_conflicts.append(TimetableConflict(
+                            tenant_id=tenant_id,
+                            run_id=run.id,
+                            severity="WARN",
+                            conflict_type="ROOM_UNAVAILABLE",
+                            message=f"No {subject.subject_type} room available at slot {slot_id}",
+                            metadata_json={"section_id": str(section_id), "subject_id": str(subj_id)},
+                        ))
                         continue
                     
                     # SUCCESS: Create and persist entry
@@ -235,7 +252,7 @@ def greedy_fallback_solver(ctx: SolverContext) -> SolveResult:
                             slot_id=slot_id,
                         )
                         assert_entry_invariants(ctx, entry)
-                        db.add(entry)
+                        pending_entries.append(entry)
                         entries_written += 1
                     except Exception as e:
                         logger.warning(f"Failed to create THEORY entry for {section_id}/{subj_id}: {e}")
@@ -256,14 +273,16 @@ def greedy_fallback_solver(ctx: SolverContext) -> SolveResult:
     logger.info(f"Greedy fallback generated {entries_written} entries")
     
     # Update run status
-    run.status = "FEASIBLE_GREEDY_FALLBACK"
+    # run_status enum does not include a dedicated greedy fallback value.
+    # Persist as FEASIBLE and expose fallback mode via warnings/solver_stats.
+    run.status = "FEASIBLE"
     run.solver_version = "greedy-fallback-v2-lab-aware"
     run.solve_time_seconds = 0.0
     run.total_variables = 0
     run.objective_value = None
     
     # Add diagnostic conflict
-    db.add(
+    pending_conflicts.append(
         TimetableConflict(
             tenant_id=tenant_id,
             run_id=run.id,
@@ -275,14 +294,20 @@ def greedy_fallback_solver(ctx: SolverContext) -> SolveResult:
     )
     
     try:
-        db.commit()
+        save_run_outputs_with_retry(
+            db,
+            run=run,
+            tenant_id=tenant_id,
+            entries=pending_entries,
+            conflicts=pending_conflicts,
+            clear_existing_entries=True,
+        )
     except Exception as e:
         logger.exception(f"Failed to commit greedy fallback results: {e}")
-        db.rollback()
         raise
     
     return SolveResult(
-        status="FEASIBLE_GREEDY_FALLBACK",
+        status="FEASIBLE",
         entries_written=entries_written,
         conflicts=[],
         warnings=["Generated using greedy fallback (CP-SAT infeasible); solution quality degraded."],

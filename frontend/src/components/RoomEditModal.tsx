@@ -81,10 +81,11 @@ export function RoomEditModal({ open, room, subjects, loading, onClose, onSave }
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [open, onClose])
 
+  const subjectOptions = React.useMemo(() => subjects.map((s) => ({ value: s.id, label: `${s.code} - ${s.name}` })), [subjects])
+
   if (!open || !room || !form) return null
 
   const idPrefix = `edit_room_${room.id}`
-  const subjectOptions = React.useMemo(() => subjects.map((s) => ({ value: s.id, label: `${s.code} - ${s.name}` })), [subjects])
 
   const dirty =
     form.code.trim() !== (room.code ?? '').trim() ||
